@@ -15,7 +15,7 @@ Install RedLog on **your operator machine** (the Kali box or laptop you attack
 from), not on a target. It records what you do; it is not an implant.
 
 Grab the installer for your platform from the
-[**releases page**](https://github.com/guan4tou2/REDLOG/releases/latest) — current version **v0.18.6**.
+[**releases page**] — current version **v0.18.6**.
 Builds do not yet carry a trusted publisher identity (macOS is ad-hoc signed, not notarised). First launch may require an OS trust decision; managed machines may block it.
 
 | Platform | File | Install |
