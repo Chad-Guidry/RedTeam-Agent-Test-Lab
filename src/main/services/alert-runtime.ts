@@ -1,0 +1,192 @@
+// AlertRuntime — one-object convenience wrapper around the alert
+// subsystem. Bundles bus + all four policies + all five surfaces + the
+// IP signal producer and provides one .configure() entry point.
+//
+// The alert subsystem itself doesn't depend on this — you could wire
+// AlertBus + policies + surfaces by hand in main/index.ts. The runtime
+// exists so main only has to think about "give me an alert runtime,
+// configure it, subscribe to badge changes"; the policy/surface list is
+// hidden.
+
+import type { RedLogConfig } from '../../core/config'
+import type { ProjectIdentity } from '../../core/project-runtime'
+import type { IPProducerState } from './producers/ip-signal-producer'
+import {
+  alertFloorFor,
+  type ScopeSnapshot,
+  AlertBus,
+  BadgeSurface,
+  ChainEmitter,
+  IPPolicy,
+  ScopePolicy,
+  ObservationLog,
+  AdherenceCounter,
+  type IPVerdict,
+  type ObservationLogRow,
+  type AdherenceRow,
+  type TargetHitSignal
+} from '../../core/alert'
+import { IPSignalProducer } from './producers/ip-signal-producer'
+
+/** The compat shape the StatusBar / IPStatusCard / overlay expect. The
+ *  old IPMonitor exposed exactly this; the runtime composes it from the
+ *  producer's state + the badge surface's verdict. Kept identical so the
+ *  UI code doesn't need to change. */
+export interface IPStatusShape {
+  externalIP: string | null
+  internalIP: string | null
+  ipSafety: 'safe' | 'exposed' | 'unknown'
+  lastCheck: number
+  error: string | null
+  settling: boolean
+  link?: { type: 'wifi' | 'wired' | 'unknown'; name: string }
+}
+
+/** Maps the richer five-verdict alert semantics onto the three-colour
+ *  badge the UI has always shown. `presumed_safe` reads as safe (we
+ *  don't have positive-safe evidence, but nothing is red); `off_profile`
+ *  reads as exposed (whitelist configured, IP didn't match — a real
+ *  fact, deserves red). */
+function verdictToSafety(v: IPVerdict | null): IPStatusShape['ipSafety'] {
+  if (!v) return 'unknown'
+  if (v.value === 'exposed' || v.value === 'off_profile') return 'exposed'
+  if (v.value === 'safe' || v.value === 'presumed_safe') return 'safe'
+  return 'unknown'
+}
+
+export class AlertRuntime {
+  readonly bus: AlertBus
+  readonly ipPolicy: IPPolicy
+  readonly scopePolicy: ScopePolicy
+  readonly chainEmitter: ChainEmitter
+  readonly badgeSurface: BadgeSurface
+  readonly adherenceCounter: AdherenceCounter
+  readonly observationLog: ObservationLog
+  readonly ipProducer: IPSignalProducer
+
+  constructor(initial: { engagementId: string; operatorId: string }) {
+    this.bus = new AlertBus()
+    this.ipPolicy = new IPPolicy()
+    this.scopePolicy = new ScopePolicy()
+    this.chainEmitter = new ChainEmitter(initial)
+    this.badgeSurface = new BadgeSurface()
+    this.adherenceCounter = new AdherenceCounter()
+    this.observationLog = new ObservationLog()
+    this.ipProducer = new IPSignalProducer(this.bus)
+
+    this.bus.registerSurface(this.chainEmitter)
+    this.bus.registerSurface(this.badgeSurface)
+    this.bus.registerSurface(this.adherenceCounter)
+    this.bus.registerSurface(this.observationLog)
+
+    this.bus.registerPolicy(this.ipPolicy)
+    this.bus.registerPolicy(this.scopePolicy)
+  }
+
+  /** Apply a full config snapshot to every policy that reads config. Called
+   *  on project open and on config:save. Also updates the ChainEmitter's
+   *  engagement/operator context. Policies dedup internally so a no-op
+   *  configure() call doesn't re-emit anything. */
+  configure(cfg: RedLogConfig, identity: Readonly<ProjectIdentity>, scopeTargets: string[]): void {
+    this.chainEmitter.updateContext(identity)
+
+    this.ipPolicy.configure({
+      safeIps: cfg.network?.whitelist ?? [],
+      exposedIps: cfg.network?.blacklist ?? []
+    })
+    this.scopePolicy.configure({
+      targets: scopeTargets,
+      excludeTargets: cfg.scope?.excludeTargets ?? [],
+      // v0.11 had `warnOnViolation` as a single boolean gating everything.
+      // The new alertFloor list is finer-grained; `warnOnViolation:false`
+      // maps to "only in_scope and excluded emit" — every operator wants
+      // the explicit-deny case fired regardless. Read from core so the
+      // recompute cannot judge stored rows against a different floor than the
+      // live path used.
+      alertFloor: alertFloorFor(cfg.scope?.warnOnViolation)
+    })
+
+
+    this.ipProducer.configure({
+      checkIntervalSec: cfg.network?.checkInterval ?? 10,
+      providers: cfg.network?.providers ?? [],
+      confirmations: cfg.network?.confirmations ?? 3,
+      ipMode: (cfg.network?.ipMode ?? 'auto') as 'dns' | 'http' | 'auto',
+      offline: cfg.network?.offline === true
+    })
+  }
+
+  /** Fire a scope-check for one observed target. Shell command_start,
+   *  http_request_start, dns_query, agent tool call — all funnel here
+   *  and hand the runtime a TargetHitSignal. */
+  dispatchTargetHit(input: {
+    target: string
+    source: TargetHitSignal['source']
+    action: string
+    sourceEventId?: string | null
+  }): void {
+    this.bus.dispatch({
+      kind: 'target_hit',
+      timestamp: Date.now(),
+      target: input.target,
+      source: input.source,
+      sourceEventId: input.sourceEventId ?? null,
+      action: input.action
+    })
+  }
+
+  /** IPC-compat: what the StatusBar / IPStatusCard have always read. */
+  ipStatus(): IPStatusShape {
+    const st = this.ipProducer.getState()
+    return {
+      externalIP: st.external,
+      internalIP: st.internal,
+      ipSafety: verdictToSafety(this.badgeSurface.get()),
+      lastCheck: st.lastCheck,
+      error: st.error,
+      settling: st.settling,
+      link: st.link
+    }
+  }
+
+  /** IPC-compat: what the ScopePanel / StatusBar violation counter show. */
+  scopeObservations(): ObservationLogRow[] { return this.observationLog.list() }
+  scopeObservationCount(): number { return this.observationLog.count() }
+  /** The scope in force, carried across a config save so the recompute can
+   *  compare before and after. */
+  scopeSnapshot(): ScopeSnapshot { return this.scopePolicy.snapshot() }
+
+  scopeIsConfigured(): boolean { return this.scopePolicy.isConfigured() }
+
+  /** Adherence snapshot for the post-hoc scope report. */
+  adherence(): AdherenceRow[] { return this.adherenceCounter.snapshot() }
+
+  /** Called on project switch — clears policy state, the in-memory violation
+   *  log and the adherence counts; the chain-persisted history stays. */
+  resetOnProjectSwitch(): void {
+    this.bus.resetPolicies()
+    this.observationLog.reset()
+    this.adherenceCounter.reset()
+  }
+
+  /** Subscribe to badge changes so main can broadcast `ip:status` when the
+   *  verdict flips. Returns an unsubscribe function. */
+  onBadgeChange(fn: (v: IPVerdict | null) => void): () => void {
+    return this.badgeSurface.subscribe(fn)
+  }
+
+  /** Subscribe to per-tick producer state updates. Fires every check —
+   *  including no-address-change ticks — so the UI can refresh `lastCheck`
+   *  and per-tick health signals. */
+  onIpTick(fn: () => void): () => void {
+    return this.ipProducer.onCheck(fn)
+  }
+
+  /** Producer link state — used by main's active-link monitor. */
+  setLink(link: IPProducerState['link']): void {
+    this.ipProducer.setLink(link)
+  }
+
+  start(): void { this.ipProducer.start() }
+  stop(): void { this.ipProducer.stop() }
+}

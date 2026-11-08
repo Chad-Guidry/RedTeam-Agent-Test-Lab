@@ -1,0 +1,215 @@
+// @vitest-environment jsdom
+import { fireEvent, render, screen, waitFor, cleanup } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { ExportMenu } from '../src/renderer/src/components/ExportMenu'
+import { I18nProvider } from '../src/renderer/src/i18n'
+
+// The preview reshaped the resolved plan into an `ExportPreview` whose
+// `hasScope` was always false, `screenshotEvents` always 0 and `snapshot` all
+// zeros, and whose `inScope` was `included - maskedOutOfScope` — arithmetic,
+// not a scope classification. An operator checking what they are about to hand
+// to a client was reading numbers RedLog had made up.
+
+const SCOPE = { targets: ['10.0.0.0/24', '*.corp.local'], excludeTargets: [], personalDomains: [] }
+
+const plan = (over: Partial<ResolvedExportPlan> = {}): ResolvedExportPlan => ({
+  id: 'plan-1',
+  fingerprint: '1234567890abcdef',
+  expiresAt: Date.now() + 10_000,
+  snapshot: { chainedMaxRowId: 9, loggedMaxRowId: 4, takenAt: 1_700_000_000_000 },
+  scopeSnapshot: SCOPE,
+  capabilities: { snapshot: true, boundedSubset: false, scopeMasking: true, piiScrubbing: true, attachments: false },
+  request: { format: 'json', subset: { kind: 'all' }, maskOutOfScope: true, scopeOnly: false, scrubPii: false },
+  counts: {
+    examined: 120, included: 100, excludedDoNotExport: 5, excludedPersonal: 7,
+    maskedOutOfScope: 5, sanitized: 2,
+    attachmentsIncluded: 0, attachmentsMissing: 0, attachmentsUnattributed: 0, unsupported: 0
+  },
+  ...over
+})
+
+function install(p: ResolvedExportPlan): void {
+  ;(window as unknown as { redlog: unknown }).redlog = {
+    data: { recentExport: vi.fn(async () => ({ ok: true, delivery: null })),
+      resolveExportPlan: vi.fn(async () => ({ ok: true as const, plan: p })),
+      executeExportPlan: vi.fn(async () => ({ ok: true as const, planId: p.id, fingerprint: 'x', artifactPath: '/tmp/x', counts: p.counts, warnings: [], delivery: { artifactPath: '/tmp/x', format: 'json', completedAt: 1700000000000, availability: 'available' } }))
+    },
+    config: { get: async () => ({}) }
+  }
+}
+
+const openJson = (): void => {
+  fireEvent.click(screen.getByRole('button', { name: /Export/i }))
+
+}
+
+describe('the export preview shows only what the plan measured', () => {
+  afterEach(() => { cleanup(); vi.restoreAllMocks() })
+
+  const draw = async (p: ResolvedExportPlan): Promise<void> => {
+    install(p)
+    render(<I18nProvider><ExportMenu totalCount={120} /></I18nProvider>)
+    openJson()
+    await waitFor(() => expect(screen.getByTestId('export-preview-scope')).toBeTruthy())
+  }
+
+  it('names the real scope rather than claiming there is none', async () => {
+    await draw(plan())
+    const scope = screen.getByTestId('export-preview-scope').textContent ?? ''
+    expect(scope).toContain('10.0.0.0/24')
+    expect(scope).toContain('*.corp.local')
+  })
+
+  it('says scope is not set when it genuinely is not', async () => {
+    await draw(plan({ scopeSnapshot: { targets: [], excludeTargets: [], personalDomains: [] } }))
+    expect(screen.getByTestId('export-preview-scope').textContent).toMatch(/not set/i)
+  })
+
+  it('warns that web traffic is unfiltered when no scope is set, and still lets the export go ahead', async () => {
+    await draw(plan({ scopeSnapshot: { targets: [], excludeTargets: [], personalDomains: [] } }))
+    expect(screen.getByTestId('export-scope-unset').textContent).toMatch(/not filtered by scope/i)
+    // Confirming is not blocked by the warning.
+    expect((screen.getByTestId('export-confirm') as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it('offers "set a scope first" only when the menu can open Settings, and closes the dialog when used', async () => {
+    const open = vi.fn()
+    install(plan({ scopeSnapshot: { targets: [], excludeTargets: [], personalDomains: [] } }))
+    render(<I18nProvider><ExportMenu totalCount={120} onOpenScopeSettings={open} /></I18nProvider>)
+    openJson()
+    await waitFor(() => expect(screen.getByTestId('export-set-scope')).toBeTruthy())
+    fireEvent.click(screen.getByTestId('export-set-scope'))
+    expect(open).toHaveBeenCalledTimes(1)
+    expect(screen.queryByTestId('export-dialog')).toBeNull()
+  })
+
+  it('has no set-scope action without a way to open Settings', async () => {
+    await draw(plan({ scopeSnapshot: { targets: [], excludeTargets: [], personalDomains: [] } }))
+    expect(screen.queryByTestId('export-set-scope')).toBeNull()
+  })
+
+  it('does not warn about an unset scope when one is set, and exclusions alone count as set', async () => {
+    await draw(plan())
+    expect(screen.queryByTestId('export-scope-unset')).toBeNull()
+    cleanup()
+    await draw(plan({ scopeSnapshot: { targets: [], excludeTargets: ['login.corp.local'], personalDomains: [] } }))
+    expect(screen.queryByTestId('export-scope-unset')).toBeNull()
+  })
+
+  it('always says commands are not filtered by the web scope', async () => {
+    await draw(plan())
+    expect(screen.getByTestId('export-commands-note').textContent).toMatch(/Commands and their output are not filtered by web scope/)
+  })
+
+  it('shows no invented in-scope or screenshot counts', async () => {
+    await draw(plan())
+    const panel = screen.getByRole('dialog').textContent ?? ''
+    // `inScope` was included - maskedOutOfScope = 95, and screenshots was 0.
+    expect(panel).not.toMatch(/In scope/i)
+    expect(panel).not.toMatch(/Screenshots/i)
+    // What the resolver did measure is still there.
+    expect(panel).toContain('120')
+    expect(panel).toContain('100')
+  })
+
+  it('spells out the time range and target of a bounded subset', async () => {
+    await draw(plan({
+      request: {
+        format: 'timeline',
+        subset: { kind: 'time-range', since: 1_700_000_000_000, before: 1_700_003_600_000, targetId: '10.0.0.5' },
+        maskOutOfScope: true, scopeOnly: false, scrubPii: false
+      }
+    }))
+    const subset = screen.getByTestId('export-preview-subset').textContent ?? ''
+    expect(subset).toMatch(/\d/)          // a real timestamp, not just "bounded"
+    expect(subset).toContain('10.0.0.5')
+  })
+
+  it('names each policy decision, not one preset word', async () => {
+    await draw(plan({
+      request: { format: 'json', subset: { kind: 'all' }, maskOutOfScope: false, scopeOnly: true, scrubPii: true }
+    }))
+    const policy = screen.getByTestId('export-preview-policy').textContent ?? ''
+    expect(policy).toMatch(/masking off/i)
+    expect(policy).toMatch(/in-scope only/i)
+    expect(policy).toMatch(/PII scrubbed/i)
+  })
+
+  // Three different things that all used to read as "0 attachments".
+  it('distinguishes a format that carries no attachments from none being found', async () => {
+    await draw(plan())   // json: capabilities.attachments === false
+    expect(screen.getByTestId('export-preview-no-attachments').textContent).toMatch(/carries none/i)
+  })
+
+  it('reports missing and unattributed attachments for a format that carries them', async () => {
+    await draw(plan({
+      capabilities: { snapshot: true, boundedSubset: false, scopeMasking: true, piiScrubbing: false, attachments: true },
+      counts: { ...plan().counts, attachmentsIncluded: 4, attachmentsMissing: 2, attachmentsUnattributed: 1 }
+    }))
+    expect(screen.queryByTestId('export-preview-no-attachments')).toBeNull()
+    const panel = screen.getByRole('dialog').textContent ?? ''
+    expect(panel).toMatch(/Attachments missing/i)
+    expect(panel).toMatch(/Attachments unattributed/i)
+  })
+
+  // #290: a crash-recovered recording is cut off, not finished, and the
+  // preview says so before the operator hands it over.
+  it('names terminal recordings and commands a crash cut off, and only when there are any', async () => {
+    await draw(plan({ counts: { ...plan().counts, interruptedRecordings: 1, interruptedCommands: 2 } }))
+    const panel = screen.getByRole('dialog').textContent ?? ''
+    expect(panel).toMatch(/Terminal recordings cut off by a crash\s*1/)
+    expect(panel).toMatch(/Commands cut off without a result\s*2/)
+    cleanup()
+    await draw(plan())
+    expect(screen.getByRole('dialog').textContent).not.toMatch(/cut off/)
+  })
+})
+
+// #291 R14: a capture gap is a Known Gap. The preview names it per reason and
+// shows an unrecorded amount as unknown; it never claims what was lost.
+describe('the export preview names capture gaps', () => {
+  afterEach(() => { cleanup(); vi.restoreAllMocks() })
+
+  const draw = async (p: ResolvedExportPlan): Promise<void> => {
+    install(p)
+    render(<I18nProvider><ExportMenu totalCount={120} /></I18nProvider>)
+    openJson()
+    await waitFor(() => expect(screen.getByTestId('export-preview-scope')).toBeTruthy())
+  }
+
+  it('shows each reason with its skipped units, and an unknown amount as unknown', async () => {
+    await draw(plan({ counts: { ...plan().counts, captureGaps: [
+      { reason: 'delivery-unconfirmed', gaps: 1, skippedUnits: 0, unknownAmount: 1 },
+      { reason: 'queue-full', gaps: 3, skippedUnits: 17, unknownAmount: 1 }
+    ] } }))
+    const panel = screen.getByRole('dialog').textContent ?? ''
+    expect(panel).toMatch(/Capture gaps \(proxy queue full\)\s*3 gap\(s\) · 17 skipped · amount unknown for 1/)
+    expect(panel).toMatch(/Capture gaps \(HTTP delivery not confirmed\)\s*1 gap\(s\) · amount unknown for 1/)
+    expect(panel).not.toMatch(/not confirmed\)[^C]*0 skipped/)
+  })
+
+  // The reason is shown in words, the way the Timeline names the same gap; a
+  // reason the preview does not know is shown as recorded, never dropped.
+  it('names each known reason in words, and an unknown one as recorded', async () => {
+    await draw(plan({ counts: { ...plan().counts, captureGaps: [
+      { reason: 'gap-unsaved', gaps: 1, skippedUnits: 4, unknownAmount: 0 },
+      { reason: 'project-switched', gaps: 1, skippedUnits: 2, unknownAmount: 0 },
+      { reason: 'proxy-stopped', gaps: 1, skippedUnits: 3, unknownAmount: 0 },
+      { reason: 'delivery-interrupted', gaps: 1, skippedUnits: 0, unknownAmount: 1 },
+      { reason: 'some-new-reason', gaps: 1, skippedUnits: 0, unknownAmount: 1 },
+      { reason: 'unspecified', gaps: 1, skippedUnits: 9, unknownAmount: 0 }
+    ] } }))
+    const panel = screen.getByRole('dialog').textContent ?? ''
+    expect(panel).toMatch(/Capture gaps \(gap could not be saved\)\s*1 gap\(s\) · 4 skipped/)
+    expect(panel).toMatch(/Capture gaps \(another project was opened\)\s*1 gap\(s\) · 2 skipped/)
+    expect(panel).toMatch(/Capture gaps \(proxy stopped before sending\)\s*1 gap\(s\) · 3 skipped/)
+    expect(panel).toMatch(/Capture gaps \(proxy stopped while sending\)\s*1 gap\(s\) · amount unknown for 1/)
+    expect(panel).toMatch(/Capture gaps \(some-new-reason\)\s*1 gap\(s\) · amount unknown for 1/)
+    expect(panel).toMatch(/Capture gaps \(AI transcript lines skipped while paused\)\s*1 gap\(s\) · 9 skipped/)
+  })
+
+  it('shows nothing when the selection holds no gap', async () => {
+    await draw(plan())
+    expect(screen.getByRole('dialog').textContent).not.toMatch(/Capture gaps/)
+  })
+})

@@ -1,0 +1,458 @@
+import { bodyTruncation, capturedContentIsPartial } from '../../../core/content-contract'
+import type { StreamCompletion } from '../../../core/stream-completion'
+import { Button } from './Button'
+import { EventContentReader, type ReaderControl } from './EventContentReader'
+import { hasContentReader } from '../lib/timelineEvents'
+import { useState, useEffect } from 'react'
+import { useI18n } from '../i18n'
+import { toast } from './Toast'
+import { writeClipboard } from '../lib/clipboard'
+
+// ---------------------------------------------------------------------------
+// Shared constants & helpers
+// ---------------------------------------------------------------------------
+
+
+export const STREAM_ACCENTS: Record<'emerald' | 'amber' | 'zinc', { label: string; bar: string; bg: string; badge: string }> = {
+  emerald: { label: 'text-emerald-400', bar: 'border-emerald-600/40', bg: 'bg-emerald-900/10', badge: 'text-emerald-300 bg-emerald-900/30' },
+  amber:   { label: 'text-amber-400',   bar: 'border-amber-600/40',   bg: 'bg-amber-900/10',   badge: 'text-amber-300 bg-amber-900/30' },
+  zinc:    { label: 'text-redlog-text',    bar: 'border-redlog-border/60',    bg: 'bg-redlog-surface/40',    badge: 'text-redlog-text bg-redlog-elevated/60' }
+}
+
+const INLINE_PREVIEW_BYTES = 4096
+
+import { formatSize } from '../lib/time'
+const formatBytes = formatSize
+export { formatBytes }
+
+export function safePretty(v: unknown): string {
+  try { return JSON.stringify(v, null, 2) } catch { return String(v) }
+}
+
+// ---------------------------------------------------------------------------
+// CollapsibleStream
+// ---------------------------------------------------------------------------
+
+export function CollapsibleStream({
+  label,
+  content,
+  bytes,
+  truncated,
+  truncatedLabel,
+  accent,
+  startOpen
+}: {
+  label: string
+  content: string
+  bytes?: number
+  truncated?: boolean
+  /** Replaces the shell hook's 100 KB wording for content cut elsewhere. */
+  truncatedLabel?: string
+  accent: 'emerald' | 'amber' | 'zinc'
+  startOpen?: boolean
+}): JSX.Element {
+  const { t } = useI18n()
+  const [open, setOpen] = useState(!!startOpen)
+  const [copied, setCopied] = useState(false)
+  const acc = STREAM_ACCENTS[accent]
+  const shownBytes = typeof bytes === 'number' ? bytes : content.length
+  const isLarge = content.length > INLINE_PREVIEW_BYTES
+  const preview = isLarge ? content.slice(0, INLINE_PREVIEW_BYTES) : content
+  const copyFull = async (): Promise<void> => {
+    // The bridge, not navigator.clipboard: the renderer is denied that, and a
+    // dropped rejection made this button look dead.
+    if (await writeClipboard(content)) {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+      toast(t('toast.copied'), 'success')
+    } else {
+      toast(t('toast.copyFailed'), 'error')
+    }
+  }
+  return (
+    <div className={`border ${acc.bar} rounded ${acc.bg}`}>
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="w-full flex items-center gap-2 px-2 py-1 text-left"
+      >
+        <span className="text-xs text-redlog-text-dim font-mono w-3">{open ? '▼' : '▶'}</span>
+        <span className={`text-xs font-mono font-semibold uppercase tracking-wider ${acc.label}`}>{label}</span>
+        <span className={`text-xs font-mono px-1.5 py-0.5 rounded ${acc.badge}`}>
+          {formatBytes(shownBytes)}
+        </span>
+        {truncated && truncatedLabel && <span className="text-xs font-mono text-amber-400">{truncatedLabel}</span>}
+        {truncated && !truncatedLabel && (
+          <span className="text-xs font-mono text-amber-400" title={t('timeline.detail.truncatedHint')}>
+            {t('timeline.detail.truncated')}
+          </span>
+        )}
+        {isLarge && (
+          <span
+            role="button"
+            tabIndex={0}
+            onClick={(e) => { e.stopPropagation(); void copyFull() }}
+            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.stopPropagation(); e.preventDefault(); void copyFull() } }}
+            className="ml-auto text-xs font-mono px-1.5 py-0.5 rounded bg-redlog-elevated text-redlog-text-dim hover:bg-redlog-elevated-hover hover:text-redlog-text cursor-pointer"
+          >
+            {copied ? t('timeline.detail.copied') : t('timeline.detail.copyFull')}
+          </span>
+        )}
+      </button>
+      {open && content.length > 0 && (
+        <pre className="mx-2 mb-2 p-2 bg-redlog-bg rounded border border-redlog-border/60 text-xs text-redlog-text font-mono max-h-80 overflow-y-auto whitespace-pre-wrap break-all">
+          {preview}
+          {isLarge && (
+            <span className="block mt-2 text-xs text-redlog-text-dim">
+              {t('timeline.detail.previewCut', { shown: formatBytes(preview.length), total: formatBytes(shownBytes) })}
+            </span>
+          )}
+        </pre>
+      )}
+      {open && content.length === 0 && (
+        <p className="mx-2 mb-2 px-2 py-1 text-xs text-redlog-text-faint font-mono italic">{t('timeline.detail.empty')}</p>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// MetadataGrid
+// ---------------------------------------------------------------------------
+
+export function MetadataGrid({ entries }: { entries: Array<[string, unknown]> }): JSX.Element {
+  const rows = entries.filter(([, v]) => v !== undefined && v !== null && v !== '')
+  if (rows.length === 0) return <></>
+  return (
+    <div className="rounded border border-redlog-border/60 bg-redlog-bg/40 px-2 py-1.5">
+      <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-xs font-mono">
+        {rows.map(([k, v]) => (
+          <div key={k} className="contents">
+            <span className="text-redlog-text-dim">{k}</span>
+            <span className="text-redlog-text break-all">{String(v)}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// HttpDetail — HTTP exchange detail, shared by Timeline and HttpHistoryPanel
+// ---------------------------------------------------------------------------
+
+/** One line for the whole flow: what its saved segments prove about its end.
+ *  Without the lookup, fall back to what this row alone says. */
+function streamStatus(t: (key: string, vars?: Record<string, string | number>) => string, completion: StreamCompletion | null, data: Record<string, unknown>): { text: string; settled: boolean } | null {
+  if (!completion) return data.streamed === true ? { text: t(capturedContentIsPartial(data) ? 'http.streamCapturePartial' : 'http.streamCaptureUnknown'), settled: false } : null
+  if (completion.state === 'end-observed') return { text: t('http.streamEndObserved', { saved: completion.saved }), settled: true }
+  if (completion.state === 'known-partial') {
+    return { text: completion.missing ? t('http.streamMissingSegments', { missing: completion.missing, observed: completion.observed ?? 0 }) : t('http.streamCapturePartial'), settled: false }
+  }
+  return { text: t(completion.closed ? 'http.streamCaptureUnknown' : 'http.streamNoEnd'), settled: false }
+}
+
+export function HttpDetail({ data, eventId, projectId, reader }: {
+  data: Record<string, unknown>; eventId: string; projectId: string
+  /** Held by the Timeline so its bar can open the same Reader. */
+  reader?: ReaderControl
+}): JSX.Element {
+  const { t } = useI18n()
+  const subtype = String(data.subtype ?? '')
+  const isRequest = subtype === 'http_request_start'
+  const isResponse = subtype === 'http_response'
+  const flowId = typeof data.flow_id === 'string' ? data.flow_id : ''
+  const [partner, setPartner] = useState<{ eventId: string; partnerId: string; data: Record<string, unknown> } | null>(null)
+  const [pairedLoading, setPairedLoading] = useState(false)
+  const [pairedError, setPairedError] = useState(false)
+  const [attempt, setAttempt] = useState(0)
+  const [completion, setCompletion] = useState<{ flowId: string; value: StreamCompletion | null } | null>(null)
+
+  useEffect(() => {
+    if (!flowId) return
+    let cancelled = false
+    // A failed lookup leaves the row-level fallback, never a stale answer.
+    Promise.resolve().then(() => window.redlog.events.streamCompletion(flowId))
+      .then(value => { if (!cancelled) setCompletion({ flowId, value }) })
+      .catch(() => { if (!cancelled) setCompletion(null) })
+    return () => { cancelled = true }
+  }, [flowId, eventId, attempt])
+  useEffect(() => {
+    setPartner(null)
+    setPairedError(false)
+    setPairedLoading(false)
+    if (!flowId || (!isRequest && !isResponse)) return
+    let cancelled = false
+    setPairedLoading(true)
+    window.redlog.events.queryByFlowId(flowId).then(events => {
+      if (cancelled) return
+      const found = events.find(event => event.id !== eventId && (
+        isRequest ? event.data?.subtype === 'http_response' : event.data?.subtype === 'http_request_start'
+      ))
+      setPartner(found ? { eventId, partnerId: found.id, data: found.data } : null)
+    }).catch(() => { if (!cancelled) setPairedError(true) })
+      .finally(() => { if (!cancelled) setPairedLoading(false) })
+    return () => { cancelled = true }
+  }, [flowId, eventId, isRequest, isResponse, attempt])
+
+  // Request above, response below (Spec 069 FR-005): the two halves are read
+  // together, so neither hides behind a tab. Both use the same body reader.
+  const pairedData = partner?.eventId === eventId ? partner.data : null
+  const requestData = isRequest ? data : pairedData
+  const responseData = isResponse ? data : pairedData
+  const requestId = isRequest ? eventId : partner?.partnerId ?? eventId
+  const responseId = isResponse ? eventId : partner?.partnerId ?? eventId
+  // The lifted Reader belongs to the half that IS the selected event; the
+  // other half of a pair keeps its own, so one click never opens two.
+  const stream = streamStatus(t, completion?.flowId === flowId ? completion.value : null, responseData ?? data)
+  return (
+    <div className="mt-2 space-y-1.5">
+      {stream && <p role="status" data-testid="http-stream-status" className={`text-xs ${stream.settled ? 'text-redlog-text-dim' : 'text-amber-400'}`}>{stream.text}</p>}
+      {pairedData && requestData && responseData ? (
+        <>
+          <section data-testid="http-section-request" aria-labelledby={`http-request-${eventId}`}>
+            <h4 id={`http-request-${eventId}`} className="text-xs font-semibold text-redlog-text-dim border-b border-redlog-border/60 pb-1">{t('timeline.detail.tabRequest')}</h4>
+            <HttpHalf key={`${eventId}:request`} data={requestData} projectId={projectId} eventId={requestId} reader={requestId === eventId ? reader : undefined} />
+          </section>
+          <section data-testid="http-section-response" aria-labelledby={`http-response-${eventId}`}>
+            <h4 id={`http-response-${eventId}`} className="text-xs font-semibold text-redlog-text-dim border-b border-redlog-border/60 pb-1">{t('timeline.detail.tabResponse')}</h4>
+            <HttpHalf key={`${eventId}:response`} data={responseData} projectId={projectId} eventId={responseId} reader={responseId === eventId ? reader : undefined} />
+          </section>
+        </>
+      ) : (
+        <HttpHalf key={eventId} data={data} projectId={projectId} eventId={eventId} reader={reader} />
+      )}
+      {pairedLoading && <p role="status" className="text-xs text-redlog-text-dim">{t('http.loadingPaired')}</p>}
+      {pairedError && <div role="alert" className="flex flex-wrap items-center gap-2 text-xs text-amber-400">
+        <span>{t('http.pairedFailed')}</span>
+        <button type="button" className="min-h-8 underline" onClick={() => setAttempt(value => value + 1)}>{t('common.retry')}</button>
+      </div>}
+    </div>
+  )
+}
+
+function HttpHalf({ data, projectId, eventId, reader }: {
+  data: Record<string, unknown>; projectId: string; eventId: string
+  reader?: ReaderControl
+}): JSX.Element {
+  const { t } = useI18n()
+  const subtype = String(data.subtype ?? '')
+  const isResponse = subtype === 'http_response'
+  const isRequest = subtype === 'http_request_start'
+  const isWs = subtype === 'ws_message'
+  const isTcp = subtype === 'tcp_message'
+  const tlsInfo = data.tls as Record<string, unknown> | undefined
+  const timingInfo = data.timing as Record<string, number> | undefined
+  const params = data.params as Record<string, unknown> | undefined
+  const preview = typeof data.response_preview === 'string' ? (data.response_preview as string) : ''
+  const reqPreview = typeof data.request_body_preview === 'string' ? (data.request_body_preview as string) : ''
+  const wsPreview = typeof data.ws_preview === 'string' ? (data.ws_preview as string) : ''
+  const tcpPreview = typeof data.tcp_preview === 'string' ? (data.tcp_preview as string) : ''
+  const contentType = String(data.content_type ?? '')
+  const contentLength = typeof data.content_length === 'number' ? (data.content_length as number) : null
+
+  const inlineReqBody = data.request_body as { data?: string; encoding?: string; size?: number; truncated?: boolean } | undefined
+  const inlineRespBody = data.response_body as { data?: string; encoding?: string; size?: number; truncated?: boolean } | undefined
+  const inlineWsBody = data.ws_body as { data?: string; encoding?: string; size?: number; truncated?: boolean } | undefined
+  const inlineTcpBody = data.tcp_body as { data?: string; encoding?: string; size?: number; truncated?: boolean } | undefined
+  const reqBodyRef = data.request_body_ref as { sha256: string; size: number; file: string; encoding: 'text' | 'base64'; truncated?: boolean; totalSize?: number } | undefined
+  const respBodyRef = data.response_body_ref as { sha256: string; size: number; file: string; encoding: 'text' | 'base64'; truncated?: boolean; totalSize?: number } | undefined
+  const wsBodyRef = data.ws_body_ref as { sha256: string; size: number; file: string; encoding: 'text' | 'base64'; truncated?: boolean; totalSize?: number } | undefined
+  const tcpBodyRef = data.tcp_body_ref as { sha256: string; size: number; file: string; encoding: 'text' | 'base64'; truncated?: boolean; totalSize?: number } | undefined
+
+  const hasFullReqBody = !!(inlineReqBody?.data || reqBodyRef)
+  const hasFullRespBody = !!(inlineRespBody?.data || respBodyRef)
+  const hasFullWsBody = !!(inlineWsBody?.data || wsBodyRef)
+  const hasFullTcpBody = !!(inlineTcpBody?.data || tcpBodyRef)
+
+  const reqBodyTruncated = inlineReqBody?.truncated === true || reqBodyRef?.truncated === true
+  const respBodyTruncated = inlineRespBody?.truncated === true || respBodyRef?.truncated === true
+  const wsBodyTruncated = inlineWsBody?.truncated === true || wsBodyRef?.truncated === true
+  const tcpBodyTruncated = inlineTcpBody?.truncated === true || tcpBodyRef?.truncated === true
+  const cutLabel = (inline: Parameters<typeof bodyTruncation>[0], ref: Parameters<typeof bodyTruncation>[1]): string | undefined => {
+    const cut = bodyTruncation(inline, ref)
+    if (!cut) return undefined
+    return cut.total === null
+      ? t('timeline.detail.bodySavedTotalUnknown', { saved: formatBytes(cut.saved) })
+      : t('timeline.detail.bodySavedOf', { saved: formatBytes(cut.saved), total: formatBytes(cut.total) })
+  }
+
+  const [ownReaderOpen, setOwnReaderOpen] = useState(false)
+  const readerOpen = reader ? reader.mode !== 'closed' : ownReaderOpen
+  const setReaderOpen = (open: boolean): void => { if (reader) reader.setMode(open ? 'inline' : 'closed'); else setOwnReaderOpen(open) }
+  // Inline previews are already on the Event. Sidecars always use the shared
+  // versioned window reader, never the legacy whole-body IPC.
+  const inlineText = (body: { data?: string; encoding?: string } | undefined): string | null =>
+    body?.encoding === 'text' && typeof body.data === 'string' && body.data.length <= 65536 ? body.data : null
+  const loadedReqBody = inlineText(inlineReqBody)
+  const loadedRespBody = inlineText(inlineRespBody)
+  const loadedWsBody = inlineText(inlineWsBody)
+  const loadedTcpBody = inlineText(inlineTcpBody)
+
+  const headers = data.request_headers ?? data.response_headers
+  const headersText = (() => {
+    if (!headers) return ''
+    if (Array.isArray(headers)) {
+      return (headers as string[][]).map(([n, v]) => `${n}: ${v}`).join('\n')
+    }
+    return safePretty(headers)
+  })()
+
+  const bodyless = isResponse && !preview && !hasFullRespBody && contentLength !== null && contentLength > 0
+  const binaryish = bodyless && !!contentType && !/json|html|text|xml|javascript/i.test(contentType)
+
+  const ownBlock = (
+    <>
+      {isRequest && params && Object.keys(params).length > 0 && (
+        <CollapsibleStream
+          label={t('timeline.detail.httpRequestParams')}
+          content={safePretty(params)}
+          accent="zinc"
+          startOpen
+        />
+      )}
+      {isRequest && reqPreview.length > 0 && !loadedReqBody && (
+        <CollapsibleStream
+          label={t('timeline.detail.httpRequestBody')}
+          content={reqPreview}
+          bytes={inlineReqBody?.size ?? reqPreview.length}
+          truncated={reqBodyTruncated}
+          truncatedLabel={cutLabel(inlineReqBody, reqBodyRef)}
+          accent="zinc"
+          startOpen
+        />
+      )}
+
+      {isRequest && loadedReqBody && (
+        <CollapsibleStream
+          label={t('timeline.detail.httpRequestBody')}
+          content={loadedReqBody}
+          bytes={inlineReqBody?.size ?? reqBodyRef?.size}
+          truncated={reqBodyTruncated}
+          truncatedLabel={cutLabel(inlineReqBody, reqBodyRef)}
+          accent="zinc"
+          startOpen
+        />
+      )}
+      {isResponse && (preview.length > 0 || (loadedRespBody)) && (
+        <CollapsibleStream
+          label={t('timeline.detail.httpResponseBody')}
+          content={(loadedRespBody) ? loadedRespBody : preview}
+          bytes={contentLength ?? ((loadedRespBody) ? loadedRespBody : preview).length}
+          truncated={respBodyTruncated}
+          truncatedLabel={cutLabel(inlineRespBody, respBodyRef)}
+          accent="emerald"
+          startOpen
+        />
+      )}
+
+      {isWs && (wsPreview.length > 0 || (loadedWsBody)) && (
+        <CollapsibleStream
+          label={t('timeline.detail.wsPayload')}
+          content={(loadedWsBody) ? loadedWsBody : wsPreview}
+          bytes={data.size as number ?? ((loadedWsBody) ? loadedWsBody : wsPreview).length}
+          truncated={wsBodyTruncated}
+          truncatedLabel={cutLabel(inlineWsBody, wsBodyRef)}
+          accent={data.direction === 'client' ? 'zinc' : 'emerald'}
+          startOpen
+        />
+      )}
+
+      {isTcp && (tcpPreview.length > 0 || (loadedTcpBody)) && (
+        <CollapsibleStream
+          label={t('timeline.detail.tcpPayload')}
+          content={(loadedTcpBody) ? loadedTcpBody : tcpPreview}
+          bytes={data.size as number ?? ((loadedTcpBody) ? loadedTcpBody : tcpPreview).length}
+          truncated={tcpBodyTruncated}
+          truncatedLabel={cutLabel(inlineTcpBody, tcpBodyRef)}
+          accent={data.direction === 'client' ? 'zinc' : 'emerald'}
+          startOpen
+        />
+      )}
+
+      {bodyless && (
+        <p className="text-xs text-amber-400/80 font-mono px-2 py-1 rounded border border-amber-600/30 bg-amber-900/10">
+          {t(binaryish ? 'timeline.detail.httpBodyBinary' : 'timeline.detail.httpBodyNotCaptured', {
+            type: contentType || '—', size: formatBytes(contentLength ?? 0)
+          })}
+        </p>
+      )}
+
+      {headersText && (
+        <CollapsibleStream
+          label={t('timeline.detail.httpHeaders')}
+          content={headersText}
+          accent="zinc"
+        />
+      )}
+      <MetadataGrid
+        entries={[
+          ...(isWs ? [
+            ['direction', data.direction],
+            ['message_type', data.message_type],
+            ['size', formatBytes(data.size as number ?? 0)],
+            ['message_#', data.message_count],
+          ] as [string, unknown][] : isTcp ? [
+            ['direction', data.direction],
+            ['size', formatBytes(data.size as number ?? 0)],
+            ['port', data.port],
+            ['message_#', data.message_count],
+            ['tls_version', data.tls_version],
+          ] as [string, unknown][] : [
+            ['method', data.method],
+            ['url', isRequest ? data.url : undefined],
+            ['status', data.status],
+            ['content_type', contentType || undefined],
+            ['content_length', contentLength !== null ? formatBytes(contentLength) : undefined],
+            ['duration_ms', data.duration_ms],
+            ['http_version', data.http_version],
+            ['stream_id', data.stream_id],
+          ] as [string, unknown][]),
+          ['host', data.host],
+          ['flow_id', data.flow_id]
+        ]}
+      />
+      {tlsInfo && (
+        <CollapsibleStream
+          label={t('timeline.detail.tlsInfo')}
+          content={Object.entries(tlsInfo).map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`).join('\n')}
+          accent="zinc"
+        />
+      )}
+      {timingInfo && (
+        <CollapsibleStream
+          label={t('timeline.detail.timing')}
+          content={Object.entries(timingInfo).map(([k, v]) => `${k}: ${v}ms`).join('\n')}
+          accent="zinc"
+        />
+      )}
+      {isRequest && Array.isArray(data.cookies) && (data.cookies as Array<{name: string; value: string}>).length > 0 && (
+        <CollapsibleStream
+          label={t('timeline.detail.cookies')}
+          content={(data.cookies as Array<{name: string; value: string}>).map(c => `${c.name}=${c.value}`).join('\n')}
+          accent="zinc"
+        />
+      )}
+      {isResponse && Array.isArray(data.set_cookies) && (data.set_cookies as Array<Record<string, unknown>>).length > 0 && (
+        <CollapsibleStream
+          label={t('timeline.detail.setCookies')}
+          content={(data.set_cookies as Array<Record<string, unknown>>).map(c => {
+            const parts = [`${c.name}=${c.value}`]
+            if (c.domain) parts.push(`Domain=${c.domain}`)
+            if (c.path) parts.push(`Path=${c.path}`)
+            if (c.secure) parts.push('Secure')
+            if (c.httponly) parts.push('HttpOnly')
+            if (c.samesite) parts.push(`SameSite=${c.samesite}`)
+            return parts.join('; ')
+          }).join('\n')}
+          accent="zinc"
+        />
+      )}
+    </>
+  )
+
+  return <div className="space-y-1.5">
+    {(hasContentReader({ agentType: 'scanner', data }) || readerOpen) && <Button size="compact" level="quiet" aria-expanded={readerOpen} onClick={() => setReaderOpen(!readerOpen)}>{t('content.savedContent')}</Button>}
+    {readerOpen ? <EventContentReader projectId={projectId} eventId={eventId} {...(reader ? { expanded: reader.mode === 'expanded', onExpandedChange: (x: boolean) => reader.setMode(x ? 'expanded' : 'inline') } : {})} /> : ownBlock}
+  </div>
+}

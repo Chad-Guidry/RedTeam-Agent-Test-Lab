@@ -1,0 +1,267 @@
+// One-line event title for the lane label, event list, first-run strip,
+// and search index. Pulled out of Timeline.tsx so FirstRunView and the
+// search index can import it directly without pulling in 4000 lines of
+// component code.
+
+import { SCOPE_VIOLATION_SUBTYPE } from '../../../core/scope-vocabulary'
+import en from '../i18n/en.json'
+import { AMENDABLE_FIELDS } from './markerFold'
+import { firstStringArg } from './timelineDomain'
+import { formatBytes } from '../components/HttpDetail'
+import { safeDisplay } from './evidenceText'
+
+/** The IP policy's verdict, in the words the IP card already uses. */
+const IP_VERDICT_KEY: Record<string, string> = {
+  exposed: 'ip.exposedIp',
+  safe: 'ip.safeIp',
+  unknown: 'ip.unknownIp',
+  off_profile: 'eventTitle.ipOffProfile',
+  presumed_safe: 'eventTitle.ipPresumedSafe'
+}
+
+/** Exported for the first-run strip, which is a preview of this timeline and
+ *  must name rows the same way it does. */
+export type Translate = (key: string, vars?: Record<string, string | number>) => string
+
+// English fallback for the `eventTitle.*` keys when no translator is passed.
+// The strings are the en.json entries; keeping the lookup here rather than a
+// second copy means a caller without `t` (search indexing, tests) still gets
+// the same English the interface shows in the en locale.
+const enTitles = en as Record<string, string>
+export const englishTitle: Translate = (key, vars) => {
+  const tpl = enTitles[key] ?? key
+  return vars ? tpl.replace(/\{\{(\w+)\}\}/g, (_, k) => String(vars[k] ?? `{{${k}}}`)) : tpl
+}
+
+/**
+ * One line per event, for the lane label, the event list and the first-run
+ * strip. Commands, URLs, hostnames and hashes are shown as captured; the
+ * static words around them — "terminal opened", "Screenshot", "Recording
+ * paused" — go through `t` so a Chinese interface does not read half in
+ * English. Pass no `t` to get English regardless of locale, which is what
+ * the search index does so a query matches the same text in every locale.
+ */
+export function eventTitle(event: RedLogEvent, t: Translate = englishTitle): string {
+  // Every title that reaches a list, a search result or a marker reference
+  // goes through here, so this is the one place that has to neutralise the
+  // direction controls an untrusted producer can put in `command`, `url` or
+  // `target` (#549). The stored event is not modified.
+  return safeDisplay(rawEventTitle(event, t))
+}
+
+function rawEventTitle(event: RedLogEvent, t: Translate): string {
+  const d = event.data
+  switch (event.agentType) {
+    case 'shell':
+      // A producer on the local API may send a command row without `command`
+      // or `exit_code`; `?` says so rather than throwing or printing "undefined".
+      if (d.subtype === 'command_start') return `$ ${String(d.command ?? '?').slice(0, 100)}`
+      if (d.subtype === 'command_end') return `$ ${String(d.command ?? '?').slice(0, 80)} → exit ${String(d.exit_code ?? '?')}`
+      if (d.subtype === 'command' && d.command) return `$ ${(d.command as string).slice(0, 100)}`
+      if (d.subtype === 'session_output') return `PTY #${String(d.sequence ?? '')}: ${String(d.stdout ?? '').slice(0, 100)}`
+      if (d.subtype === 'session_start') return t('eventTitle.terminalOpened')
+      if (d.subtype === 'command_boundary' && d.reason === 'recovered-orphan') return t('eventTitle.commandInterrupted')
+      if (d.subtype === 'session_end') {
+        if (d.recovered === true) return t('eventTitle.terminalInterrupted')
+        if (d.source === 'external-session' && (Number(d.omittedBytes) > 0 || Number(d.pausedBytes) > 0 || d.incomplete)) {
+          return t('eventTitle.sessionIncomplete', { code: String(d.exitCode ?? '?'), omitted: Number(d.omittedBytes ?? 0), paused: Number(d.pausedBytes ?? 0) })
+        }
+        return d.exitCode != null ? t('eventTitle.terminalClosedExit', { code: String(d.exitCode) }) : t('eventTitle.terminalClosed')
+      }
+      return t('eventTitle.shellEvent')
+    case 'dns': {
+      const qName = (d.query_name as string) || (d.dest_host as string) || (d.command as string) || ''
+      const qType = (d.query_type as string) || ''
+      if (d.subtype === 'dns_response') {
+        const answers = (d.answers as Array<{ type?: string; data?: string }> | undefined) ?? []
+        const preview = answers.length > 0
+          ? ` → ${answers.slice(0, 2).map((a) => a.data ?? '').filter(Boolean).join(', ')}`
+          : ''
+        const dur = d.duration_ms != null ? ` (${d.duration_ms}ms)` : ''
+        const rcode = d.response_code ? ` [${d.response_code}]` : ''
+        return `DNS ⇐ ${qName} ${qType}${rcode}${preview}${dur}`.trim()
+      }
+      return `DNS ⇒ ${qName} ${qType}`.trim()
+    }
+    case 'browser': {
+      const level = String(d.level ?? 'log')
+      const host = (d.host as string) || (d.url as string) || ''
+      const msg = String(d.message ?? '').slice(0, 80).replace(/\s+/g, ' ')
+      const glyph = level === 'error' || level === 'warning' || level === 'warn' || d.subtype === 'exception' ? '⚠' : '▸'
+      if (d.subtype === 'exception') return `⚠ [exception] ${host}: ${(d.exception_class as string) || 'Error'} — ${msg}`.trim()
+      return `${glyph} [${level}] ${host}: ${msg}`.trim()
+    }
+    case 'process': {
+      const cmd = String(d.command ?? '').slice(0, 60)
+      if (d.subtype === 'process_exit') {
+        const dur = d.duration_sec != null ? ` (${d.duration_sec}s)` : ''
+        return `▪ ${cmd}${dur}`.trim()
+      }
+      return `▶ ${cmd}`.trim()
+    }
+    case 'http_navigation':
+      return `⇢ ${d.host || d.url || ''} ${d.title ? `— ${(d.title as string).slice(0, 60)}` : ''}`.trim()
+    case 'scanner': {
+      const method = (d.method as string) || ''
+      const url = (d.url as string) || (d.host as string) || ''
+      switch (d.subtype) {
+        case 'http_request_start':
+          return `[req] ${method} ${url}`.trim()
+        case 'http_response':
+          return `[${d.duration_ms ?? '?'} ms] ${method} ${url} → ${d.status ?? '?'}`.trim()
+        case 'http_request_dropped': {
+          const age = d.age_sec != null ? `${d.age_sec}s` : '?'
+          return `[${t('eventTitle.droppedAfter', { age })}] ${method} ${url}`.trim()
+        }
+        case 'http_error':
+          return `[err] ${method} ${url}: ${d.error || 'unknown'}`.trim()
+        case 'ws_message': {
+          const dir = d.direction === 'client' ? '▲' : '▼'
+          const msgType = d.message_type === 'binary' ? 'bin' : 'txt'
+          return `[WS ${dir}] ${url} (${formatBytes(d.size as number ?? 0)} ${msgType})`.trim()
+        }
+        case 'tcp_message': {
+          const tcpDir = d.direction === 'client' ? '▲' : '▼'
+          return `[TCP ${tcpDir}] ${d.host || ''}:${d.port || '?'} (${formatBytes(d.size as number ?? 0)})`.trim()
+        }
+        case 'tcp_end':
+          return `[TCP end] ${d.host || ''}:${d.port || '?'} ${d.stream_state === 'interrupted' ? `interrupted: ${d.error || 'unknown'}` : 'closed'}`.trim()
+        case 'capture_gap':
+          if (d.reason === 'queue-full') return t('eventTitle.gapQueueFull', { count: String(d.skipped_units ?? '?') })
+          if (d.reason === 'project-switched') return t('eventTitle.gapProjectSwitched', { count: String(d.skipped_units ?? '?') })
+          if (d.reason === 'delivery-unconfirmed') return t('eventTitle.gapDeliveryUnconfirmed')
+          if (d.reason === 'proxy-stopped') return t('eventTitle.gapProxyStopped', { count: String(d.skipped_units ?? '?') })
+          if (d.reason === 'delivery-interrupted') return t('eventTitle.gapDeliveryInterrupted', { count: String(d.skipped_units ?? '?') })
+          return `[${d.subtype}] ${d.description || ''}`.trim()
+        case 'cookie_change':
+          return t('eventTitle.cookieRotated', { domain: String(d.domain || '?'), name: String(d.cookie_name || '?') }).trim()
+        case 'connection': {
+          const proto = (d.proto as string || 'tcp').toUpperCase()
+          return `⇄ ${proto} ${d.remote_addr || '?'}:${d.remote_port ?? '?'}`.trim()
+        }
+        case 'connection_end': {
+          const proto = (d.proto as string || 'tcp').toUpperCase()
+          const dur = d.duration_sec != null ? ` (${d.duration_sec}s)` : ''
+          return `⇄ ${proto} ${d.remote_addr || '?'}:${d.remote_port ?? '?'} ${t('eventTitle.connectionClosed')}${dur}`.trim()
+        }
+        default:
+          return `[${d.subtype || 'req'}] ${method} ${url}`.trim()
+      }
+    }
+    case 'screenshot':
+      return t('eventTitle.screenshot', { trigger: String(d.trigger ?? '') })
+    case 'clipboard':
+      return t('eventTitle.clipboard', { preview: (d.content as string)?.slice(0, 60) || '' })
+    case 'file_transfer': {
+      // A file the operator added is evidence they will want to find by name,
+      // not one more transfer line: name, size and the start of its hash.
+      if (d.subtype === 'artifact_added') {
+        const source = String(d.path ?? d.stored ?? '')
+        const name = source.split(/[\\/]/).pop() || source
+        const title = t('eventTitle.artifact', {
+          name,
+          size: formatBytes(typeof d.size === 'number' ? d.size : 0),
+          hash: typeof d.sha256 === 'string' ? d.sha256.slice(0, 8) : '?'
+        })
+        return d.duplicate ? `${title} ${t('eventTitle.artifactAgain')}` : title
+      }
+      const label = d.subtype || d.direction || 'transfer'
+      const target = d.path || d.filename || d.localPath || d.remotePath || ''
+      const size = d.size != null ? ` (${d.size}B)` : d.bytes ? ` (${d.bytes}B)` : ''
+      return `${label}: ${target}${size}`.trim()
+    }
+    case 'credential_use': {
+      const who = d.user_context || d.scheme || ''
+      const where = d.dest_host || d.dest_ip || d.host || ''
+      const detail = d.masked ? `${d.masked}${where ? ` → ${where}` : ''}` : `${who || '?'}${where ? ` @ ${where}` : ''}`
+      return `🔑 ${d.subtype || 'cred'}: ${detail}`.trim()
+    }
+    case 'c2_checkin':
+      return t('eventTitle.c2Beacon', { host: String(d.dest_ip || d.dest_host || ''), bytes: d.bytes ? `(${d.bytes}B)` : '' }).trim()
+    case 'pivot':
+      return t('eventTitle.pivot', { tool: String(d.tool ?? ''), rest: `${d.subtype || ''}${d.via ? ` → ${d.via}` : ''}${d.route ? ` (${d.route})` : ''}` }).trim()
+    case 'cleanup':
+      return t('eventTitle.cleanup', { tool: String(d.tool ?? ''), rest: `${d.subtype || ''}${d.target ? ` → ${d.target}` : ''}` }).trim()
+    case 'marker': {
+      if (d.subtype === 'amended') {
+        return AMENDABLE_FIELDS.map((f) => d[f]).filter((v) => typeof v === 'string' && v).join(' · ')
+      }
+      return `${(d.severity as string || 'info').toUpperCase()}: ${d.title}`
+    }
+    case 'loot': {
+      const m = (d.matches as Array<{ type: string; confidence: string }>)?.[0]
+      return m
+        ? t('eventTitle.lootMatch', { type: m.type.replace(/_/g, ' '), confidence: m.confidence })
+        : t('eventTitle.lootCount', { count: Number(d.count ?? 0) })
+    }
+    case 'agent': {
+      const sub = String(d.subtype ?? '')
+      const raw = String(
+        d.preview ?? d.full ?? d.output ?? d.textContent ?? ''
+      ).replace(/\s+/g, ' ').trim()
+      const cap = 100
+      const body = raw.length > cap ? raw.slice(0, cap) + '…' : raw
+      if (sub === 'user_message') return body ? `${t('eventTitle.agentUser')}: ${body}` : t('eventTitle.agentUser')
+      if (sub === 'assistant_message') return body ? `${t('eventTitle.agentAssistant')}: ${body}` : t('eventTitle.agentAssistant')
+      if (sub === 'tool_call') {
+        const name = String(d.tool_name ?? 'tool')
+        const input = d.tool_input as Record<string, unknown> | undefined
+        const hint = input ? firstStringArg(input, 60) : ''
+        return hint ? `⚙ ${name}: ${hint}` : `⚙ ${name}`
+      }
+      if (sub === 'tool_result') return body ? `${t('eventTitle.agentResult')}: ${body}` : t('eventTitle.agentResult')
+      if (sub === 'thinking') return body ? `💭 ${body}` : t('eventTitle.agentThinking')
+      if (sub === 'compact_summary') return t('eventTitle.agentCompacted')
+      if (sub === 'tool_interrupted') return body ? `${t('eventTitle.agentInterrupted')}: ${body}` : t('eventTitle.agentInterrupted')
+      if (sub === 'away_summary') return body ? `${t('eventTitle.agentAway')}: ${body}` : t('eventTitle.agentAway')
+      if (sub === 'transcript_snapshot') return t('eventTitle.agentSnapshot', { turns: String(d.turns_emitted ?? '?') })
+      if (sub === 'session_end') return t('eventTitle.agentSessionEnd', { turns: String(d.turns_emitted ?? '?') })
+      if (sub === 'transcript_compacted') return t('eventTitle.agentTranscriptReset')
+      if (sub === 'transcript_schema_drift') return t('eventTitle.agentSchemaDrift', { type: String(d.unknown_type ?? '?') })
+      if (sub === 'transcript_parent_missing') return t('eventTitle.agentParentMissing')
+      if (sub === 'transcript_tool_gap') return t('eventTitle.agentToolGap', { seen: String(d.tool_calls_seen ?? '?'), emitted: Number(d.tool_calls_emitted ?? 0) })
+      return `agent: ${sub}`
+    }
+    case 'system':
+      if (d.subtype === SCOPE_VIOLATION_SUBTYPE) {
+        // A hit that landed inside the scope is stored under the same subtype
+        // so adherence can be counted; it is a tally, not a violation, and
+        // must not read as one.
+        // With no scope configured the evaluator still files the hit under
+        // `in_scope` (nothing is outside an undrawn boundary), but marks the
+        // verdict `authority: 'unknown'`. Saying 範圍內 then contradicts the
+        // status bar's 範圍未設定 on the same screen; it was never judged.
+        const key = d.distance !== 'in_scope'
+          ? 'eventTitle.scopeObservation'
+          : d.authority === 'unknown' ? 'eventTitle.scopeUnjudged' : 'eventTitle.scopeInScope'
+        return t(key, { target: String(d.target || d.command || '') })
+      }
+      if (d.subtype === 'ip_transition') return `⇋ ${d.description || t('eventTitle.ipTransition')}`
+      if (d.subtype === 'opsec_state_changed') return t('eventTitle.opsecChanged', { description: String(d.description || t('eventTitle.opsecChangedDefault')) })
+      if (d.subtype === 'recording_paused') return t('eventTitle.recordingPaused')
+      if (d.subtype === 'recording_resumed') return t('eventTitle.recordingResumed')
+      if (d.subtype === 'config_changed') return `⚙ ${d.description || t('eventTitle.configChanged')}`
+      if (d.subtype === 'scope_recomputed') return `⟲ ${d.description || ''}`.trim()
+      if (d.subtype === 'scope_cleared') return `✓ ${d.description || ''}`.trim()
+      if (d.subtype === 'browser_launched') {
+        return t('eventTitle.browserLaunched', { proxy: d.proxy ? t('eventTitle.browserProxy', { proxy: String(d.proxy) }) : t('eventTitle.browserNoProxy') })
+      }
+      if (d.subtype === 'secret_revealed') return t('eventTitle.secretRevealed', { fields: (d.fields as string[])?.join(', ') || t('eventTitle.secretRevealedUnknown') })
+      if (d.subtype === 'connection_capture_started') return t('eventTitle.connectionCaptureOn')
+      if (d.subtype === 'capture_gap' && d.reason === 'gap-unsaved') return t('eventTitle.gapUnsaved', { count: String(d.skipped_units ?? '?') })
+      if (d.subtype === 'connection_monitor_saturated') return t('eventTitle.connectionSaturated', { count: String(d.count ?? '?') })
+      // RedLog's own state changes. Raw `system: ip_verdict` rows sat at the top
+      // of the activity log in the Stitch audit (2026-11-08); each gets a title.
+      if (d.subtype === 'http_proxy_started') return t('eventTitle.proxyStarted', { proxy: String(d.proxy ?? '') }).trim()
+      if (d.subtype === 'http_proxy_stopped') return t('eventTitle.proxyStopped')
+      if (d.subtype === 'http_proxy_failed') return t('capture.summary.http.failed')
+      if (d.subtype === 'http_proxy_orphan_reclaimed') return t('eventTitle.proxyOrphan', { pid: String(d.pid ?? '?') })
+      if (d.subtype === 'opsec_airgap') return t(d.enabled ? 'eventTitle.airgapOn' : 'eventTitle.airgapOff')
+      if (d.subtype === 'ip_verdict') return t('eventTitle.ipVerdict', { verdict: t(IP_VERDICT_KEY[String(d.ip_verdict_kind)] ?? 'ip.unknownIp') })
+      if (d.subtype === 'session_start') return t('eventTitle.sessionStart')
+      if (d.subtype === 'chain_sample_broken') return t('eventTitle.chainSampleBroken')
+      return t('eventTitle.systemOther', { name: String(d.subtype || '') })
+    default:
+      return `${event.agentType}: ${d.subtype || ''}`
+  }
+}

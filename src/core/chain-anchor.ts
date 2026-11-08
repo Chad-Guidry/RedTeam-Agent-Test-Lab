@@ -1,0 +1,875 @@
+import crypto from 'crypto'
+import { insertEvent } from './db/events'
+import { getPrimaryOperator } from './db/operators'
+import https from 'https'
+import { URL } from 'url'
+import { getDB, openReadOnlyDB, dbGeneration } from './db/index'
+import { canonicalStringify } from './db/events'
+import { verifyEventSignature } from './signing'
+
+export interface ChainAnchor {
+  id: string
+  headEventId: string | null
+  headHash: string
+  eventCount: number
+  calendarReceipts: CalendarReceipt[]
+  status: 'pending' | 'partial' | 'complete' | 'failed'
+  createdAt: number
+  completedAt: number | null
+}
+
+export interface CalendarReceipt {
+  calendar: string
+  ok: boolean
+  receiptB64?: string
+  error?: string
+  submittedAt: number
+  upgraded?: boolean
+  upgradedAt?: number | null
+  upgradedBytes?: number
+}
+
+const UPGRADED_MIN_BYTES = 200
+
+const DEFAULT_CALENDARS = [
+  'https://a.pool.opentimestamps.org',
+  'https://b.pool.opentimestamps.org',
+  'https://finney.calendar.eternitywall.com'
+]
+
+const HTTP_TIMEOUT_MS = 15000
+
+interface AnchorRow {
+  id: string
+  head_event_id: string | null
+  head_hash: string
+  event_count: number
+  calendar_receipts: string
+  status: string
+  created_at: number
+  completed_at: number | null
+}
+
+function rowToAnchor(row: AnchorRow): ChainAnchor {
+  let receipts: CalendarReceipt[] = []
+  try { receipts = JSON.parse(row.calendar_receipts) } catch { /* */ }
+  return {
+    id: row.id,
+    headEventId: row.head_event_id,
+    headHash: row.head_hash,
+    eventCount: row.event_count,
+    calendarReceipts: receipts,
+    status: row.status as ChainAnchor['status'],
+    createdAt: row.created_at,
+    completedAt: row.completed_at
+  }
+}
+
+/** The chain head: sha256 of the last chained event's hash followed by the
+ *  number of chained events, in decimal. Anchors, bundle manifests and the
+ *  offline verifier (tools/redlog-verify.py) all state the head in this form,
+ *  so it is computed only here. A bundle that wrote the bare last hash instead
+ *  failed its own verifier (#226). */
+export function chainHeadHash(lastHash: string, eventCount: number): string {
+  return crypto.createHash('sha256').update(lastHash).update(String(eventCount)).digest('hex')
+}
+
+export function computeChainHead(maxEvents?: number): { hash: string; headEventId: string | null; eventCount: number } | null {
+  const db = getDB()
+  if (maxEvents !== undefined) {
+    // A zero-length prefix has no head. The old form got this for free from
+    // LIMIT 0 returning no rows; OFFSET -1 would not.
+    if (maxEvents <= 0) return null
+    // v0.9.8: fetch only the Nth row, not the first N. This loaded every row
+    // up to `maxEvents` into an array purely to read its last element and
+    // length — 131k rows materialised to answer a question about one of them.
+    // OFFSET walks the same index entries but keeps a single row in memory.
+    // verifyLatestAnchor calls this on every chain-status request.
+    const row = db.prepare(
+      `SELECT id, hash FROM events WHERE hash IS NOT NULL ORDER BY created_at ASC, rowid ASC LIMIT 1 OFFSET ?`
+    ).get(maxEvents - 1) as { id: string; hash: string } | undefined
+    // Fewer rows exist than the anchor claims — the count below tells the
+    // caller how far the chain actually got, and it compares counts anyway.
+    if (!row) {
+      const n = (db.prepare(`SELECT COUNT(*) AS c FROM events WHERE hash IS NOT NULL`).get() as { c: number }).c
+      if (n === 0) return null
+      const tail = db.prepare(
+        `SELECT id, hash FROM events WHERE hash IS NOT NULL ORDER BY created_at DESC, rowid DESC LIMIT 1`
+      ).get() as { id: string; hash: string }
+      return { hash: chainHeadHash(tail.hash, n), headEventId: tail.id, eventCount: n }
+    }
+    return { hash: chainHeadHash(row.hash, maxEvents), headEventId: row.id, eventCount: maxEvents }
+  }
+  const row = db.prepare(
+    `SELECT id, hash FROM events WHERE hash IS NOT NULL ORDER BY created_at DESC, rowid DESC LIMIT 1`
+  ).get() as { id: string; hash: string } | undefined
+  const countRow = db.prepare(
+    `SELECT COUNT(*) as count FROM events WHERE hash IS NOT NULL`
+  ).get() as { count: number }
+  if (!row) return null
+  return { hash: chainHeadHash(row.hash, countRow.count), headEventId: row.id, eventCount: countRow.count }
+}
+
+export function listAnchors(limit = 50): ChainAnchor[] {
+  const db = getDB()
+  const rows = db.prepare(
+    `SELECT id, head_event_id, head_hash, event_count, calendar_receipts, status, created_at, completed_at
+     FROM chain_anchors ORDER BY created_at DESC LIMIT ?`
+  ).all(limit) as AnchorRow[]
+  return rows.map(rowToAnchor)
+}
+
+export function getLastAnchor(): ChainAnchor | null {
+  const db = getDB()
+  const row = db.prepare(
+    `SELECT id, head_event_id, head_hash, event_count, calendar_receipts, status, created_at, completed_at
+     FROM chain_anchors ORDER BY created_at DESC LIMIT 1`
+  ).get() as AnchorRow | undefined
+  return row ? rowToAnchor(row) : null
+}
+
+function postDigest(calendarUrl: string, hashBytes: Buffer): Promise<CalendarReceipt> {
+  return new Promise((resolve) => {
+    const submittedAt = Date.now()
+    const parsed = new URL(calendarUrl + '/digest')
+    const req = https.request({
+      hostname: parsed.hostname,
+      port: parsed.port || 443,
+      path: parsed.pathname,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/vnd.opentimestamps.v1',
+        'Content-Length': hashBytes.length,
+        'User-Agent': 'RedLog-anchor/0.1'
+      },
+      timeout: HTTP_TIMEOUT_MS
+    }, (res) => {
+      const chunks: Buffer[] = []
+      res.on('data', (c) => chunks.push(c as Buffer))
+      res.on('end', () => {
+        const body = Buffer.concat(chunks)
+        if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300 && body.length > 0) {
+          resolve({
+            calendar: calendarUrl,
+            ok: true,
+            receiptB64: body.toString('base64'),
+            submittedAt
+          })
+        } else {
+          resolve({
+            calendar: calendarUrl,
+            ok: false,
+            error: `HTTP ${res.statusCode}`,
+            submittedAt
+          })
+        }
+      })
+    })
+    req.on('error', (err) => {
+      resolve({ calendar: calendarUrl, ok: false, error: err.message, submittedAt })
+    })
+    req.on('timeout', () => {
+      req.destroy()
+      resolve({ calendar: calendarUrl, ok: false, error: 'timeout', submittedAt })
+    })
+    req.write(hashBytes)
+    req.end()
+  })
+}
+
+function insertAnchor(a: Omit<ChainAnchor, 'id'>): ChainAnchor {
+  const db = getDB()
+  const id = crypto.randomUUID()
+  db.prepare(
+    `INSERT INTO chain_anchors (id, head_event_id, head_hash, event_count, calendar_receipts, status, created_at, completed_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    id, a.headEventId, a.headHash, a.eventCount,
+    JSON.stringify(a.calendarReceipts), a.status, a.createdAt, a.completedAt
+  )
+  return { ...a, id }
+}
+
+export async function anchorNow(calendars: string[] = DEFAULT_CALENDARS): Promise<ChainAnchor | null> {
+  const head = computeChainHead()
+  if (!head) return null
+  const opened = dbGeneration()
+
+  const hashBytes = Buffer.from(head.hash, 'hex')
+  const receipts = await Promise.all(calendars.map((cal) => postDigest(cal, hashBytes)))
+  // The calendars can take 15 s each. A project switched in the meantime has
+  // a different chain: this head written into its anchors table reads as
+  // tampering on its next verify. Its own loop anchors it.
+  if (dbGeneration() !== opened) return null
+
+  const okCount = receipts.filter((r) => r.ok).length
+  let status: ChainAnchor['status'] = 'failed'
+  if (okCount > 0 && okCount === calendars.length) status = 'complete'
+  else if (okCount > 0) status = 'partial'
+
+  const now = Date.now()
+  const anchor = insertAnchor({
+    headEventId: head.headEventId,
+    headHash: head.hash,
+    eventCount: head.eventCount,
+    calendarReceipts: receipts,
+    status,
+    createdAt: now,
+    completedAt: okCount > 0 ? now : null
+  })
+
+  // v0.6.88 P2-B: an anchor failure is currently silent — dashboard shows
+  // "last anchor: N hours ago" and the operator has no idea why it stopped
+  // renewing. Emit a `system.anchor_failed` audit event so the chain records
+  // that OTS submission failed and delivery bundles carry the reason.
+  if (status === 'failed') {
+    try {
+      const opId = getPrimaryOperator()?.id
+      if (opId) {
+        insertEvent('system', {
+          subtype: 'anchor_failed',
+          headHash: head.hash,
+          eventCount: head.eventCount,
+          calendarsAttempted: calendars.length,
+          receipts: receipts.map((r) => ({ calendar: r.calendar, ok: r.ok, error: r.error })),
+          description: `OTS anchor failed across ${calendars.length} calendars`
+        }, { operatorId: opId })
+      }
+    } catch { /* audit event best-effort; anchor row itself is the real record */ }
+  }
+
+  return anchor
+}
+
+let loopTimer: ReturnType<typeof setInterval> | null = null
+let upgradeTimer: ReturnType<typeof setInterval> | null = null
+// The first tick of each, sooner than the interval. Kept so stop can cancel
+// them: untracked, a project switched to air-gap within 30 s had its chain
+// head posted to the public calendars by the previous project's first tick.
+let firstTicks: Array<ReturnType<typeof setTimeout>> = []
+
+export function startAnchorLoop(intervalMs = 60 * 60 * 1000, upgradeIntervalMs = 6 * 60 * 60 * 1000): void {
+  stopAnchorLoop()
+  const tick = async (): Promise<void> => {
+    try {
+      const head = computeChainHead()
+      if (!head) return
+      const last = getLastAnchor()
+      if (last && last.headHash === head.hash && last.status !== 'failed') return
+      await anchorNow()
+    } catch { /* best effort */ }
+  }
+  loopTimer = setInterval(tick, intervalMs)
+  firstTicks.push(setTimeout(tick, 30_000))
+
+  const upgradeTick = async (): Promise<void> => {
+    try { await upgradeAllPending() } catch { /* best effort */ }
+  }
+  upgradeTimer = setInterval(upgradeTick, upgradeIntervalMs)
+  firstTicks.push(setTimeout(upgradeTick, 2 * 60_000))
+}
+
+export function stopAnchorLoop(): void {
+  if (loopTimer) { clearInterval(loopTimer); loopTimer = null }
+  if (upgradeTimer) { clearInterval(upgradeTimer); upgradeTimer = null }
+  for (const t of firstTicks) clearTimeout(t)
+  firstTicks = []
+}
+
+export function verifyLatestAnchor(): { ok: boolean; anchor: ChainAnchor | null; currentHead: string | null; noAnchor?: boolean } {
+  const last = getLastAnchor()
+  const head = computeChainHead()
+  // v0.9.4: "never anchored" is not "the anchor disagrees with the chain".
+  // `ok` stays false — nothing has been verified — but `noAnchor` lets callers
+  // say which one it is. The Settings panel already branched on `anchor ===
+  // null`; the CLI printed "MISMATCH — investigate" and exited 2, and the MCP
+  // tool handed agents a bare {ok:false}, so an agent following the ship skill
+  // would report a broken evidence chain on a brand-new project.
+  if (!last || !head) return { ok: false, noAnchor: !last, anchor: last, currentHead: head?.hash ?? null }
+  const countOk = last.eventCount <= head.eventCount
+  const recomputedAtAnchor = computeChainHead(last.eventCount)
+  const hashOk = recomputedAtAnchor ? recomputedAtAnchor.hash === last.headHash : false
+  return { ok: countOk && hashOk, anchor: last, currentHead: head.hash }
+}
+
+const OTS_MAGIC = Buffer.from([
+  0x00, 0x4f, 0x70, 0x65, 0x6e, 0x54, 0x69, 0x6d, 0x65, 0x73, 0x74, 0x61,
+  0x6d, 0x70, 0x73, 0x00, 0x00, 0x50, 0x72, 0x6f, 0x6f, 0x66, 0x00, 0xbf,
+  0x89, 0xe2, 0xe8, 0x84, 0xe8, 0x92, 0x94
+])
+const OTS_VERSION = 0x01
+const OTS_OP_SHA256 = 0x08
+
+export function buildOtsBundle(headHashHex: string, receiptB64: string): Buffer {
+  const digest = Buffer.from(headHashHex, 'hex')
+  if (digest.length !== 32) throw new Error(`headHash must be 32 bytes (SHA-256), got ${digest.length}`)
+  const timestamp = Buffer.from(receiptB64, 'base64')
+  return Buffer.concat([
+    OTS_MAGIC,
+    Buffer.from([OTS_VERSION, OTS_OP_SHA256]),
+    digest,
+    timestamp
+  ])
+}
+
+function getTimestamp(calendarUrl: string, headHashHex: string): Promise<{ ok: boolean; status: number; body?: Buffer; error?: string }> {
+  return new Promise((resolve) => {
+    let parsed: URL
+    try { parsed = new URL(calendarUrl + '/timestamp/' + headHashHex) } catch (e) { return resolve({ ok: false, status: 0, error: (e as Error).message }) }
+    const req = https.request({
+      hostname: parsed.hostname,
+      port: parsed.port || 443,
+      path: parsed.pathname,
+      method: 'GET',
+      headers: {
+        'Accept': 'application/vnd.opentimestamps.v1',
+        'User-Agent': 'RedLog-anchor/0.1'
+      },
+      timeout: HTTP_TIMEOUT_MS
+    }, (res) => {
+      const chunks: Buffer[] = []
+      res.on('data', (c) => chunks.push(c as Buffer))
+      res.on('end', () => {
+        const body = Buffer.concat(chunks)
+        const s = res.statusCode ?? 0
+        if (s >= 200 && s < 300 && body.length > 0) resolve({ ok: true, status: s, body })
+        else resolve({ ok: false, status: s, error: `HTTP ${s}` })
+      })
+    })
+    req.on('error', (err) => resolve({ ok: false, status: 0, error: err.message }))
+    req.on('timeout', () => { req.destroy(); resolve({ ok: false, status: 0, error: 'timeout' }) })
+    req.end()
+  })
+}
+
+export async function upgradeAnchor(id: string): Promise<ChainAnchor | null> {
+  const existing = getAnchorById(id)
+  if (!existing) return null
+  const opened = dbGeneration()
+
+  const receipts = await Promise.all(existing.calendarReceipts.map(async (r) => {
+    if (!r.ok || r.upgraded) return r
+    const res = await getTimestamp(r.calendar, existing.headHash)
+    if (res.ok && res.body) {
+      const b64 = res.body.toString('base64')
+      const wasPending = r.receiptB64 ?? ''
+      const isBigger = res.body.length >= UPGRADED_MIN_BYTES && b64 !== wasPending
+      return {
+        ...r,
+        receiptB64: b64,
+        upgraded: isBigger,
+        upgradedAt: isBigger ? Date.now() : (r.upgradedAt ?? null),
+        upgradedBytes: res.body.length
+      }
+    }
+    return { ...r, upgraded: false, upgradedAt: r.upgradedAt ?? null, error: res.error ?? r.error }
+  }))
+  // Same window as anchorNow. This used to fail closed only because the
+  // handle it held had been closed by the switch — a throw, not a decision.
+  // The anchor id is the old project's; its own loop upgrades it next time.
+  if (dbGeneration() !== opened) return null
+  const db = getDB()
+
+  const anyUpgraded = receipts.some((r) => r.upgraded)
+  const allUpgraded = receipts.filter((r) => r.ok).every((r) => r.upgraded)
+  const status = allUpgraded ? 'complete' : (anyUpgraded ? 'partial' : existing.status)
+
+  db.prepare(
+    `UPDATE chain_anchors SET calendar_receipts = ?, status = ?, completed_at = COALESCE(completed_at, ?) WHERE id = ?`
+  ).run(JSON.stringify(receipts), status, anyUpgraded ? Date.now() : existing.completedAt, id)
+
+  return getAnchorById(id)
+}
+
+export async function upgradeAllPending(): Promise<{ upgraded: number; scanned: number }> {
+  const anchors = listAnchors(1000).filter((a) => a.calendarReceipts.some((r) => r.ok && !r.upgraded))
+  const opened = dbGeneration()
+  let upgraded = 0
+  for (const a of anchors) {
+    // The list is the opening project's: the next project's ids are not in it.
+    if (dbGeneration() !== opened) break
+    const result = await upgradeAnchor(a.id)
+    if (result && result.calendarReceipts.some((r) => r.upgraded)) upgraded++
+  }
+  return { upgraded, scanned: anchors.length }
+}
+
+export function getAnchorById(id: string): ChainAnchor | null {
+  const db = getDB()
+  const row = db.prepare(
+    `SELECT id, head_event_id, head_hash, event_count, calendar_receipts, status, created_at, completed_at
+     FROM chain_anchors WHERE id = ?`
+  ).get(id) as AnchorRow | undefined
+  return row ? rowToAnchor(row) : null
+}
+
+export interface ClockAnomaly {
+  eventId: string
+  prevEventId: string
+  hostname: string
+  sessionId: string
+  wallDeltaMs: number
+  monoDeltaMs: number
+  diffMs: number
+}
+
+export interface FullVerifyResult {
+  ok: boolean
+  walked: number
+  brokenAtEventId: string | null
+  brokenReason: string | null
+  currentHead: string | null
+  anchor: ChainAnchor | null
+  anchorMatchesWalkedHead: boolean
+  clockAnomalies: ClockAnomaly[]
+  // Per-event Ed25519 signature roll-up.
+  //   signedCount   — rows with a signature that verifies against the
+  //                   operator's DB-stored public key.
+  //   unsignedCount — rows without a signature because the operator signing
+  //                   key was unavailable. Not a failure signal
+  //                   on its own — chain hash still protects them.
+  //   badSignatureAtEventId — first row whose signature is present but does
+  //                   NOT verify. That IS a tamper signal; also causes ok=false.
+  signedCount: number
+  unsignedCount: number
+  badSignatureAtEventId: string | null
+}
+
+const CLOCK_TOLERANCE_MS = 5000
+
+interface WalkRow {
+  id: string
+  timestamp: number
+  engagement_id: string
+  session_id: string
+  operator_id: string
+  agent_type: string
+  hostname: string
+  source_ip: string | null
+  target_id: string | null
+  data: string
+  hash: string | null
+  prev_hash: string | null
+  created_at: number
+  monotonic_ns: string | null
+  ntp_offset_ms: number | null
+  signature: string | null
+}
+
+// v0.6.95 P0-4a: shared walker state, so the full walk (`verifyChainFullAsync`,
+// chunked, yields to the main loop) and the sampling verify can call the same
+// per-row logic. Extracting this lets us short-circuit shape
+// attempts lazily — most rows on a modern chain match the v0.6.88 canonical
+// shape, and older shapes only need to be computed as fallbacks. Previously
+// the walker eagerly computed all 6 SHA-256 hashes per row — 30-second block
+// at 100k events.
+interface WalkerState {
+  walked: number
+  expectedPrev: string | null
+  lastHash: string | null
+  clockAnomalies: ClockAnomaly[]
+  prevByHostSession: Map<string, WalkRow>
+  signedCount: number
+  unsignedCount: number
+  badSignatureAtEventId: string | null
+  lookupPubKey: (opId: string) => string | null
+}
+
+// v0.7.1 P3: subset of the row shape needed to rebuild a hash. Both
+// WalkRow (verifyChainFullAsync) and SampleRow (verifyRandomSample) satisfy
+// this structurally — the previous TODO warned that sharing the shape
+// list would need a helper with 15+ parameters, but bundling them into
+// this interface keeps the call sites one-argument.
+export interface HashableRow {
+  id: string
+  timestamp: number
+  engagement_id: string
+  session_id: string
+  operator_id: string
+  agent_type: string
+  hostname: string
+  source_ip: string | null
+  target_id: string | null
+  created_at: number
+  prev_hash: string | null
+  monotonic_ns: string | null
+  ntp_offset_ms: number | null
+}
+
+function canonicalHashPayload(row: HashableRow, parsedData: unknown): Record<string, unknown> {
+  return {
+    id: row.id,
+    timestamp: row.timestamp,
+    engagementId: row.engagement_id,
+    sessionId: row.session_id,
+    operatorId: row.operator_id,
+    agentType: row.agent_type,
+    hostname: row.hostname,
+    sourceIP: row.source_ip,
+    targetId: row.target_id,
+    data: parsedData,
+    prevHash: row.prev_hash,
+    createdAt: row.created_at,
+    monotonicNs: row.monotonic_ns,
+    ntpOffsetMs: row.ntp_offset_ms,
+    tier: 'chained',
+    hash: undefined
+  }
+}
+
+function verifyRowHash(row: WalkRow, parsedData: unknown):
+  { matched: { label: string; canonicalJsonForSig: string } | null; attemptLabels: string[] } {
+  const payload = canonicalHashPayload(row, parsedData)
+  const canonical = canonicalStringify(payload)
+  const computed = crypto.createHash('sha256').update(canonical).digest('hex')
+  return computed === row.hash
+    ? { matched: { label: 'canonical', canonicalJsonForSig: canonical }, attemptLabels: [`canonical=${computed.slice(0, 8)}`] }
+    : { matched: null, attemptLabels: [`canonical=${computed.slice(0, 8)}`] }
+}
+
+// Returns a FullVerifyResult if this row breaks the chain (caller should
+// return it immediately); null otherwise. State is mutated in place so the
+// walker can resume with the same counters.
+function processRow(row: WalkRow, state: WalkerState, currentHeadHash: string | null, anchor: ChainAnchor | null): FullVerifyResult | null {
+  state.walked++
+  if (row.prev_hash !== state.expectedPrev) {
+    return {
+      ok: false,
+      walked: state.walked,
+      brokenAtEventId: row.id,
+      brokenReason: `prev_hash mismatch (expected ${state.expectedPrev ?? 'null'}, got ${row.prev_hash ?? 'null'})`,
+      currentHead: currentHeadHash,
+      anchor,
+      anchorMatchesWalkedHead: false,
+      clockAnomalies: state.clockAnomalies,
+      signedCount: state.signedCount,
+      unsignedCount: state.unsignedCount,
+      badSignatureAtEventId: state.badSignatureAtEventId
+    }
+  }
+
+  const parsedData = JSON.parse(row.data)
+  const { matched, attemptLabels } = verifyRowHash(row, parsedData)
+  if (!matched) {
+    return {
+      ok: false,
+      walked: state.walked,
+      brokenAtEventId: row.id,
+      brokenReason: `hash mismatch (tried ${attemptLabels.join(', ')}, stored ${(row.hash ?? '').slice(0, 16)}...)`,
+      currentHead: currentHeadHash,
+      anchor,
+      anchorMatchesWalkedHead: false,
+      clockAnomalies: state.clockAnomalies,
+      signedCount: state.signedCount,
+      unsignedCount: state.unsignedCount,
+      badSignatureAtEventId: state.badSignatureAtEventId
+    }
+  }
+
+  // Verify the Ed25519 signature over the canonical payload.
+  if (row.signature) {
+    if (matched.canonicalJsonForSig) {
+      const pubKey = state.lookupPubKey(row.operator_id)
+      if (!pubKey) {
+        state.unsignedCount++
+      } else {
+        const sigOk = verifyEventSignature(matched.canonicalJsonForSig, row.signature, pubKey)
+        if (sigOk) {
+          state.signedCount++
+        } else {
+          if (state.badSignatureAtEventId == null) state.badSignatureAtEventId = row.id
+          return {
+            ok: false,
+            walked: state.walked,
+            brokenAtEventId: row.id,
+            brokenReason: 'signature invalid',
+            currentHead: currentHeadHash,
+            anchor,
+            anchorMatchesWalkedHead: false,
+            clockAnomalies: state.clockAnomalies,
+            signedCount: state.signedCount,
+            unsignedCount: state.unsignedCount,
+            badSignatureAtEventId: state.badSignatureAtEventId
+          }
+        }
+      }
+    } else {
+      state.unsignedCount++
+    }
+  } else {
+    state.unsignedCount++
+  }
+
+  const key = `${row.hostname}|${row.session_id}`
+  const prev = state.prevByHostSession.get(key)
+  if (prev && prev.monotonic_ns && row.monotonic_ns) {
+    const parse = (s: string): { boot: string; ns: bigint } | null => {
+      try {
+        if (s.includes('-')) {
+          const [boot, ns] = s.split('-', 2)
+          return { boot, ns: BigInt(ns) }
+        }
+        return { boot: '', ns: BigInt(s) }
+      } catch { return null }
+    }
+    const pr = parse(prev.monotonic_ns)
+    const cur = parse(row.monotonic_ns)
+    if (pr && cur && pr.boot === cur.boot) {
+      // `created_at`, not `timestamp`: an event may carry the producer's own
+      // occurrence time (see resolveOccurredAt in db/event-write.ts), so
+      // `timestamp` is not always a reading of this machine's clock. Comparing
+      // one against a monotonic counter would flag every row of a backfilled
+      // transcript as a clock anomaly. `created_at` is the receipt clock and is
+      // inside the same hash, so it is no less attested.
+      const wallDelta = row.created_at - prev.created_at
+      const monoDelta = Number((cur.ns - pr.ns) / 1000000n)
+      const diff = Math.abs(wallDelta - monoDelta)
+      if (diff > CLOCK_TOLERANCE_MS) {
+        state.clockAnomalies.push({
+          eventId: row.id,
+          prevEventId: prev.id,
+          hostname: row.hostname,
+          sessionId: row.session_id,
+          wallDeltaMs: wallDelta,
+          monoDeltaMs: monoDelta,
+          diffMs: diff
+        })
+      }
+    }
+  }
+  state.prevByHostSession.set(key, row)
+
+  state.expectedPrev = row.hash
+  state.lastHash = row.hash
+  return null
+}
+
+function initWalkerState(): WalkerState {
+  const db = getDB()
+  const pubKeyCache = new Map<string, string | null>()
+  const pubKeyStmt = db.prepare(`SELECT signer_pub_key FROM operators WHERE id = ?`)
+  return {
+    walked: 0,
+    expectedPrev: null,
+    lastHash: null,
+    clockAnomalies: [],
+    prevByHostSession: new Map<string, WalkRow>(),
+    signedCount: 0,
+    unsignedCount: 0,
+    badSignatureAtEventId: null,
+    // v0.6.89: cache operator → public key lookups. verifyChainFullAsync walks the
+    // full events table; a typical operator set is <20, so a Map keyed by
+    // operator_id is cheaper than a JOIN and lets us surface "no pubkey" as
+    // "unsigned" cleanly.
+    lookupPubKey: (opId: string): string | null => {
+      if (pubKeyCache.has(opId)) return pubKeyCache.get(opId) ?? null
+      const row = pubKeyStmt.get(opId) as { signer_pub_key: string | null } | undefined
+      const key = row?.signer_pub_key ?? null
+      pubKeyCache.set(opId, key)
+      return key
+    }
+  }
+}
+
+function finaliseWalk(state: WalkerState, anchor: ChainAnchor | null, currentHead: ReturnType<typeof computeChainHead>): FullVerifyResult {
+  // The head at the anchored row count, as verifyLatestAnchor computes it.
+  // This used to fall back to "the anchored count has been reached", so once
+  // the chain grew past an anchor any anchor passed — including one a chain
+  // re-hashed end to end no longer matches, the one rewrite only it catches.
+  const anchorMatchesWalkedHead = anchor !== null && state.lastHash !== null
+    && anchor.eventCount <= state.walked
+    && computeChainHead(anchor.eventCount)?.hash === anchor.headHash
+  return {
+    ok: true,
+    walked: state.walked,
+    brokenAtEventId: null,
+    brokenReason: null,
+    currentHead: currentHead?.hash ?? null,
+    anchor,
+    anchorMatchesWalkedHead,
+    clockAnomalies: state.clockAnomalies,
+    signedCount: state.signedCount,
+    unsignedCount: state.unsignedCount,
+    badSignatureAtEventId: state.badSignatureAtEventId
+  }
+}
+
+const WALK_STMT_SQL =
+  `SELECT id, timestamp, engagement_id, session_id, operator_id, agent_type,
+          hostname, source_ip, target_id, data, hash, prev_hash, created_at,
+          monotonic_ns, ntp_offset_ms, signature
+   FROM events ORDER BY created_at ASC, rowid ASC`
+
+// v0.6.95 P0-4a: the full walk yields to the event loop every CHUNK rows.
+// It walks the entire events table (SHA-256 per row for up to 6 shape
+// variants + Ed25519 verify); done synchronously, 100k events blocked the main
+// thread for 10-30s and froze the renderer. So it drains a chunk, hands the
+// main loop back with `setImmediate`, then resumes. (The synchronous variant
+// was removed in Spec 030: only tests called it, so they verified a path the
+// app never ran.)
+const ASYNC_CHUNK_ROWS = 1000
+export async function verifyChainFullAsync(): Promise<FullVerifyResult> {
+  const anchor = getLastAnchor()
+  const currentHead = computeChainHead()
+  const state = initWalkerState()
+  // v0.11.1 (AUDIT P1-1): walk on a SEPARATE read-only connection.
+  //
+  // The iterator below stays open across every setImmediate yield, and
+  // better-sqlite3 refuses `.run()` on a connection with a live iterator
+  // ("This database connection is busy executing a query"). On the primary
+  // handle that meant every capture write during a full verify failed — REST
+  // 500s, the shell hook spooling, capture-health going dark — for the tens of
+  // seconds a large chain takes. WAL lets this reader run alongside the
+  // writer, so the walk no longer blocks capture.
+  const readDb = openReadOnlyDB()
+  try {
+    const rowIter = readDb.prepare(WALK_STMT_SQL).iterate() as IterableIterator<WalkRow>
+    let inChunk = 0
+    for (const row of rowIter) {
+      const broken = processRow(row, state, currentHead?.hash ?? null, anchor)
+      if (broken) return broken
+      if (++inChunk >= ASYNC_CHUNK_ROWS) {
+        inChunk = 0
+        // Yield so queued IPC / renderer messages get a turn between chunks.
+        await new Promise<void>((resolve) => setImmediate(resolve))
+      }
+    }
+    return finaliseWalk(state, anchor, currentHead)
+  } finally {
+    readDb.close()
+  }
+}
+
+// Read-path sampling verify. verifyChainFullAsync walks the whole
+// chain and is Settings-button-only; a chain-aware attacker that edits N rows,
+// recomputes hashes forward, and rebuilds the OTS-anchored region has time
+// before the operator manually verifies. Sampling turns detection into a
+// probability: run K random rows on every project open + every 5 minutes,
+// and the odds of tampering escaping N runs shrinks exponentially.
+//
+// Each sampled row uses the same canonical payload as verifyChainFullAsync and
+// verifies its link against the actual previous row's stored hash.
+export interface RandomSampleResult {
+  ok: boolean
+  sampled: number
+  brokenAtEventId: string | null
+  brokenReason: string | null
+}
+
+interface SampleRow {
+  id: string
+  timestamp: number
+  engagement_id: string
+  session_id: string
+  operator_id: string
+  agent_type: string
+  hostname: string
+  source_ip: string | null
+  target_id: string | null
+  data: string
+  hash: string | null
+  prev_hash: string | null
+  created_at: number
+  monotonic_ns: string | null
+  ntp_offset_ms: number | null
+}
+
+export function verifyRandomSample(count = 50): RandomSampleResult {
+  const db = getDB()
+  // v0.9.8: sample by rowid instead of ORDER BY RANDOM().
+  //
+  // RANDOM() forces SQLite to assign a random key to every row and sort the
+  // lot — "SCAN events | USE TEMP B-TREE FOR ORDER BY". Because the sort
+  // materialises the full row, that means reading the entire `data` column
+  // too. Measured on a real 131k-event engagement whose data column is 151 MB
+  // (an AI-transcript-heavy project, where `tool_result` rows average 3.8 KB):
+  // 3.7 s for a 100-row sample, 1.8 s for 50. This runs synchronously on the
+  // main process at every project open AND on a 5-minute timer — a ~2 s
+  // freeze, four times an hour, forever.
+  //
+  // The prior note here guessed this would only matter past 1M rows. It was
+  // reasoning about row COUNT; what actually matters is total bytes, and a
+  // transcript-heavy project gets there two orders of magnitude sooner.
+  //
+  // Rowids are dense because `no_delete_events` makes DELETE impossible, so
+  // picking random integers in [MIN(rowid), MAX(rowid)] hits a real row
+  // essentially every time. Over-draw slightly to absorb any gap (a failed
+  // INSERT still burns a rowid), then take the first `count` that came back.
+  const bounds = db.prepare(`SELECT MIN(rowid) AS lo, MAX(rowid) AS hi FROM events`).get() as
+    { lo: number | null; hi: number | null } | undefined
+  if (!bounds?.lo || !bounds.hi) {
+    return { ok: true, sampled: 0, brokenAtEventId: null, brokenReason: null }
+  }
+  const span = bounds.hi - bounds.lo + 1
+  const wanted = Math.min(count, span)
+  const picks = new Set<number>()
+  if (wanted >= span) {
+    // Asking for at least as many rows as exist: take the whole range rather
+    // than drawing. Random draws would usually cover it but not always — it is
+    // the coupon-collector problem, so a small table could silently verify
+    // fewer rows than it has, and any test asserting "sampled === rowCount"
+    // would be flaky rather than wrong.
+    for (let r = bounds.lo; r <= bounds.hi; r++) picks.add(r)
+  } else {
+    // Bounded attempts so a sparse table cannot spin here; whatever we have
+    // when the budget runs out is still a valid random sample, just smaller.
+    for (let tries = 0; picks.size < wanted && tries < wanted * 4; tries++) {
+      picks.add(bounds.lo + Math.floor(Math.random() * span))
+    }
+  }
+  const ids = [...picks]
+  const rows = db.prepare(
+    `SELECT rowid AS rid, id, timestamp, engagement_id, session_id, operator_id, agent_type,
+            hostname, source_ip, target_id, data, hash, prev_hash, created_at,
+            monotonic_ns, ntp_offset_ms
+     FROM events WHERE rowid IN (${ids.map(() => '?').join(',')}) AND hash IS NOT NULL`
+  ).all(...ids) as Array<SampleRow & { rid: number }>
+
+  if (rows.length === 0) {
+    return { ok: true, sampled: 0, brokenAtEventId: null, brokenReason: null }
+  }
+
+  // v0.9.8: row-value comparison instead of the equivalent OR. Semantically
+  // identical — "the row immediately before this one in (created_at, rowid)
+  // order" — but SQLite cannot drive an index from an OR across two different
+  // predicates, so the old form degraded into a scan of the events table, and
+  // scanning means paging in the whole `data` column. Measured on a real
+  // 131k-event / 151 MB engagement: 39.5 ms per lookup, 3.95 s for the 100
+  // lookups one sample makes. The row-value form takes 0.6 ms for all 100.
+  //
+  // That single query was the entire cost of verifyRandomSample — which runs
+  // at every project open and on a 5-minute timer, synchronously on the main
+  // process.
+  const prevLookup = db.prepare(
+    `SELECT hash FROM events WHERE (created_at, rowid) < (?, ?) ORDER BY created_at DESC, rowid DESC LIMIT 1`
+  )
+
+  for (const row of rows) {
+    let parsedData: unknown
+    try { parsedData = JSON.parse(row.data) } catch {
+      return { ok: false, sampled: rows.length, brokenAtEventId: row.id, brokenReason: 'data column is not valid JSON' }
+    }
+    const { matched, attemptLabels } = verifyRowHash({ signature: null, ...row }, parsedData)
+    if (!matched) {
+      return {
+        ok: false,
+        sampled: rows.length,
+        brokenAtEventId: row.id,
+        brokenReason: `hash mismatch (tried ${attemptLabels.join(', ')}, stored ${(row.hash ?? '').slice(0, 16)}...)`
+      }
+    }
+
+    const prev = prevLookup.get(row.created_at, row.rid) as { hash: string } | undefined
+    const expectedPrev = prev?.hash ?? null
+    if (row.prev_hash !== expectedPrev) {
+      return {
+        ok: false,
+        sampled: rows.length,
+        brokenAtEventId: row.id,
+        brokenReason: `prev_hash mismatch (expected ${expectedPrev?.slice(0, 16) ?? 'null'}..., got ${row.prev_hash?.slice(0, 16) ?? 'null'}...)`
+      }
+    }
+  }
+
+  return { ok: true, sampled: rows.length, brokenAtEventId: null, brokenReason: null }
+}

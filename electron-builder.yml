@@ -1,0 +1,126 @@
+appId: com.redlog.app
+productName: RedLog
+directories:
+  buildResources: resources
+  output: dist
+files:
+  - out/**/*
+  - "!out/optional-ai/**/*"
+  - resources/**/*
+  - "!resources/installer.nsh"
+  # MSBuild's intermediate tree from node-gyp builds of node-pty and
+  # better-sqlite3: .tlog, .lastbuildstate and .recipe files nothing loads.
+  # Their deepest paths sit 139 characters below the install root. An NSIS
+  # upgrade renames every file through MAX_PATH-bound calls, so from an install
+  # folder deeper than about 120 characters, the upgrade aborted ("…: 2").
+  - "!**/node_modules/**/build/**/obj/**"
+# Ship the hook scripts alongside the app so the packaged build can point at
+# them when it installs a hook. (The stdio MCP bridge that used to ride along
+# here was removed in 2026-08 — `mcp/` no longer exists and every build was
+# printing "file source doesn't exist" for it.)
+extraResources:
+  # Optional AI packages are inert here; install copies only the selected package.
+  - from: out/optional-ai
+    to: optional-ai
+  - from: hooks
+    to: hooks
+    filter: ["**/*", "!**/__pycache__/**", "!**/*.pyc"]
+  # Bundled plugin packs (loader.ts bundledRoot() reads <resources>/plugins).
+  # Ships the declarative packs the app depends on — builtin-tools (E1 Option B:
+  # the tool→target extraction table core no longer hardcodes) and c2-tailers.
+  # Without this the packaged build finds no bundled plugins and target
+  # extraction (and scope monitoring that rides on it) silently goes dark.
+  - from: plugins
+    to: plugins
+  # The offline evidence-bundle verifier every export copies in. bundle-export
+  # resolves it as <resources>/tools/redlog-verify.py in a packaged build;
+  # without this line every installed RedLog exported bundles with no verifier.
+  - from: tools/redlog-verify.py
+    to: tools/redlog-verify.py
+mac:
+  # Seal the final app even when release CI has no Developer ID certificate.
+  # Skipping signing leaves Electron's stale linker signature after repacking.
+  # Ad-hoc signing is not notarization or an authenticated publisher identity.
+  identity: "-"
+  entitlements: resources/entitlements.mac.plist
+  entitlementsInherit: resources/entitlements.mac.plist
+  icon: resources/icon.icns
+  category: public.app-category.developer-tools
+  extendInfo:
+    # macOS gates the Wi-Fi SSID behind Location Services; this lets RedLog
+    # request it (opt-in) so the HUD can show the real network name.
+    NSLocationWhenInUseUsageDescription: RedLog uses your location only to read the current Wi-Fi network name for the operator HUD. No location data leaves your machine.
+    NSLocationUsageDescription: RedLog uses your location only to read the current Wi-Fi network name for the operator HUD. No location data leaves your machine.
+  # v0.9.4: Apple Silicon only. An unsigned, unnotarised dev tool doesn't
+  # justify doubling every release's artifact size for Intel; those users
+  # build from source.
+  target:
+    - target: dmg
+      arch:
+        - arm64
+    - target: zip
+      arch:
+        - arm64
+win:
+  # A real multi-size .ico, not a single PNG. Handed one PNG, electron-builder
+  # downscales it to fill every slot, and the 16px slot — the one Windows shows
+  # in the taskbar and Explorer all day — comes out as mush. resources/icon.ico
+  # renders each size from the right master instead (tools/make-icons.py).
+  icon: resources/icon.ico
+  target:
+    - target: nsis
+      arch:
+        - x64
+nsis:
+  artifactName: RedLog.Setup.${version}.${ext}
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  # Removes shell enrolments on uninstall (not on upgrade); see the file.
+  include: resources/installer.nsh
+linux:
+  # DEB requires a maintainer email; package.json's author is only a name.
+  # Use the repository's public maintainer identity for the installed package.
+  maintainer: Guan4Tou2 <mole30608@gmail.com>
+  # A DIRECTORY of NxN.png (electron-builder's Linux icon-set format) instead of
+  # a single 256px file every panel/launcher had to downscale itself — the
+  # mushy result RING_MIN_PX exists to avoid. tools/make-icons.py regenerates
+  # resources/icon-<N>.png; these are the same renders named <N>x<N>.png.
+  icon: resources/icons
+  target:
+    - target: deb
+      arch:
+        - x64
+  category: Development
+deb:
+  # python3 and curl are not optional on POSIX: the shell adapter builds every
+  # event with python3 and posts it with curl, and the BUILT-IN terminal
+  # sources that same adapter. Without them a Kali install opens, records the
+  # screen, and puts no command on the Timeline — which the first-run screen
+  # cannot distinguish from an operator who has not typed anything yet.
+  #
+  # Declaring them makes `apt install ./redlog_*.deb` leave a machine where
+  # command capture is guaranteed to work, instead of one that needs a
+  # remediation step nobody reads. mitmproxy stays optional — it is for web
+  # work and a hard dependency would drag in a Python toolchain for operators
+  # who never proxy anything.
+  # `depends` REPLACES electron-builder's default list rather than extending
+  # it, so the Electron runtime's own libraries are repeated here. Keep them
+  # in sync with getDefaultDepends('deb') in app-builder-lib when upgrading.
+  depends:
+    - libgtk-3-0
+    - libnotify4
+    - libnss3
+    - libxss1
+    - libxtst6
+    - xdg-utils
+    - libatspi2.0-0
+    - libuuid1
+    - libsecret-1-0
+    - python3
+    - curl
+publish:
+  provider: github
+  releaseType: release

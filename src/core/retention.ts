@@ -1,0 +1,530 @@
+// Retention sweeps for large per-project artifacts (.cast recordings +
+// screenshot .jpg files). Runs once on project open. The DB event row
+// stays regardless — only the on-disk file is deleted, and a
+// `system.cast_pruned` / `system.screenshot_pruned` audit event is
+// appended per deletion so the chain records that raw evidence was
+// removed by policy (as opposed to silently disappearing).
+//
+// v0.6.87 B1 + B2.
+
+import fs from 'fs'
+import path from 'path'
+import { getProjectDir, getDB } from './db/index'
+import { insertEvent } from './db/events'
+import { deleteBookmarksOlderThan } from './db/bookmarks'
+import { eventBus } from './event-bus'
+import { noteDbError } from './capture-health'
+import { pruneCast } from './cast-index'
+import { BODY_REF_FIELDS } from './http-body-store'
+import { matchPattern } from './scope-evaluator'
+import { planEviction, type BodyEntry } from './body-eviction'
+import { pruneHttpBodyIndex, pruneSavedFileIndex } from './http-body-index'
+import type { RedLogConfig } from './config'
+
+// v0.6.89 `_causes`: cast_pruned and screenshot_pruned should reference the
+// upstream event so focus chain walks light up the "originally recorded here
+// → later pruned by retention" arc. For casts we can look up the session_end
+// event whose data.castPath matches the file we're deleting; for screenshots
+// the .jpg filename is chosen at capture time, so we look up the screenshot
+// event by its data.filename basename.
+function lookupCauseEventId(subtype: 'cast_pruned' | 'screenshot_pruned', absPath: string): string | null {
+  try {
+    const db = getDB()
+    const basename = path.basename(absPath)
+    if (subtype === 'cast_pruned') {
+      const row = db.prepare(`
+        SELECT id FROM events
+        WHERE agent_type = 'shell'
+          AND subtype = 'session_end'
+          AND (json_extract(data,'$.castPath') = ? OR EXISTS (
+            SELECT 1 FROM json_each(data, '$.castSegments') part WHERE json_extract(part.value, '$.path') = ?))
+        ORDER BY created_at DESC LIMIT 1
+      `).get(absPath, absPath) as { id: string } | undefined
+      return row?.id ?? null
+    }
+    // screenshot_pruned: the screenshot event stores `filename` (basename only)
+    // and `filePath` (absolute). Match on either — some old rows only have one.
+    const row = db.prepare(`
+      SELECT id FROM events
+      WHERE agent_type = 'screenshot'
+        AND (json_extract(data,'$.filePath') = ? OR json_extract(data,'$.filename') = ?)
+      ORDER BY created_at DESC LIMIT 1
+    `).get(absPath, basename) as { id: string } | undefined
+    return row?.id ?? null
+  } catch { return null }
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000
+
+function sweepDir(
+  dir: string,
+  keepDays: number,
+  matcher: (name: string) => boolean,
+  auditSubtype: string,
+  opts: { engagementId: string; operatorId: string }
+): number {
+  if (keepDays <= 0) return 0
+  if (!fs.existsSync(dir)) return 0
+  const cutoff = Date.now() - keepDays * DAY_MS
+  let pruned = 0
+  let entries: string[] = []
+  try { entries = fs.readdirSync(dir) } catch { return 0 }
+  for (const name of entries) {
+    if (!matcher(name)) continue
+    const full = path.join(dir, name)
+    let stat: fs.Stats
+    try { stat = fs.statSync(full) } catch { continue }
+    if (stat.mtimeMs > cutoff) continue
+    // v0.6.89: resolve the upstream event id BEFORE deletion so the audit
+    // event points at the original recording/screenshot row for focus chain.
+    const causeId = (auditSubtype === 'cast_pruned' || auditSubtype === 'screenshot_pruned')
+      ? lookupCauseEventId(auditSubtype, full)
+      : null
+    try {
+      fs.unlinkSync(full)
+      pruned++
+      // The recording's text lives in a second place. An index that outlives
+      // the file it describes turns a retention policy into a lie: the
+      // operator is told the recording aged out, and its contents are still
+      // searchable.
+      if (auditSubtype === 'cast_pruned') {
+        try { pruneCast(name) } catch (e) { noteDbError('retention-cast-index', e) }
+      }
+      if (auditSubtype === 'http_body_pruned') {
+        try { pruneHttpBodyIndex(path.basename(name, '.body')) } catch (e) { noteDbError('retention-body-index', e) }
+      }
+      if(auditSubtype==='agent_transcript_pruned'){
+        try{pruneSavedFileIndex(full)}catch(error){noteDbError('retention-transcript-index',error)}
+      }
+      try {
+        const ev = insertEvent('system', {
+          subtype: auditSubtype,
+          path: full,
+          bytes: stat.size,
+          ageDays: Math.round((Date.now() - stat.mtimeMs) / DAY_MS),
+          description: `pruned by retention policy (${keepDays}d)`,
+          ...(causeId ? { _causes: [causeId] } : {})
+        }, opts)
+        if (ev) eventBus.publish(ev)
+      } catch (e) { noteDbError('retention-sweep', e) }
+    } catch { /* file gone / permission — skip */ }
+  }
+  return pruned
+}
+
+/** v0.13.0 (docs/DESIGN-logged-tier-retention.md): row-level sweep of the
+ *  events_logged table. Age-based delete keyed on `created_at`
+ *  (clock-drift-immune; see design §5.2). Fires one chained
+ *  `system.retention_pruned_logged` summary event when count > 0
+ *  (mirrors the cast_pruned non-empty convention). Respects
+ *  `eventBus.paused` for symmetry with insertEvent. */
+export interface LoggedTierRetentionResult {
+  deleted: number
+  bytesFreed: number
+  oldestPruned: number | null
+  newestPruned: number | null
+  durationMs: number
+}
+
+const BATCH_SIZE = 5000  // §5.3: large deletes are batched so a 40 GB
+                         // sweep doesn't stall WAL for minutes.
+
+export function sweepLoggedTier(
+  cfg: { keepDays?: number } | undefined,
+  opts: { engagementId: string; operatorId: string }
+): LoggedTierRetentionResult {
+  const noop = { deleted: 0, bytesFreed: 0, oldestPruned: null, newestPruned: null, durationMs: 0 }
+  if (!opts.operatorId) return noop
+  // §5.4: sweep respects eventBus.paused for symmetry with insertEvent —
+  // a paused RedLog does NOT prune. Recording resumes → next timer tick
+  // catches up.
+  if (eventBus.paused) return noop
+  // Env var override for CI / air-gapped installs (design §4.3).
+  // Guard the empty-string case: `Number('') === 0` would otherwise pass
+  // Number.isFinite && >= 0 and silently switch to keep-forever, exactly
+  // the silent-typo-vaporises-tier failure §7.2 wanted to avoid.
+  const envRaw = process.env.REDLOG_LOGGED_RETENTION_DAYS
+  const envDays = envRaw && envRaw.length > 0 ? Number(envRaw) : NaN
+  const keepDays = Number.isFinite(envDays) && envDays >= 0
+    ? envDays
+    : (cfg?.keepDays ?? 0)
+  if (keepDays <= 0) return noop  // 0 = keep forever (opt-out)
+
+  const cutoff = Date.now() - keepDays * DAY_MS
+  const started = Date.now()
+  let db
+  try { db = getDB() } catch { return noop }
+
+  // Bounds first — for the summary event.
+  const bounds = db.prepare(
+    'SELECT MIN(created_at) as oldest, MAX(created_at) as newest FROM events_logged WHERE created_at < ?'
+  ).get(cutoff) as { oldest: number | null; newest: number | null }
+  if (bounds.oldest === null) return noop  // nothing to prune
+
+  // Byte estimate before delete — pages freed is approximate but useful.
+  // The `data` blob is the dominant weight; sum its length.
+  const bytesRow = db.prepare(
+    'SELECT COALESCE(SUM(LENGTH(data)), 0) as bytes FROM events_logged WHERE created_at < ?'
+  ).get(cutoff) as { bytes: number }
+  const bytesFreed = bytesRow.bytes
+
+  // Batched delete. `changes()` gives us the per-statement count so we
+  // can loop until the affected set is empty (or bounded — no infinite
+  // loops on a stuck row).
+  let deleted = 0
+  const stmt = db.prepare(
+    `DELETE FROM events_logged WHERE rowid IN (
+       SELECT rowid FROM events_logged WHERE created_at < ? LIMIT ${BATCH_SIZE}
+     )`
+  )
+  for (let iterations = 0; iterations < 10_000; iterations++) {
+    const info = stmt.run(cutoff)
+    const batchDeleted = Number(info.changes ?? 0)
+    if (batchDeleted === 0) break
+    deleted += batchDeleted
+  }
+  if (deleted === 0) return noop
+
+  const durationMs = Date.now() - started
+  try {
+    const ev = insertEvent('system', {
+      subtype: 'retention_pruned_logged',
+      count: deleted,
+      bytes_freed: bytesFreed,
+      oldest_pruned_at: bounds.oldest,
+      newest_pruned_at: bounds.newest,
+      keep_days: keepDays,
+      sweep_duration_ms: durationMs,
+      description: `retention: pruned ${deleted} logged-tier row(s), freed ~${Math.round(bytesFreed / 1024 / 1024)} MB (${keepDays}d policy)`
+    }, opts)
+    if (ev) eventBus.publish(ev)
+  } catch (e) { noteDbError('retention-sweep-logged', e) }
+
+  return {
+    deleted,
+    bytesFreed,
+    oldestPruned: bounds.oldest,
+    newestPruned: bounds.newest,
+    durationMs
+  }
+}
+
+export function sweepRetention(config: Pick<RedLogConfig, 'retention'>, opts: { engagementId: string; operatorId: string }): { cast: number; screenshots: number; agentTranscripts: number; httpBodies: number } {
+  if (!opts.operatorId) return { cast: 0, screenshots: 0, agentTranscripts: 0, httpBodies: 0 }
+  let projectDir: string
+  try { projectDir = getProjectDir() } catch { return { cast: 0, screenshots: 0, agentTranscripts: 0, httpBodies: 0 } }
+  const castDays = config.retention?.casts?.keepDays ?? 0
+  const shotDays = config.retention?.screenshots?.keepDays ?? 0
+  // v0.7.2 F: agent-transcripts sweep.
+  // v0.7.4 F2: default changed from 30 to 0 (keep forever unless opted in),
+  // matching cast + screenshot conventions. Code-review adversarial pass
+  // caught that pruning a sidecar whose Claude Code source .jsonl still
+  // exists caused every historical turn to be re-inserted as fresh chained
+  // events on next project open — because the tailer used sidecar size as
+  // its sole "how far have we processed" marker. That specific corruption
+  // path is now closed by the F2 DB-side seed of `redlogIdByUuid` at
+  // registerSession (which dedups even if the sidecar was reset), but
+  // matching sibling conventions removes the surprise for operators who
+  // expected evidence to be kept by default.
+  const agentDays = config.retention?.agentTranscripts?.keepDays ?? 0
+  const cast = sweepDir(
+    path.join(projectDir, 'casts'),
+    castDays,
+    (n) => n.endsWith('.cast'),
+    'cast_pruned',
+    opts
+  )
+  const screenshots = sweepDir(
+    path.join(projectDir, 'screenshots'),
+    shotDays,
+    (n) => /\.(jpg|jpeg|png)$/i.test(n),
+    'screenshot_pruned',
+    opts
+  )
+  const agentTranscripts = sweepDir(
+    path.join(projectDir, 'agent-transcripts'),
+    agentDays,
+    (n) => n.endsWith('.jsonl') || n.endsWith('.bak'),
+    'agent_transcript_pruned',
+    opts
+  )
+  const httpBodyDays = config.retention?.httpBodies?.keepDays ?? 0
+  const httpBodies = sweepDir(
+    path.join(projectDir, 'http-bodies'),
+    httpBodyDays,
+    (n) => n.endsWith('.body'),
+    'http_body_pruned',
+    opts
+  )
+  return { cast, screenshots, agentTranscripts, httpBodies }
+}
+
+// ── Size-pressure eviction for the HTTP body store ──────────────────────────
+//
+// Separate from sweepRetention because it answers a different question: not
+// "what is older than N days" but "the disk is filling — what can go without
+// losing evidence". The planner (body-eviction.ts) holds the policy and the
+// safety proof; this function is the join and the side effects.
+//
+// The event is never touched, only the .body file. The event keeps its
+// { sha256, size, file } attestation and the chain keeps verifying — an
+// evicted body reads back as "content no longer on disk", not as a fact that
+// was erased. See body-eviction.ts for why that makes this safe.
+/** Age-based cleanup of the bookmarks (書籤) table. Bookmarks are a private
+ *  notepad — not chained, not attributed — but they hold pasted secrets and
+ *  the captured external IP, so permanent retention is the wrong default.
+ *  `0` = keep forever. Respects pause (a paused RedLog prunes nothing). */
+export function sweepBookmarks(
+  cfg: { keepDays?: number } | undefined,
+  opts: { engagementId: string; operatorId: string }
+): number {
+  if (!opts.operatorId || eventBus.paused) return 0
+  const keepDays = cfg?.keepDays ?? 0
+  if (keepDays <= 0) return 0
+  const cutoff = Date.now() - keepDays * DAY_MS
+  let deleted = 0
+  try { deleted = deleteBookmarksOlderThan(cutoff) } catch (e) { noteDbError('retention-bookmarks', e); return 0 }
+  if (deleted > 0) {
+    // Content is never in the audit row — only the fact that N notes aged out.
+    const ev = insertEvent('system', {
+      subtype: 'bookmarks_pruned', count: deleted, keep_days: keepDays,
+      description: `Pruned ${deleted} bookmark(s) older than ${keepDays}d`
+    }, { engagementId: opts.engagementId, operatorId: opts.operatorId })
+    if (ev) eventBus.publish(ev)
+  }
+  return deleted
+}
+
+export function sweepBodyStore(
+  config: Pick<RedLogConfig, 'retention'> & { scope?: { targets?: string[] } },
+  opts: { engagementId: string; operatorId: string }
+): { evicted: number; freedBytes: number; shortfallBytes: number } {
+  const none = { evicted: 0, freedBytes: 0, shortfallBytes: 0 }
+  if (!opts.operatorId) return none
+  const budget = config.retention?.httpBodies?.maxBytes ?? 0
+  if (budget <= 0) return none  // unbounded is the default; opt in to bound it
+
+  let projectDir: string
+  try { projectDir = getProjectDir() } catch { return none }
+  const dir = path.join(projectDir, 'http-bodies')
+  if (!fs.existsSync(dir)) return none
+
+  // 1. The files on disk, with size and coldness.
+  let names: string[]
+  try { names = fs.readdirSync(dir).filter((n) => n.endsWith('.body')) } catch { return none }
+  const stat = new Map<string, { sizeBytes: number; mtimeMs: number }>()
+  for (const n of names) {
+    try { const s = fs.statSync(path.join(dir, n)); stat.set(n, { sizeBytes: s.size, mtimeMs: s.mtimeMs }) }
+    catch { /* vanished mid-scan */ }
+  }
+
+  // 2. Scope is the pin. A .body file is pinned if ANY event referencing it
+  //    (bodies are deduped, so one file backs many events) has an in-scope
+  //    target — OR-ing across references is what makes eviction refcount-gated:
+  //    evictable only when every reference agrees it is not evidence.
+  const pinned = pinnedFiles(config.scope?.targets ?? [])
+
+  const entries: BodyEntry[] = []
+  for (const [file, s] of stat) {
+    entries.push({ file, sizeBytes: s.sizeBytes, mtimeMs: s.mtimeMs, pinned: pinned.has(file) })
+  }
+
+  // 3. Decide, then act.
+  const plan = planEviction(entries, budget)
+  if (plan.evict.length === 0 && plan.shortfallBytes === 0) return none
+
+  let evicted = 0
+  let freedBytes = 0
+  for (const file of plan.evict) {
+    try {
+      fs.unlinkSync(path.join(dir, file))
+      pruneHttpBodyIndex(path.basename(file, '.body'), projectDir)
+      evicted++
+      freedBytes += stat.get(file)?.sizeBytes ?? 0
+    } catch { /* already gone — fine */ }
+  }
+
+  // 4. Evidence that shrinks says so. One summary event, not one per file: a
+  //    wide assessment can evict thousands of bodies, and a per-file flood
+  //    would bury the timeline it is meant to keep legible.
+  try {
+    const ev = insertEvent('system', {
+      subtype: 'body_evicted',
+      count: evicted,
+      freed_bytes: freedBytes,
+      total_bytes: plan.totalBytes,
+      budget_bytes: budget,
+      shortfall_bytes: plan.shortfallBytes,
+      description: plan.shortfallBytes > 0
+        ? `Evicted ${evicted} body file(s) under disk pressure; still ${plan.shortfallBytes} bytes over budget after evicting everything unpinned — pinned (in-scope) bodies were kept.`
+        : `Evicted ${evicted} body file(s) under disk pressure (freed ${freedBytes} bytes; in-scope bodies kept).`
+    }, opts)
+    if (ev) eventBus.publish(ev)
+  } catch (e) { noteDbError('body-eviction', e) }
+
+  return { evicted, freedBytes, shortfallBytes: plan.shortfallBytes }
+}
+
+/** The set of `.body` filenames pinned by an in-scope reference. Empty scope
+ *  pins nothing — with no declared scope there is no "in-scope" to protect,
+ *  and eviction falls back to purely coldest-first, which is the safe order
+ *  anyway. */
+function pinnedFiles(scopeTargets: string[]): Set<string> {
+  const pinned = new Set<string>()
+  if (scopeTargets.length === 0) return pinned
+  let db: ReturnType<typeof getDB>
+  try { db = getDB() } catch { return pinned }
+  const REF_FIELDS = BODY_REF_FIELDS
+  // Alias each extraction to a stable column name (f0..f3) rather than relying
+  // on SQLite naming the column after the expression text.
+  const selects = REF_FIELDS.map((f, i) => `json_extract(data,'$.${f}.file') AS f${i}`).join(', ')
+  const where = REF_FIELDS.map((f) => `json_extract(data,'$.${f}.file') IS NOT NULL`).join(' OR ')
+  // Both tiers: the mitmproxy HTTP events that carry the bodies live in
+  // `events_logged` (LOGGED_TIER), not the chained `events` table — querying
+  // only `events` would pin nothing and quietly evict in-scope evidence.
+  const rows: Array<Record<string, unknown>> = []
+  for (const table of ['events', 'events_logged']) {
+    try {
+      rows.push(...(db.prepare(
+        `SELECT target_id, ${selects} FROM ${table} WHERE ${where}`
+      ).all() as Array<Record<string, unknown>>))
+    } catch { /* table may not exist on an older DB — skip */ }
+  }
+
+  for (const row of rows) {
+    const target = row.target_id as string | null
+    if (!target) continue
+    if (!scopeTargets.some((p) => matchPattern(target, p))) continue
+    for (let i = 0; i < REF_FIELDS.length; i++) {
+      const file = row[`f${i}`] as string | null
+      if (file) pinned.add(file)
+    }
+  }
+  return pinned
+}
+
+// ── Scope-pinned size-pressure eviction for casts + screenshots ─────────────
+//
+// docs/DESIGN-OPEN-ITEMS §3b. `sweepBodyStore` already evicts HTTP bodies
+// coldest-first with scope as the pin. Casts and screenshots had only the
+// age-based `sweepDir` (all-or-nothing past a cutoff, order irrelevant), so a
+// disk filling with out-of-scope recordings could push in-scope evidence out
+// only by aging — never by relevance. This gives them the same store-budget
+// eviction: when `casts/` or `screenshots/` exceeds its byte cap, the coldest
+// UNPINNED files go first and files whose referencing event is in scope are
+// pinned and kept. Same safety model as body-eviction: the event row and its
+// castSha256 / sha256 attestation stay, only the on-disk file is dropped, so
+// the chain keeps verifying and the file reads back as "content no longer on
+// disk" rather than as evidence that was silently erased.
+
+/** Basenames of cast/screenshot files pinned by an in-scope reference. A file
+ *  is pinned if ANY event that points at it carries an in-scope target. Empty
+ *  scope pins nothing (no declared scope → no "in-scope" to protect), and
+ *  eviction falls back to purely coldest-first, which is the safe order anyway.
+ *  Keyed on basename because `readdir` yields basenames. */
+function pinnedArtifactFiles(kind: 'cast' | 'screenshot', scopeTargets: string[]): Set<string> {
+  const pinned = new Set<string>()
+  if (scopeTargets.length === 0) return pinned
+  let db: ReturnType<typeof getDB>
+  try { db = getDB() } catch { return pinned }
+  // Casts and screenshots live only in the chained `events` table (the
+  // shell/screenshot agents write there), so — unlike bodies — no
+  // events_logged pass is needed.
+  const query = kind === 'cast'
+    ? `SELECT target_id, json_extract(data,'$.castPath') AS p, NULL AS fn, json_extract(data,'$.castSegments') AS parts FROM events
+         WHERE agent_type = 'shell'
+           AND subtype = 'session_end'
+           AND json_extract(data,'$.castPath') IS NOT NULL`
+    : `SELECT target_id,
+              json_extract(data,'$.filePath') AS p,
+              json_extract(data,'$.filename') AS fn FROM events
+         WHERE agent_type = 'screenshot'
+           AND (json_extract(data,'$.filePath') IS NOT NULL OR json_extract(data,'$.filename') IS NOT NULL)`
+  let rows: Array<Record<string, unknown>> = []
+  try { rows = db.prepare(query).all() as Array<Record<string, unknown>> } catch { return pinned }
+  for (const row of rows) {
+    const target = row.target_id as string | null
+    if (!target) continue
+    if (!scopeTargets.some((p) => matchPattern(target, p))) continue
+    const p = row.p as string | null
+    if (p) pinned.add(path.basename(p))
+    if (kind === 'cast' && typeof row.parts === 'string') {
+      for (const part of JSON.parse(row.parts) as Array<{ path?: unknown }>) {
+        if (typeof part.path === 'string') pinned.add(path.basename(part.path))
+      }
+    }
+    const fn = row.fn as string | null
+    if (fn) pinned.add(path.basename(fn))
+  }
+  return pinned
+}
+
+export function sweepArtifactStore(
+  kind: 'cast' | 'screenshot',
+  config: Pick<RedLogConfig, 'retention'> & { scope?: { targets?: string[] } },
+  opts: { engagementId: string; operatorId: string }
+): { evicted: number; freedBytes: number; shortfallBytes: number } {
+  const none = { evicted: 0, freedBytes: 0, shortfallBytes: 0 }
+  if (!opts.operatorId) return none
+  const budget = (kind === 'cast' ? config.retention?.casts : config.retention?.screenshots)?.maxBytes ?? 0
+  if (budget <= 0) return none  // unbounded is the default; opt in to bound it
+
+  let projectDir: string
+  try { projectDir = getProjectDir() } catch { return none }
+  const dir = path.join(projectDir, kind === 'cast' ? 'casts' : 'screenshots')
+  if (!fs.existsSync(dir)) return none
+
+  const matcher = kind === 'cast'
+    ? (n: string): boolean => n.endsWith('.cast')
+    : (n: string): boolean => /\.(jpg|jpeg|png)$/i.test(n)
+  let names: string[]
+  try { names = fs.readdirSync(dir).filter(matcher) } catch { return none }
+  const stat = new Map<string, { sizeBytes: number; mtimeMs: number }>()
+  for (const n of names) {
+    try { const s = fs.statSync(path.join(dir, n)); stat.set(n, { sizeBytes: s.size, mtimeMs: s.mtimeMs }) }
+    catch { /* vanished mid-scan */ }
+  }
+
+  const pinned = pinnedArtifactFiles(kind, config.scope?.targets ?? [])
+  const entries: BodyEntry[] = []
+  for (const [file, s] of stat) {
+    entries.push({ file, sizeBytes: s.sizeBytes, mtimeMs: s.mtimeMs, pinned: pinned.has(file) })
+  }
+
+  const plan = planEviction(entries, budget)
+  if (plan.evict.length === 0 && plan.shortfallBytes === 0) return none
+
+  let evicted = 0
+  let freedBytes = 0
+  for (const file of plan.evict) {
+    try {
+      fs.unlinkSync(path.join(dir, file))
+      evicted++
+      freedBytes += stat.get(file)?.sizeBytes ?? 0
+      // A cast's transcript lives in a second place (the search index). Drop it
+      // with the file — the same "an index that outlives its file is a lie"
+      // rule the age-based sweepDir follows.
+      if (kind === 'cast') {
+        try { pruneCast(file) } catch (e) { noteDbError('artifact-evict-cast-index', e) }
+      }
+    } catch { /* already gone — fine */ }
+  }
+
+  const subtype = kind === 'cast' ? 'cast_evicted' : 'screenshot_evicted'
+  try {
+    const ev = insertEvent('system', {
+      subtype,
+      count: evicted,
+      freed_bytes: freedBytes,
+      total_bytes: plan.totalBytes,
+      budget_bytes: budget,
+      shortfall_bytes: plan.shortfallBytes,
+      description: plan.shortfallBytes > 0
+        ? `Evicted ${evicted} ${kind} file(s) under disk pressure; still ${plan.shortfallBytes} bytes over budget after evicting everything unpinned — pinned (in-scope) ${kind}s were kept.`
+        : `Evicted ${evicted} ${kind} file(s) under disk pressure (freed ${freedBytes} bytes; in-scope ${kind}s kept).`
+    }, opts)
+    if (ev) eventBus.publish(ev)
+  } catch (e) { noteDbError('artifact-eviction', e) }
+
+  return { evicted, freedBytes, shortfallBytes: plan.shortfallBytes }
+}

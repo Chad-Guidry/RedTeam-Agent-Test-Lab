@@ -1,0 +1,72 @@
+import { useState } from 'react'
+import { RuntimePreparation } from '../CapturePreparation'
+import { HttpCaptureStep } from '../HttpCaptureStep'
+import { toast } from '../Toast'
+import { DEFAULT_CDP_PORT } from '../../lib/defaults'
+import { FieldGroup, type ConfigState } from './SettingsShared'
+import BrowserPanel from './BrowserPanel'
+import { useReadState } from '../../lib/readState'
+import { SetupAndTeardown } from './ManualStepList'
+import { Button } from '../Button'
+
+// The browser RedLog launches, and the HTTP capture proxy it wires that
+// browser to, are capture sources: they decide what ends up in the record.
+// They sat on the Network page beside the VPN and IP-exposure settings,
+// which answer a different question - am I where I think I am - so an
+// operator looking for 'where does my web traffic get recorded' had to
+// know to look under network security to find it.
+export default function BrowserPage({
+  config, setConfig, t
+}: {
+  config: ConfigState
+  setConfig: (c: ConfigState) => void
+  t: (key: string, vars?: Record<string, string | number>) => string
+}): JSX.Element {
+  const [preparing, setPreparing] = useState(false)
+  const hook = useReadState(async () => (await window.redlog.hooks.detect()).find(item => item.id === 'mitmproxy') ?? null)
+  const [verify, setVerify] = useState(false)
+  return (
+    <>
+      <div className="mb-4">
+        <Button level="secondary" aria-expanded={verify} aria-controls="http-verification-panel" onClick={() => setVerify(open => !open)}>{t('firstRun.http.verifySettings')}</Button>
+        {verify && <div id="http-verification-panel" className="mt-3"><HttpCaptureStep onPrepare={() => setPreparing(true)} /></div>}
+      </div>
+      {preparing && <RuntimePreparation source="web" onClose={() => setPreparing(false)} />}
+      <BrowserPanel t={t} config={config} setConfig={setConfig} />
+      {hook.state.phase === 'failed' && <div role="alert" className="text-xs text-redlog-danger">
+        {hook.state.error} <Button size="compact" level="quiet" onClick={hook.retry}>{t('common.retry')}</Button>
+      </div>}
+      {hook.state.value && <details className="mb-4">
+        <summary className="min-h-8 cursor-pointer text-xs text-redlog-text content-center">{t('settings.hookOptionalSteps')}</summary>
+        <SetupAndTeardown setup={hook.state.value.manualSteps} teardown={hook.state.value.removalSteps} t={t} />
+      </details>}
+      <FieldGroup title={t('settings.cdp')}>
+        <p className="text-xs text-redlog-text-faint mb-2">
+          {t('settings.cdpHint', { port: String(config.browser?.cdpPort ?? DEFAULT_CDP_PORT) })}
+        </p>
+        <button
+          onClick={async () => {
+            // Uses the CDP port from BrowserPanel above (config.browser.
+            // cdpPort) — the previous separate field silently didn't
+            // auto-save so users often set two different ports without
+            // knowing (audit finding P0 #43).
+            const port = config.browser?.cdpPort ?? DEFAULT_CDP_PORT
+            await window.redlog.cdp.setPort(port)
+            const cdpTab = await window.redlog.cdp.getTab()
+            if (cdpTab.connected) toast(t('settings.cdpConnected', { title: cdpTab.title ?? '', url: cdpTab.url ?? '' }), 'success')
+            else {
+              toast(t('settings.cdpNotConnectedTitle'), {
+                type: 'error',
+                why: t('settings.cdpNotConnected', { port: String(port) }),
+                action: { label: t('common.retry'), onClick: () => { void window.redlog.cdp.getTab() } }
+              })
+            }
+          }}
+          className="px-3 py-1.5 bg-redlog-elevated text-redlog-text text-xs rounded hover:bg-redlog-elevated-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/40"
+        >
+          {t('settings.testConnection')}
+        </button>
+      </FieldGroup>
+    </>
+  )
+}

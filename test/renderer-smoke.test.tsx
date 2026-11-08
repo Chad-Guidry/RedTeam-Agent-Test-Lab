@@ -1,0 +1,544 @@
+// @vitest-environment jsdom
+//
+// Smoke coverage for every renderer view. This exists because the Timeline
+// shipped in v0.2.0 crashed on open — laneEvents was seeded from a hand-written
+// object literal that had drifted from the LANES list, so laneEvents['dns'] was
+// undefined and .map() threw. Nothing in the suite touched a component, so it
+// reached a release. Each view here is rendered against a mocked bridge with at
+// least one event of every agent_type, which is exactly the shape that broke.
+
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { render, cleanup, screen, fireEvent, act, within, waitFor } from '@testing-library/react'
+import { I18nProvider } from '../src/renderer/src/i18n'
+
+import App from '../src/renderer/src/App'
+import { snapshotIssues, _resetIssues } from '../src/renderer/src/lib/issues'
+import OverlayApp from '../src/renderer/src/OverlayApp'
+import TimelinePanel from '../src/renderer/src/components/Timeline'
+import Settings from '../src/renderer/src/components/Settings'
+import ProjectPicker from '../src/renderer/src/components/ProjectPicker'
+import Sidebar from '../src/renderer/src/components/Sidebar'
+import StatusBar from '../src/renderer/src/components/StatusBar'
+import IPStatusCard from '../src/renderer/src/components/IPStatusCard'
+import { TargetView } from '../src/renderer/src/components/TargetView'
+import { ScopeStatus } from '../src/renderer/src/components/ScopeStatus'
+import { LootPanel } from '../src/renderer/src/components/LootPanel'
+import { BookmarksView } from '../src/renderer/src/components/BookmarksView'
+import { ScreenshotsView } from '../src/renderer/src/components/ScreenshotsView'
+
+const AGENT_TYPES = [
+  'shell', 'dns', 'screenshot', 'clipboard', 'file_transfer',
+  'credential_use', 'c2_checkin', 'marker', 'loot', 'system',
+  'agent', 'scanner'
+]
+
+let seq = 0
+function makeEvent(agentType: string): Record<string, unknown> {
+  seq += 1
+  return {
+    id: `evt-${seq}`,
+    timestamp: 1_700_000_000_000 + seq * 1000,
+    engagementId: 'eng',
+    sessionId: 'sess',
+    operatorId: 'op-1',
+    agentType,
+    hostname: 'host',
+    sourceIP: null,
+    targetId: 'example.com',
+    data: {
+      subtype: `${agentType}_sub`,
+      command: 'nmap -sV example.com',
+      detectedTarget: 'example.com',
+      exit_code: 0,
+      trigger: 'manual',
+      title: 'A finding',
+      severity: 'high',
+      type: 'aws_key',
+      confidence: 'high',
+      dest_host: 'example.com',
+      user_context: 'root',
+      bytes: 42,
+      filename: 'loot.txt',
+      content: 'clipboard text'
+    },
+    hash: 'a'.repeat(64),
+    prevHash: null,
+    createdAt: 1_700_000_000_000 + seq * 1000,
+    monotonicNs: String(seq * 1_000_000),
+    ntpOffsetMs: 3
+  }
+}
+
+const EVENTS_BASE = AGENT_TYPES.map(makeEvent)
+// One marker amendment rides in the shared fixture as a tripwire. An amendment
+// carries `title` and `severity` under the SAME names as a marker, so any
+// consumer that reads `data.title` without first asking what kind of row it has
+// renders a correction as a second finding — 'HIGH: undefined' on the track,
+// '⚑ undefined' in the transcript. Six such sites are guarded; this row is what
+// makes a seventh show up as a broken render instead of shipping.
+const MARKER_EVENT = EVENTS_BASE.find((e) => e.agentType === 'marker')!
+const AMENDMENT: Record<string, unknown> = {
+  ...makeEvent('marker'),
+  id: 'evt-amendment',
+  data: { subtype: 'amended', markerId: MARKER_EVENT.id, severity: 'critical' }
+}
+const EVENTS = [...EVENTS_BASE, AMENDMENT]
+
+const unsub = (): void => {}
+
+function installBridge(): void {
+  ;(window as unknown as { redlog: unknown }).redlog = {
+    platform: 'darwin',
+    // Asked at mount for the outcome of an update restart; there was none.
+    app: { takeUpdateOutcome: async () => null, onUpdateOutcomeReady: () => unsub },
+    project: {
+      list: async () => [{ id: 'p1', name: 'Proj', createdAt: 1, lastOpened: 2, path: '/tmp/p1' }],
+      create: async () => ({ id: 'p1', name: 'Proj', createdAt: 1, lastOpened: 2, path: '/tmp/p1' }),
+      open: async () => ({ id: 'p1', name: 'Proj', createdAt: 1, lastOpened: 2, path: '/tmp/p1' }),
+      delete: async () => true,
+      active: async () => ({ id: 'p1', name: 'Proj', createdAt: Date.UTC(2026, 8, 1, 9, 0) })
+    },
+    ip: {
+      getStatus: async () => ({
+        externalIP: '203.0.113.7', internalIP: '10.0.0.2',
+        ipSafety: 'safe', lastCheck: Date.now(), error: null
+      }),
+      onStatus: () => unsub
+    },
+    config: {
+      get: async () => ({
+        engagement: { id: 'eng' },
+        operator: { id: 'op-1', name: 'Operator' },
+        network: { whitelist: [], blacklist: [], checkInterval: 10 },
+        scope: { warnOnViolation: true, targets: [], excludeTargets: [], scopeFile: '' },
+        screenshot: { quality: 85 },
+        terminal: { maxCastBytes: 1024 },
+        redaction: { allowlist: [], denylist: [], entropyThreshold: 4.5, minLength: 20 }
+      }),
+      save: async () => true,
+      exportProfile: async () => null,
+      importProfile: async () => ({ status: 'cancelled' })
+    },
+    targetContext: {
+      get: async () => null,
+      set: async (target: string | null) => ({ ok: true, target }),
+      onChange: () => unsub
+    },
+    events: {
+      query: async () => EVENTS,
+      queryPage: async () => ({ items: EVENTS, hasMore: false, nextCursor: null }),
+      count: async () => EVENTS.length,
+      matchIds: async (req: { ids: string[] }) => req.ids,
+      queryHttpFlowPage: async () => ({ items: EVENTS, flowCount: EVENTS.length, hasMore: false, nextCursor: null }),
+      getCount: async () => EVENTS.length,
+      getLatestLoggedTs: async () => null,
+      annotatedIds: async () => [],
+      attributionStats: async () => ({ attempted: 0, resolved: 0 }),
+      getNote: async () => null,
+      setNote: async () => null,
+      search: async () => EVENTS,
+      aggregateTargets: async () => {
+        // Mirror the SQL rollup over the mock EVENTS so TargetView still renders
+        // real rows (the "actual target rows" test asserts example.com appears).
+        const m = new Map<string, { target: string; eventCount: number; firstSeen: number; lastSeen: number }>()
+        for (const e of EVENTS) {
+          const tgt = (e.data as { detectedTarget?: string })?.detectedTarget
+          if (!tgt) continue
+          const cur = m.get(tgt)
+          const ts = e.timestamp as number
+          if (cur) { cur.eventCount++; cur.firstSeen = Math.min(cur.firstSeen, ts); cur.lastSeen = Math.max(cur.lastSeen, ts) }
+          else m.set(tgt, { target: tgt, eventCount: 1, firstSeen: ts, lastSeen: ts })
+        }
+        return Array.from(m.values()).sort((a, b) => b.lastSeen - a.lastSeen)
+      },
+      getById: async (ids: string[]) => EVENTS.filter((e) => ids.includes(e.id as string)),
+      onNewBatch: () => unsub
+    },
+    marker: {
+      create: async () => EVENTS[0],
+      amend: async () => ({ ok: true, event: AMENDMENT }),
+      amendments: async () => [AMENDMENT],
+      onShortcut: () => unsub
+    },
+    screenshot: { capture: async () => '/tmp/x.jpg', read: async () => null },
+    scope: {
+      getObservations: async () => ({ rows: [{ target: 'evil.com', command: 'curl evil.com', timestamp: Date.now() }], truncated: false }),
+      getObservationCount: async () => 1,
+      isConfigured: async () => true,
+      getLastRecompute: async () => null
+    },
+    chain: {
+      length: async () => EVENTS.length,
+      anchors: async () => [],
+      anchorNow: async () => null,
+      verify: async () => ({ ok: true, anchor: null, currentHead: null }),
+      upgrade: async () => ({ upgraded: 0, scanned: 0 })
+    },
+    loot: { getCount: async () => 2, rules: async () => [] },
+    bookmarks: {
+      list: async () => [{ id: 'q1', title: 'Mark', url: 'https://example.com', note: '', context: {}, createdAt: Date.now() }],
+      get: async () => null,
+      create: async () => ({ id: 'q1', title: 'Mark', url: null, note: '', context: {}, createdAt: Date.now() }),
+      update: async () => null,
+      delete: async () => true
+    },
+    cdp: { getTab: async () => ({ url: null, title: null, connected: false }), setPort: async () => true },
+    browser: {
+      detect: async () => '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      status: async () => ({ running: false }),
+      launch: async () => ({ ok: true, pid: 1 }),
+      stop: async () => ({ stopped: true }),
+      onExited: () => () => {}
+    },
+    httpCapture: {
+      status: async () => ({ state: 'running', url: 'http://127.0.0.1:8080', pid: 2 }),
+      start: async () => ({ state: 'running', url: 'http://127.0.0.1:8080', pid: 2 }),
+      stop: async () => ({ state: 'stopped', url: null })
+    },
+    data: {
+      resolveExportPlan: async () => ({ ok: false, error: 'not configured in smoke test' }),
+      executeExportPlan: async () => ({ ok: false, error: 'not configured in smoke test' })
+    },
+    hooks: { detect: async () => [], install: async () => ({ success: true, message: '' }), uninstall: async () => ({ success: true, message: '' }) },
+    plugins: { eventTypes: async () => [] },
+    agents: { sources: async () => [] },
+    hookConfig: { get: async () => ({ watchPaths: [] }), save: async () => true, pickPath: async () => null },
+    operators: {
+      list: async () => [{ id: 'op-1', name: 'Operator', isPrimary: true, createdAt: 1, revokedAt: null }]
+    },
+    capture: {
+      health: async () => ({
+        verdict: 'healthy', recording: true, lastEventAt: Date.now(), checkedAt: Date.now(),
+        sources: [
+          { id: 'terminal', installed: true, lastEventAt: Date.now(), state: 'ready' },
+          { id: 'claude-code', installed: true, lastEventAt: null, state: 'ready' },
+          { id: 'mitmproxy', lastEventAt: null, state: 'ready' },
+          // E3 (#49): an informational plugin producer — display only, read-only.
+          { id: 'pcap-capture.pcap-tcpdump', label: 'pcap-capture', informational: true, lastEventAt: Date.now(), state: 'ready' }
+        ]
+      })
+    },
+    visibility: { signals: async () => ({
+      evidenceSeen: true, transcriptSeen: true, targetCount: 2, lootSeen: true,
+      screenshotSeen: true, markSeen: true, httpFlowSeen: true, loggedEver: true
+    }) },
+    recording: { get: async () => true, toggle: async () => true, onChange: () => unsub },
+    pivots: {
+      getActive: async () => [{ via: '10.0.0.5', tool: 'ligolo-ng', route: '10.10.20.0/24', ts: Date.now() }],
+      onChange: () => unsub
+    },
+    terminal: {
+      spawn: async () => ({ pid: 1 }), write: () => {}, resize: () => {}, kill: () => {},
+      list: async () => [], onData: () => unsub, onExit: () => unsub
+    },
+    overlay: {
+      toggle: () => {}, hide: () => {},
+      isVisible: async () => false, onVisibilityChanged: () => unsub,
+      onInteractive: () => unsub, quickMark: () => {},
+      mouseEnter: () => {}, mouseLeave: () => {}
+    }
+  }
+}
+
+function renderView(ui: React.ReactElement): void {
+  render(<I18nProvider>{ui}</I18nProvider>)
+}
+
+describe('renderer views render without throwing', () => {
+  beforeEach(() => {
+    installBridge()
+    window.localStorage.clear()
+    // ResizeObserver drives the Timeline's lane heights and jsdom has none.
+    ;(window as unknown as { ResizeObserver: unknown }).ResizeObserver = class {
+      observe(): void {}
+      unobserve(): void {}
+      disconnect(): void {}
+    }
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+  })
+
+  const views: Array<[string, () => React.ReactElement]> = [
+    ['App', () => <App />],
+    ['Timeline', () => <TimelinePanel />],
+    ['Settings', () => <Settings />],
+    ['ProjectPicker', () => <ProjectPicker onProjectOpen={() => {}} />],
+    ['Sidebar', () => <Sidebar active="dashboard" onNavigate={() => {}} />],
+    ['StatusBar', () => <StatusBar />],
+    ['IPStatusCard', () => <IPStatusCard />],
+    ['TargetView', () => <TargetView />],
+    ['ScopeStatus', () => <ScopeStatus />],
+    ['LootPanel', () => <LootPanel />],
+    ['BookmarksView', () => <BookmarksView />],
+    ['OverlayApp', () => <OverlayApp />]
+  ]
+
+  for (const [name, make] of views) {
+    it(`${name} mounts`, () => {
+      expect(() => renderView(make())).not.toThrow()
+    })
+  }
+
+  // The mount loop above only proves the FIRST synchronous render survives.
+  // TargetView builds its rows after an async query resolves, and a crash in
+  // that second render (a hook interleaved into the filter callback, reading
+  // `filtered` before it was assigned) is invisible to a synchronous
+  // not.toThrow — it shipped, and only an app-in-the-loop e2e caught it. This
+  // waits for a real row so the data-render path is under test here too.
+  it('TargetView survives rendering actual target rows', async () => {
+    renderView(<TargetView />)
+    expect(await screen.findByText('example.com', {}, { timeout: 3000 })).toBeTruthy()
+  })
+
+  it('Timeline renders a row for every agent_type without a missing-lane crash', async () => {
+    const { findAllByText, findByTestId } = render(<I18nProvider><TimelinePanel /></I18nProvider>)
+    // Bands start collapsed, so a lane's own label only renders once its band
+    // is expanded. Expanding is what puts the per-lane rows on screen, and a
+    // lane label appearing proves the events flowed through toLane() into
+    // populatedLanes without an undefined bucket.
+    fireEvent.click(await findByTestId('timeline-mode-lanes'))
+    fireEvent.click(await findByTestId('timeline-band-commands'))
+    const shellLabels = await findAllByText('Shell')
+    expect(shellLabels.length).toBeGreaterThan(0)
+  })
+
+  it('HUD restores pointer interaction before expand and hide actions', async () => {
+    const bridge = (window as unknown as { redlog: { overlay: Record<string, ReturnType<typeof vi.fn>> } }).redlog
+    bridge.overlay.mouseEnter = vi.fn()
+    bridge.overlay.mouseLeave = vi.fn()
+    bridge.overlay.hide = vi.fn()
+
+    const { container } = render(<I18nProvider><OverlayApp /></I18nProvider>)
+    const expand = await screen.findByRole('button', { name: /show details|顯示詳細資訊/i })
+    const root = container.firstElementChild as HTMLElement
+
+    fireEvent.mouseEnter(root)
+    expect(bridge.overlay.mouseEnter).toHaveBeenCalledOnce()
+
+    fireEvent.click(expand)
+    expect(screen.getByRole('button', { name: /hide details|收合詳細資訊/i })).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: /hide hud|隱藏 hud/i }))
+    expect(bridge.overlay.hide).toHaveBeenCalledOnce()
+
+    fireEvent.mouseLeave(root)
+    expect(bridge.overlay.mouseLeave).toHaveBeenCalledOnce()
+  })
+
+  // The HUD hangs off a `-webkit-app-region: drag` root so it can be dragged
+  // from anywhere. Chromium INHERITS that property, and Electron replays the
+  // collected rects in tree order — union for drag, difference for no-drag — so
+  // any element declared after a control and overlapping it hands those pixels
+  // back to the window manager. That is what killed the HUD: the compact bar
+  // followed the expand/hide cluster in the DOM and spans the full panel width,
+  // so WM_NCHITTEST over ✕ answered HTCAPTION and every click started a window
+  // drag. The HUD could be moved and nothing else.
+  //
+  // The e2e click test cannot catch this: Playwright dispatches through CDP,
+  // which lands in the renderer below the native hit test, so it passed the
+  // whole time the real HUD was dead. The order is the thing to assert.
+  it('HUD re-arms no drag region after its controls', async () => {
+    // jsdom's cssstyle drops properties it does not know, `-webkit-app-region`
+    // among them, so nothing survives to read back off the element. Give the
+    // prototype somewhere to keep it — React assigns `style.WebkitAppRegion`
+    // directly, so this records exactly what the component asked for.
+    const regions = new WeakMap<CSSStyleDeclaration, string>()
+    Object.defineProperty(window.CSSStyleDeclaration.prototype, 'WebkitAppRegion', {
+      configurable: true,
+      get(this: CSSStyleDeclaration) { return regions.get(this) ?? '' },
+      set(this: CSSStyleDeclaration, value: string) { regions.set(this, value) }
+    })
+
+    try {
+      const { container } = render(<I18nProvider><OverlayApp /></I18nProvider>)
+      // Expanded: the mark/pass-through/pin row only exists in this state, and
+      // it is the other set of controls the drag region can swallow.
+      fireEvent.click(await screen.findByRole('button', { name: /show details|顯示詳細資訊/i }))
+
+      const own = (el: Element): string =>
+        (el as HTMLElement).style.WebkitAppRegion ?? ''
+      const region = (el: Element): string => {
+        for (let node: Element | null = el; node; node = node.parentElement) {
+          if (own(node)) return own(node)
+        }
+        return 'drag'
+      }
+      // <style> has no layout box, so Blink never collects a region for it.
+      const boxes = Array.from(container.querySelectorAll('*'))
+        .filter((el) => el.tagName !== 'STYLE' && el.tagName !== 'SCRIPT')
+
+      const firstControl = boxes.findIndex((el) => region(el) === 'no-drag')
+      expect(firstControl, 'no no-drag control in the HUD at all').toBeGreaterThanOrEqual(0)
+
+      const reArmed = boxes.slice(firstControl).filter((el) => region(el) === 'drag')
+      expect(
+        reArmed.map((el) => el.outerHTML.replace(/\s+/g, ' ').slice(0, 90)),
+        'these come after a HUD control and put the drag region back over it — mark them no-drag, or move them ahead of the controls'
+      ).toEqual([])
+    } finally {
+      Reflect.deleteProperty(window.CSSStyleDeclaration.prototype, 'WebkitAppRegion')
+    }
+  })
+
+  // The picker used to render while `project.active()` was in flight and then
+  // be replaced by the restored project: a flash of the project list on every
+  // launch for anyone who had one open.
+  it('holds the mark instead of flashing the picker while the project is restored', async () => {
+    let resolveActive: (p: unknown) => void = () => {}
+    ;(window as unknown as { redlog: { project: Record<string, unknown> } }).redlog.project.active = () =>
+      new Promise((resolve) => { resolveActive = resolve })
+    renderView(<App />)
+    expect(screen.queryByTestId('project-picker')).toBeNull()
+    expect(screen.getByRole('status')).toBeTruthy()
+    await act(async () => { resolveActive({ id: 'p1', name: 'Proj', createdAt: 1 }) })
+    expect(await screen.findByTestId('view-root')).toBeTruthy()
+  })
+
+  // #49: the capture card lists a plugin producer read-only with its own label
+  // and a "plugin" tag. It shows in the full inventory (manage), not the
+  // compact problems view. Renders the actual UI I shipped, not just the mock.
+  it('capture card shows an informational plugin producer in the manage inventory', async () => {
+    renderView(<App />)
+    // Open the full inventory ("all sources (N)").
+    const manageBtn = await screen.findByText(/Other capture sources/i)
+    fireEvent.click(manageBtn)
+    // The plugin producer's own label and the plugin tag both render.
+    expect(await screen.findByText('pcap-capture')).toBeTruthy()
+    const tags = screen.getAllByText('plugin')
+    expect(tags.length).toBeGreaterThan(0)
+  })
+
+  // #47: the artifact-rotation eviction budgets must be reachable from the
+  // sidebar. Spec 049 moved them off the capture page and under Scope and
+  // evidence — retention is a deletion policy, not a capture source.
+  it('StatusBar says its clock runs from the project\'s creation, not this session', async () => {
+    renderView(<StatusBar />)
+    const clock = await screen.findByTestId('statusbar-uptime')
+    await waitFor(() => expect(clock.getAttribute('title')).toMatch(/since this project was created .*not this session/))
+  })
+
+  // An errored external-IP lookup is a condition of its own (unknown, not bad),
+  // and it clears when a later read comes back without the error.
+  it('StatusBar raises a pending issue while the external IP lookup is erroring, and clears it after', async () => {
+    _resetIssues()
+    const redlog = (window as unknown as { redlog: { ip: { getStatus: () => Promise<unknown>; onStatus: (cb: (s: unknown) => void) => () => void } } }).redlog
+    let push: (s: unknown) => void = () => {}
+    redlog.ip.getStatus = async () => ({ externalIP: null, internalIP: '10.0.0.2', ipSafety: 'unknown', lastCheck: Date.now(), error: 'timeout' })
+    redlog.ip.onStatus = (cb) => { push = cb; return () => {} }
+    renderView(<StatusBar />)
+    await waitFor(() => expect(snapshotIssues().find((i) => i.id === 'ip')?.tier).toBe('pending'))
+    act(() => push({ externalIP: '203.0.113.7', internalIP: '10.0.0.2', ipSafety: 'unknown', lastCheck: Date.now(), error: null }))
+    await waitFor(() => expect(snapshotIssues().some((i) => i.id === 'ip')).toBe(false))
+  })
+
+  // #323: below the narrow threshold the bar stays on one line by giving up its
+  // least important parts — the event count, the IP number, the overlay's label
+  // — and keeps the recording state, uptime, IP safety and scope.
+  it('StatusBar keeps one line when narrow by dropping the count, the IP number and the overlay label', async () => {
+    const before = window.innerWidth
+    try {
+      Object.defineProperty(window, 'innerWidth', { value: 400, configurable: true })
+      renderView(<StatusBar />)
+      const bar = await screen.findByTestId('status-bar')
+      await waitFor(() => expect(bar.getAttribute('data-narrow')).toBe('true'))
+      expect(bar.className).toContain('whitespace-nowrap')
+      expect(screen.queryByTestId('statusbar-event-count')).toBeNull()
+      expect(screen.getByTestId('status-bar-recording')).toBeTruthy()
+      expect(screen.getByTestId('statusbar-uptime')).toBeTruthy()
+      // The overlay toggle stays reachable by its dot, and still says what it is.
+      const overlay = screen.getByTestId('status-bar-overlay')
+      expect(overlay.getAttribute('aria-label')).toBeTruthy()
+      expect(overlay.textContent).toBe('')
+      Object.defineProperty(window, 'innerWidth', { value: 1600, configurable: true })
+      window.dispatchEvent(new Event('resize'))
+      await waitFor(() => expect(bar.getAttribute('data-narrow')).toBe('false'))
+      expect(screen.getByTestId('statusbar-event-count')).toBeTruthy()
+    } finally {
+      Object.defineProperty(window, 'innerWidth', { value: before, configurable: true })
+    }
+  })
+
+  // #298: at 800×600 with the shell at 200% the bar is 400 layout pixels wide.
+  // The IP-safety and scope words pushed the HUD toggle past the right edge,
+  // where the bar's own `overflow-hidden` made it unclickable — a control that
+  // exists and cannot be reached. Narrow, those two keep their dots and move
+  // their words to the accessible name.
+  it('StatusBar narrow keeps the HUD toggle inside the bar and the words available to a screen reader', async () => {
+    const before = window.innerWidth
+    try {
+      Object.defineProperty(window, 'innerWidth', { value: 400, configurable: true })
+      renderView(<StatusBar />)
+      const bar = await screen.findByTestId('status-bar')
+      await waitFor(() => expect(bar.getAttribute('data-narrow')).toBe('true'))
+      // The words are still rendered — inside sr-only spans — so the bar keeps
+      // saying "IP safe" and "scope not configured" to anything reading it.
+      const srOnly = [...bar.querySelectorAll('.sr-only')].map((el) => (el.textContent ?? '').trim()).filter(Boolean)
+      expect(srOnly.length).toBeGreaterThan(0)
+      // …and they are not painted, so they take no width.
+      const painted = [...bar.querySelectorAll('span')].filter((el) => {
+        const r = el.getBoundingClientRect()
+        return r.width > 4 && /安全|範圍|SAFE|Scope|scope/.test(el.textContent ?? '')
+      })
+      expect(painted).toEqual([])
+      expect(screen.getByTestId('status-bar-overlay')).toBeTruthy()
+    } finally {
+      Object.defineProperty(window, 'innerWidth', { value: before, configurable: true })
+    }
+  })
+
+  it('Settings search finds a field and opens the page that holds it', async () => {
+    renderView(<Settings />)
+    const box = await screen.findByPlaceholderText('Search settings…')
+    fireEvent.change(box, { target: { value: 'loot detection' } })
+    const results = await screen.findByTestId('settings-search-results')
+    fireEvent.click(within(results).getAllByText('Loot detection')[0])
+    // The Loot detection page is open: its hint is on screen.
+    expect(await screen.findByText(/Rules that are off are not recorded as loot/)).toBeTruthy()
+  })
+
+  it('Settings exposes the artifact-rotation budgets under "Retention and cleanup"', async () => {
+    renderView(<Settings />)
+    // The row is "Data & privacy" on the Stitch home; its page is still
+    // "Retention and cleanup", which is what this asserts it opens.
+    await screen.findByTestId('settings-home')
+    fireEvent.click(document.querySelector('[data-settings-page="retention"]') as HTMLElement)
+    expect(await screen.findByText('Retention and disk budgets')).toBeTruthy()
+    expect(screen.getByText('Terminal recording store budget (MB)')).toBeTruthy()
+  })
+
+  // Every link into Settings opened its first page, Hooks: "Turn on periodic
+  // capture", the browser's launch failure, the scope card and the
+  // broken-chain issue all left the operator to find the page themselves.
+  it('a link to a Settings page opens that page', async () => {
+    renderView(<Settings request={{ page: 'retention' }} />)
+    expect(await screen.findByText('Retention and disk budgets')).toBeTruthy()
+  })
+
+  // Spec 049 FR-010: `captureControl` kept its id through the restructure, so
+  // every saved deep link into it — the screenshots empty state, onboarding,
+  // the capture wizard — still lands on capture sources rather than nowhere.
+  it('the capture-sources deep link still resolves after the restructure', async () => {
+    renderView(<Settings request={{ page: 'captureControl' }} />)
+    expect(await screen.findByText('Pack: Host monitors')).toBeTruthy()
+  })
+
+  it('an issue that names a Settings page opens it', async () => {
+    renderView(<App />)
+    await screen.findByTestId('view-root')
+    act(() => { window.dispatchEvent(new CustomEvent('redlog:navigate', { detail: 'settings/integrity' })) })
+    expect(await screen.findByText('Verify full chain')).toBeTruthy()
+  })
+
+  // The empty state's second action only navigates; it said "Turn on".
+  it('the screenshots empty state links to the capture settings', async () => {
+    ;(window as unknown as { redlog: { events: Record<string, unknown> } }).redlog.events.queryScreenshotPage =
+      async () => ({ items: [], hasMore: false, nextCursor: null })
+    const onNavigate = vi.fn()
+    renderView(<ScreenshotsView onNavigate={onNavigate} />)
+    fireEvent.click(await screen.findByText('Periodic capture settings →'))
+    expect(onNavigate).toHaveBeenCalledWith('settings/captureControl')
+  })
+})

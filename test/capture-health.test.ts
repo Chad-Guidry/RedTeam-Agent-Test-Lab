@@ -1,0 +1,914 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import fs from 'fs'
+import path from 'path'
+import os from 'os'
+
+let initDB: typeof import('../src/core/db/index').initDB
+let closeDB: typeof import('../src/core/db/index').closeDB
+let getDB: typeof import('../src/core/db/index').getDB
+let insertEventRaw: typeof import('../src/core/db/events').insertEvent
+let getCaptureHealth: typeof import('../src/core/capture-health').getCaptureHealth
+let configureCaptureHealth: typeof import('../src/core/capture-health').configureCaptureHealth
+let invalidateHooksCache: typeof import('../src/core/capture-health').invalidateHooksCache
+let hooksMod: typeof import('../src/core/hooks-manager')
+let pluginsIndex: typeof import('../src/core/plugins/index')
+let eventBusMod: typeof import('../src/core/event-bus')
+
+let dbAvailable = false
+try {
+  const dbMod = await import('../src/core/db/index')
+  const evMod = await import('../src/core/db/events')
+  const chMod = await import('../src/core/capture-health')
+  hooksMod = await import('../src/core/hooks-manager')
+  pluginsIndex = await import('../src/core/plugins/index')
+  eventBusMod = await import('../src/core/event-bus')
+  initDB = dbMod.initDB; closeDB = dbMod.closeDB; getDB = dbMod.getDB
+  insertEventRaw = evMod.insertEvent
+  getCaptureHealth = chMod.getCaptureHealth
+  configureCaptureHealth = chMod.configureCaptureHealth
+  invalidateHooksCache = chMod.invalidateHooksCache
+  dbAvailable = true
+} catch { /* better-sqlite3 not built */ }
+
+const describeDB = dbAvailable ? describe : describe.skip
+
+const ins = (agentType: string, data: Record<string, unknown>) =>
+  insertEventRaw(agentType, data, { operatorId: 'op' })
+
+/** `unavailable` lists the ids whose runtime is NOT on this machine —
+ *  `available` is a second axis, and the mitmproxy row reads that one. */
+function mockHooks(installed: Record<string, boolean>, unavailable: string[] = []): void {
+  invalidateHooksCache()
+  vi.spyOn(hooksMod, 'detectHooks').mockReturnValue(
+    Object.entries(installed).map(([id, inst]) => ({
+      id, name: id, description: '', agentType: 'shell',
+      installed: inst, available: !unavailable.includes(id),
+      installMethod: 'shell-source' as const, hookFile: ''
+    }))
+  )
+}
+
+describeDB('capture-health', () => {
+  let tmp: string
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redlog-cap-')); initDB(tmp)
+    // The app loads the bundled pack plugins at startup; tests do not, and a
+    // pack whose plugin is not active is left out of health (Spec 035).
+    const active = (id: string) => ({ manifest: { id }, source: 'bundled', status: 'active' }) as never
+    vi.spyOn(pluginsIndex, 'listPlugins').mockReturnValue(
+      [active('pack-host-monitors'), active('pack-windows-output')]
+    )
+  })
+  afterEach(() => { closeDB(); fs.rmSync(tmp, { recursive: true, force: true }); vi.restoreAllMocks() })
+
+  it('dark when no hooks installed and only system events exist', () => {
+    mockHooks({ 'shell-zsh': false, 'shell-bash': false, 'claude-code': false })
+    ins('system', { subtype: 'session_start' })
+    const h = getCaptureHealth()
+    expect(h.verdict).toBe('dark')
+    expect(h.hasRecorded).toBe(false)
+  })
+
+  it('E3: a plugin producer that declares `emits` gets a real active/idle feed readout', () => {
+    // pcap-capture emits scanner.packet_flow. detectHooks carries agentType + emits.
+    invalidateHooksCache()
+    vi.spyOn(hooksMod, 'detectHooks').mockReturnValue([
+      { id: 'shell-zsh', name: 'shell-zsh', description: '', agentType: 'shell', installed: true, available: true, installMethod: 'shell-source' as const, hookFile: '' },
+      { id: 'pcap-capture.pcap-tcpdump', name: 'pcap-capture', description: '', agentType: 'scanner', emits: ['packet_flow'], installed: false, available: true, installMethod: 'manual' as const, hookFile: '' },
+      { id: 'transparent-proxy.mitmproxy-transparent', name: 'transparent-proxy', description: '', agentType: 'scanner', emits: ['http_request_start', 'http_response'], installed: false, available: true, installMethod: 'manual' as const, hookFile: '' }
+    ])
+    // pcap has fed a packet_flow just now; the transparent proxy never fed.
+    ins('scanner', { subtype: 'packet_flow', src: '10.0.0.5', dst: '10.0.0.9', syn_only: true })
+    const h = getCaptureHealth()
+
+    const pcap = h.sources.find((s) => s.id === 'pcap-capture.pcap-tcpdump')
+    expect(pcap?.informational).toBe(true)
+    expect(pcap?.state).toBe('ready')        // it has delivered
+    expect(pcap?.lastEventAt).not.toBeNull()
+
+    const tproxy = h.sources.find((s) => s.id === 'transparent-proxy.mitmproxy-transparent')
+    expect(tproxy?.state).toBe('off')        // declared emits, but never fed
+    expect(tproxy?.lastEventAt).toBeNull()
+
+    // A live plugin producer counts as recording (capture IS happening), and an
+    // idle sibling still can't drag the verdict down.
+    expect(h.hasRecorded).toBe(true)
+    expect(h.verdict).not.toBe('dark')
+  })
+
+  it('E3: a RUNNING plugin producer (recent heartbeat) that stopped feeding tips the verdict amber', () => {
+    // Healthy baseline from a core source, plus a plugin producer the operator
+    // is running (heartbeat) but which hasn't fed. That IS a problem.
+    mockHooks({ 'shell-zsh': true, 'pcap-capture.pcap-tcpdump': true })
+    vi.spyOn(hooksMod, 'detectHooks').mockReturnValue([
+      { id: 'shell-zsh', name: 'shell-zsh', description: '', agentType: 'shell', installed: true, available: true, installMethod: 'shell-source' as const, hookFile: '' },
+      { id: 'pcap-capture.pcap-tcpdump', name: 'pcap-capture', description: '', agentType: 'scanner', emits: ['packet_flow'], installed: false, available: true, installMethod: 'manual' as const, hookFile: '' }
+    ])
+    ins('shell', { subtype: 'command_start', command: 'x' })          // core source fed → would be healthy
+    ins('system', { subtype: 'producer_heartbeat', producer: 'pcap-capture' }) // pcap says: I'm running
+    invalidateHooksCache()
+    const h = getCaptureHealth()
+
+    const pcap = h.sources.find((s) => s.id === 'pcap-capture.pcap-tcpdump')
+    expect(pcap?.running).toBe(true)
+    expect(pcap?.state).toBe('ready')  // it is running, so it can record
+    // The one silence that still means something: this producer says it is
+    // running, every 15 seconds, and is delivering nothing. That is a fault —
+    // and it is the only clock left in the verdict.
+    expect(h.verdict).toBe('partial')
+  })
+
+  it('E3: WITHOUT a heartbeat, an idle plugin producer still never tips the verdict', () => {
+    // The #48/#49 guarantee: installed-but-not-run producers are invisible to
+    // the verdict. Same shape as above minus the heartbeat → stays healthy.
+    vi.spyOn(hooksMod, 'detectHooks').mockReturnValue([
+      { id: 'shell-zsh', name: 'shell-zsh', description: '', agentType: 'shell', installed: true, available: true, installMethod: 'shell-source' as const, hookFile: '' },
+      { id: 'pcap-capture.pcap-tcpdump', name: 'pcap-capture', description: '', agentType: 'scanner', emits: ['packet_flow'], installed: false, available: true, installMethod: 'manual' as const, hookFile: '' }
+    ])
+    ins('shell', { subtype: 'command_start', command: 'x' })
+    invalidateHooksCache()
+    const h = getCaptureHealth()
+    const pcap = h.sources.find((s) => s.id === 'pcap-capture.pcap-tcpdump')
+    expect(pcap?.running).toBeFalsy()
+    expect(pcap?.state).toBe('off')
+    expect(h.verdict).toBe('healthy')
+  })
+
+  it('E3: a plugin capture producer is surfaced as informational and never tips the verdict', () => {
+    // Healthy baseline: the shell hook is installed AND fed recently.
+    mockHooks({ 'shell-zsh': true, 'pcap-capture.pcap-tcpdump': true })
+    ins('shell', { subtype: 'command_start', command: 'nmap 10.0.0.1' })
+    const h = getCaptureHealth()
+
+    // The plugin producer (namespaced id, dot) shows up as an informational,
+    // display-only source carrying its own label.
+    const plugin = h.sources.find((s) => s.id === 'pcap-capture.pcap-tcpdump')
+    expect(plugin).toBeTruthy()
+    expect(plugin?.informational).toBe(true)
+    expect(plugin?.label).toBe('pcap-capture.pcap-tcpdump') // mockHooks uses id as name
+    expect(plugin?.state).toBe('off')
+
+    // It is INSTALLED but has never fed — the exact shape that would tip the
+    // verdict to `partial` if it counted. It must not: verdict stays healthy.
+    expect(h.verdict).toBe('healthy')
+    // And it is excluded from the core source rows the verdict is built from.
+    const core = h.sources.filter((s) => !s.informational)
+    expect(core.every((s) => !s.id.includes('.'))).toBe(true)
+  })
+
+  it('E3: an idle plugin producer alone cannot make the verdict partial', () => {
+    // No core source fed; only an installed-but-idle plugin producer. Without
+    // the informational exclusion this would read as "wired but silent" →
+    // partial. The verdict must stay driven by the CORE sources only (here:
+    // nothing wired/fed → dark), not amber-flip on an unrun manual producer.
+    mockHooks({ 'pcap-capture.pcap-tcpdump': true })
+    ins('system', { subtype: 'startup' }) // a non-capture event, proves nothing
+    const h = getCaptureHealth()
+    expect(h.verdict).toBe('dark')
+    expect(h.sources.find((s) => s.id === 'pcap-capture.pcap-tcpdump')?.informational).toBe(true)
+  })
+
+  // Set up and nothing has come through is not a fault. A proxy with no
+  // traffic is a proxy nobody has sent traffic to; a terminal with no commands
+  // is an operator who has not typed. The verdict grades whether capture CAN
+  // run, and `recording` reports, separately, whether anything has.
+  it('is healthy when set up, even with nothing recorded yet', () => {
+    mockHooks({ 'shell-zsh': true, 'claude-code': false })
+    const h = getCaptureHealth()
+    expect(h.verdict).toBe('healthy')
+    expect(h.hasRecorded).toBe(false)
+    expect(h.sources.find((s) => s.id === 'terminal')?.state).toBe('ready')
+  })
+
+  it('healthy once a source has recorded something', () => {
+    mockHooks({ 'shell-zsh': true, 'claude-code': false })
+    ins('shell', { subtype: 'command_start', command: 'nmap', source: 'zsh' })
+    const h = getCaptureHealth()
+    expect(h.verdict).toBe('healthy')
+    expect(h.hasRecorded).toBe(true)
+    expect(h.sources.find((s) => s.id === 'terminal')?.state).toBe('ready')
+  })
+
+  // One row for both terminals: RedLog's own panes and the operator's own
+  // shell are the same capture in two places, and which one a command came
+  // from is on the command (`data.source`), not on a capture source.
+  it('feeds the terminal row from a RedLog pane as readily as from the shell hook', () => {
+    mockHooks({ 'shell-zsh': false, 'claude-code': false })
+    ins('shell', { subtype: 'command_end', command: 'id', source: 'builtin-terminal' })
+    const h = getCaptureHealth()
+    const terminal = h.sources.find((s) => s.id === 'terminal')
+    expect(terminal?.state).toBe('ready')
+    // No hook installed, and the row still does not read "not set up":
+    // RedLog's own pane is the capability, and it is recording.
+    expect(terminal?.installed).toBe(false)
+    expect(h.sources.find((s) => s.id === 'builtin-terminal')).toBeUndefined()
+  })
+
+  // Spec 052 T027, FR-015. An install is not finished because a file was
+  // copied and a line was appended: the rc has to be re-read, the adapter has
+  // to load, and the transport has to reach RedLog. The only evidence of all
+  // three is a command that arrived from a terminal that is not one of
+  // RedLog's own panes. Until then the card is reporting on its own setup
+  // flow rather than on capture.
+  it('does not count RedLog’s own pane as proof the shell hook works', () => {
+    mockHooks({ 'shell-zsh': true })
+    ins('shell', { subtype: 'command_end', command: 'id', source: 'builtin-terminal' })
+    const terminal = getCaptureHealth().sources.find((s) => s.id === 'terminal')
+    // The row is feeding — but not from the operator's own shell.
+    expect(terminal?.state).toBe('ready')
+    expect(terminal?.lastEventAt).not.toBeNull()
+    expect(terminal?.ownShellLastEventAt).toBeNull()
+  })
+
+  it('counts a command from the operator’s own terminal as proof', () => {
+    mockHooks({ 'shell-zsh': true })
+    ins('shell', { subtype: 'command_end', command: 'nmap -sV 10.0.0.1', source: 'auto-relay', shell: 'zsh' })
+    const t = getCaptureHealth().sources.find((s) => s.id === 'terminal')
+    expect(t?.ownShellLastEventAt).not.toBeNull()
+    expect(t?.ownShellName).toBe('zsh')
+  })
+
+  // A row that cannot say which adapter sent it proves nothing about any of
+  // them. It stays in the record; it does not light a shell's verification.
+  it('does not count a command with no shell field as proof', () => {
+    mockHooks({ 'shell-zsh': true })
+    ins('shell', { subtype: 'command_end', command: 'old adapter row', source: 'auto-relay' })
+    const t = getCaptureHealth().sources.find((s) => s.id === 'terminal')
+    expect(t?.ownShellLastEventAt).toBeNull()
+    expect(t?.ownShellName).toBeNull()
+  })
+
+  // Spec 060 FR-003: a command arriving is not its output arriving.
+  it('reports output evidence only from a command whose output was captured', () => {
+    mockHooks({ 'shell-zsh': true })
+    ins('shell', { subtype: 'command_end', command: 'vim x', source: 'auto-relay', shell: 'zsh', output_disposition: 'interactive' })
+    let t = getCaptureHealth().sources.find((s) => s.id === 'terminal')
+    expect(t?.ownShellLastEventAt).not.toBeNull()
+    expect(t?.ownShellOutputAt).toBeNull()
+    ins('shell', { subtype: 'command_end', command: 'echo ok', source: 'auto-relay', shell: 'zsh', output_disposition: 'captured' })
+    t = getCaptureHealth(Date.now() + 5000).sources.find((s) => s.id === 'terminal')
+    expect(t?.ownShellOutputAt).not.toBeNull()
+  })
+
+  // Spec 060 FR-003/FR-011: proof comes from the shell that was installed.
+  it('does not count a zsh command as proof for a Bash-only install', () => {
+    mockHooks({ 'shell-zsh': false, 'shell-bash': true })
+    ins('shell', { subtype: 'command_end', command: 'id', source: 'auto-relay', shell: 'zsh' })
+    expect(getCaptureHealth().sources.find((s) => s.id === 'terminal')?.ownShellLastEventAt).toBeNull()
+    ins('shell', { subtype: 'command_end', command: 'whoami', source: 'auto-relay', shell: 'bash' })
+    expect(getCaptureHealth(Date.now() + 5000).sources.find((s) => s.id === 'terminal')?.ownShellLastEventAt).not.toBeNull()
+  })
+
+  // Spec 060 FR-011: the two proxies emit the same subtypes; a request through
+  // the regular one must not make the transparent one look like it captured.
+  it('does not let a regular-proxy request vouch for the transparent proxy', () => {
+    invalidateHooksCache()
+    vi.spyOn(hooksMod, 'detectHooks').mockReturnValue([
+      { id: 'shell-zsh', name: 'shell-zsh', description: '', agentType: 'shell', installed: true, available: true, installMethod: 'shell-source' as const, hookFile: '' },
+      { id: 'transparent-proxy.mitmproxy-transparent', name: 'transparent-proxy', description: '', agentType: 'scanner', emits: ['http_request_start', 'http_response'], installed: false, available: true, installMethod: 'manual' as const, hookFile: '' }
+    ])
+    ins('scanner', { subtype: 'http_request_start', url: 'http://a.test/', proxy_mode: 'regular' })
+    ins('scanner', { subtype: 'http_request_start', url: 'http://old.test/' })
+    let tproxy = getCaptureHealth().sources.find((s) => s.id === 'transparent-proxy.mitmproxy-transparent')
+    expect(tproxy?.state).toBe('off')
+    expect(tproxy?.lastEventAt).toBeNull()
+
+    ins('scanner', { subtype: 'http_request_start', url: 'http://b.test/', proxy_mode: 'transparent' })
+    tproxy = getCaptureHealth(Date.now() + 5000).sources.find((s) => s.id === 'transparent-proxy.mitmproxy-transparent')
+    expect(tproxy?.state).toBe('ready')
+    expect(tproxy?.lastEventAt).not.toBeNull()
+  })
+
+  // The card does not poll. It re-reads capture health once on mount and once
+  // per batch of new events — so whatever that one read returns is what the
+  // operator sees until the NEXT event arrives. If the 750ms cache hands back
+  // a reading computed just before the event landed, the card is wrong and
+  // nothing will correct it.
+  //
+  // That is exactly the FR-015 moment: the operator installs the hook, runs
+  // one command in their own terminal to prove it, and the card keeps saying
+  // "open a new terminal". Found by e2e/terminal-enrollment.spec.ts, which
+  // passed on a quiet machine and failed on a busy CI runner — because
+  // whether something else had filled the cache in the previous 750ms is a
+  // property of the load, not of the code.
+  it('does not serve a reading from before an event that has since landed', async () => {
+    mockHooks({ 'shell-zsh': true })
+    const t0 = Date.now()
+    expect(getCaptureHealth(t0).sources.find((s) => s.id === 'terminal')?.ownShellLastEventAt)
+      .toBeNull()
+
+    const ev = ins('shell', { subtype: 'command_end', command: 'whoami', source: 'auto-relay', shell: 'zsh' })
+    // The path every real event takes: ingest writes, then publishes, and the
+    // bus defers its fanout to a microtask.
+    eventBusMod.eventBus.publish(ev!)
+    await new Promise((resolve) => setImmediate(resolve))
+
+    // Well inside the cache window. The cache exists to coalesce a storm of
+    // polls BETWEEN events; it must never outlive an event someone is about
+    // to ask about.
+    expect(getCaptureHealth(t0 + 100).sources.find((s) => s.id === 'terminal')?.ownShellLastEventAt)
+      .not.toBeNull()
+  })
+
+  it('does not count a command from an adapter too old to say where it came from', () => {
+    // Rows without `source` or `shell` predate the adapters that report them.
+    // They stay in the record for reading, but nothing about them says which
+    // adapter works, so they do not light a shell's verification. The operator
+    // sees "open a new terminal and run a command" until a current adapter
+    // sends one (Spec 060 FR-003, FR-011).
+    mockHooks({ 'shell-zsh': true })
+    ins('shell', { subtype: 'command_end', command: 'whoami' })
+    expect(getCaptureHealth().sources.find((s) => s.id === 'terminal')?.ownShellLastEventAt)
+      .toBeNull()
+  })
+
+  // Spec 052 T017. The terminal row has always been able to say whether a
+  // command has arrived; it could not say whether this machine's terminals
+  // are enrolled at all. Those are different questions — an enrolled terminal
+  // that nobody has typed in yet is working perfectly and has recorded
+  // nothing — and the card needs the second one to tell "RedLog's panes only"
+  // from "this machine's terminals too".
+  describe('enrolled terminals', () => {
+    let home: string
+    let realHome: string | undefined
+    let realProfile: string | undefined
+    beforeEach(() => {
+      home = fs.mkdtempSync(path.join(os.tmpdir(), 'redlog-home-'))
+      realHome = process.env.HOME; realProfile = process.env.USERPROFILE
+      process.env.HOME = home; process.env.USERPROFILE = home
+    })
+    afterEach(() => {
+      if (realHome === undefined) delete process.env.HOME; else process.env.HOME = realHome
+      if (realProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = realProfile
+      fs.rmSync(home, { recursive: true, force: true })
+    })
+
+    const enroll = async (sessionId: string, recording: boolean) => {
+      const mod = await import('../src/core/terminal-enrollment')
+      mod.writeTerminalEnrollment(home, {
+        sessionId, mode: 'auto', recording, engagementId: 'eng-1', operatorId: 'op', startedAt: Date.now()
+      })
+    }
+
+    it('says nothing when nothing has enrolled', () => {
+      mockHooks({ 'shell-zsh': false })
+      expect(getCaptureHealth().sources.find((s) => s.id === 'terminal')?.enrolled).toBeUndefined()
+    })
+
+    it('counts the terminals and how many of them are recording', async () => {
+      mockHooks({ 'shell-zsh': true })
+      await enroll('pane-1', true)
+      await enroll('pane-2', false)   // stopped on purpose — FR-022, not a fault
+      expect(getCaptureHealth().sources.find((s) => s.id === 'terminal')?.enrolled)
+        .toEqual({ total: 2, recording: 1 })
+    })
+  })
+
+  // #255: commands typed with no project open are spooled with no identity and
+  // set aside by replay. Health reports them as a gap in the record — and does
+  // not let them move the verdict, which is about whether capture works now.
+  describe('commands set aside by spool replay', () => {
+    let home: string
+    let realHome: string | undefined
+    let realProfile: string | undefined
+    beforeEach(() => {
+      home = fs.mkdtempSync(path.join(os.tmpdir(), 'redlog-home-'))
+      realHome = process.env.HOME; realProfile = process.env.USERPROFILE
+      process.env.HOME = home; process.env.USERPROFILE = home
+    })
+    afterEach(() => {
+      if (realHome === undefined) delete process.env.HOME; else process.env.HOME = realHome
+      if (realProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = realProfile
+      fs.rmSync(home, { recursive: true, force: true })
+    })
+
+    it('is null when the spool holds none, and counts them when it does', () => {
+      mockHooks({ 'shell-zsh': true })
+      expect(getCaptureHealth().unattributedSpool).toBeNull()
+
+      const pending = path.join(home, '.redlog', 'pending')
+      fs.mkdirSync(pending, { recursive: true })
+      fs.writeFileSync(path.join(pending, '1.json.unattributed'), '{}')
+      fs.writeFileSync(path.join(pending, '2.json.unattributed'), '{}')
+      fs.writeFileSync(path.join(pending, '3.json'), '{}')
+      mockHooks({ 'shell-zsh': true })   // drops the cached read
+      expect(getCaptureHealth().unattributedSpool).toMatchObject({ count: 2 })
+    })
+
+    it('clearing drops them from the very next read, not 750 ms later', async () => {
+      // Health is cached. The card asks again the moment the operator confirms,
+      // and an answer cached a moment before would still list what was deleted.
+      const { clearUnattributedCommands } = await import('../src/core/capture-health')
+      mockHooks({ 'shell-zsh': true })
+      const pending = path.join(home, '.redlog', 'pending')
+      fs.mkdirSync(pending, { recursive: true })
+      fs.writeFileSync(path.join(pending, '1.json.unattributed'), '{}')
+      fs.writeFileSync(path.join(pending, '2.json.unattributed'), '{}')
+      mockHooks({ 'shell-zsh': true })
+      const shown = getCaptureHealth().unattributedSpool
+      expect(shown).toMatchObject({ count: 2 })
+
+      expect(clearUnattributedCommands(shown!.newestAt)).toEqual({ removed: 2, failed: 0 })
+      expect(getCaptureHealth().unattributedSpool).toBeNull()
+    })
+
+    it('does not change the verdict', () => {
+      mockHooks({ 'shell-zsh': true })
+      ins('shell', { subtype: 'command_start', source: 'zsh' })
+      const before = getCaptureHealth().verdict
+      const pending = path.join(home, '.redlog', 'pending')
+      fs.mkdirSync(pending, { recursive: true })
+      fs.writeFileSync(path.join(pending, '1.json.unattributed'), '{}')
+      mockHooks({ 'shell-zsh': true })
+      expect(getCaptureHealth().verdict).toBe(before)
+    })
+  })
+
+  it('does not count opening a pane as having recorded a command', () => {
+    // Opening a pane writes a session_start. The terminal can record — that is
+    // what `ready` says — but nothing has been recorded, which is what an
+    // empty `lastEventAt` says. Two facts, two fields.
+    mockHooks({ 'shell-zsh': false, 'claude-code': false })
+    ins('shell', { subtype: 'session_start', source: 'builtin-terminal' })
+    const h = getCaptureHealth()
+    const terminal = h.sources.find((s) => s.id === 'terminal')
+    expect(terminal?.lastEventAt).toBeNull()
+    expect(terminal?.state).toBe('ready')
+    expect(h.hasRecorded).toBe(false)
+  })
+
+  // v0.9.7: the `claude-code` row is gone. That hook was retired in v0.7.3 —
+  // the script is a no-op stub, its detectHooks() entry is commented out —
+  // so the row could never report `installed` and rendered as a permanent
+  // idle with an Install button that did nothing. Agent coverage now comes
+  // from the transcript tailer, which sees every tool, not just Bash.
+  it('uses installation and project permissions for AI health, including reinstall', async () => {
+    vi.spyOn(os, 'homedir').mockReturnValue(tmp)
+    const { createOfficialAgentPluginManager } = await import('../src/core/plugins/official-agents')
+    const manager = createOfficialAgentPluginManager(path.join(tmp, '.redlog', 'plugins'))
+    manager.install('codex')
+    fs.mkdirSync(path.join(tmp,'.codex','sessions'),{recursive:true})
+    const receipt = manager.list().find(p => p.agentKind === 'codex')!.installationId
+    vi.spyOn(pluginsIndex,'listPlugins').mockReturnValue([{manifest:{id:'official-ai-codex'},status:'active'}] as never)
+    configureCaptureHealth({agentTailer:{sources:{codex:{enabled:true,installationId:receipt,workPaths:[tmp],startedAt:1000}}}})
+    expect(getCaptureHealth().sources.find(s => s.id === 'agent-codex')).toMatchObject({installed:true,enabled:true,state:'ready'})
+    manager.uninstall('codex'); invalidateHooksCache()
+    expect(getCaptureHealth().sources.find(s => s.id === 'agent-codex')).toMatchObject({installed:false,enabled:false,state:'off'})
+    manager.install('codex'); invalidateHooksCache()
+    expect(getCaptureHealth().sources.find(s => s.id === 'agent-codex')).toMatchObject({installed:true,enabled:false,state:'off'})
+  })
+
+  it('reports agent activity through the per-tool tailer rows, not a hook row', () => {
+    mockHooks({ 'shell-zsh': false })
+    configureCaptureHealth({})
+    ins('agent', { subtype: 'tool_call', tool_name: 'Bash', agent: 'claude-code' })
+    const h = getCaptureHealth()
+    expect(h.sources.find((s) => s.id === 'claude-code')).toBeUndefined()
+    expect(h.sources.find((s) => s.id === 'agent-claude-code')?.state).toBe('off')
+    expect(h.sources.find((s) => s.id === 'agent-claude-code')?.lastEventAt).not.toBeNull()
+  })
+
+  // v0.9.7: DNS and HTTP are the same addon (hooks/mitmproxy-addon.py),
+  // switched by how mitmdump is run. One row, fed by either stream.
+  it('folds DNS events into the mitmproxy row', () => {
+    mockHooks({ 'shell-zsh': false })
+    ins('dns', { subtype: 'dns_query', query: 'example.test' })
+    const h = getCaptureHealth()
+    expect(h.sources.find((s) => s.id === 'dns')).toBeUndefined()
+    expect(h.sources.find((s) => s.id === 'mitmproxy')?.state).toBe('ready')
+  })
+
+  // v0.9.7: installation and activation are separate axes.
+  it('reports a switched-off source as off, not merely unset', () => {
+    mockHooks({ 'shell-zsh': false })
+    // Spec 035: sources switch by pack. Host monitors off, AI agents on.
+    configureCaptureHealth({ packs: { hostMonitors: false } })
+    const h = getCaptureHealth()
+    expect(h.sources.find((s) => s.id === 'clipboard')?.state).toBe('off')
+    expect(h.sources.find((s) => s.id === 'clipboard')?.enabled).toBe(false)
+    // Switched on and nothing has come through it yet: it can record, which
+    // is all this axis claims. Its silence is reported as an empty
+    // `lastEventAt`, not as a second state.
+    expect(h.sources.find((s) => s.id === 'agent-claude-code')?.state).toBe('off')
+  })
+
+  it('a switched-off source does not drag the verdict to partial', () => {
+    mockHooks({ 'shell-zsh': false })
+    // Feed the monitor, then switch it off: previously "expected but silent"
+    // pinned the verdict to partial forever after.
+    ins('process', { subtype: 'process_spawn', command: 'bash' })
+    ins('scanner', { subtype: 'http_request', url: 'https://x' })
+    configureCaptureHealth({ packs: { hostMonitors: false } })
+    const h = getCaptureHealth()
+    expect(h.sources.find((s) => s.id === 'process-monitor')?.state).toBe('off')
+    expect(h.verdict).toBe('healthy')
+  })
+
+  it('recognises mitmproxy scanner events even though it has no install flag', () => {
+    mockHooks({ 'shell-zsh': false, 'claude-code': false })
+    ins('scanner', { subtype: 'http_request', url: 'https://x' })
+    const h = getCaptureHealth()
+    expect(h.verdict).toBe('healthy')
+    expect(h.sources.find((s) => s.id === 'mitmproxy')?.state).toBe('ready')
+  })
+
+  // v0.9.8: getCaptureHealth is cached for 750 ms — it runs eleven indexed
+  // probes plus a hooks check, and is hit by the Dashboard poll, the
+  // StatusBar, every REST /api/status and every agent calling redlog_status.
+  // Anything that changes what it reports has to drop the cache, or the
+  // readout lags behind the thing it is reporting on.
+  it('a config change is visible immediately, not after the cache TTL', () => {
+    mockHooks({ 'shell-zsh': false })
+    // The clipboard is ticked explicitly: it does not come on with the pack (#224).
+    configureCaptureHealth({ packs: { hostMonitors: true }, packMembers: { clipboard: true } })
+    expect(getCaptureHealth().sources.find((s) => s.id === 'clipboard')?.enabled).toBe(true)
+    configureCaptureHealth({ packs: { hostMonitors: false }, packMembers: { clipboard: true } })
+    expect(getCaptureHealth().sources.find((s) => s.id === 'clipboard')?.enabled).toBe(false)
+  })
+})
+
+// Three ways this panel told an operator something that was not true, all
+// found by walking a real Windows install end to end.
+describeDB('capture-health tells the truth about live sources', () => {
+  let tmp: string
+  let noteCaptureError: typeof import('../src/core/capture-health').noteCaptureError
+  let clearCaptureError: typeof import('../src/core/capture-health').clearCaptureError
+  beforeEach(async () => {
+    const ch = await import('../src/core/capture-health')
+    noteCaptureError = ch.noteCaptureError; clearCaptureError = ch.clearCaptureError
+    clearCaptureError('screenshot')
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redlog-cap2-')); initDB(tmp)
+    const active = (id: string) => ({ manifest: { id }, source: 'bundled', status: 'active' }) as never
+    vi.spyOn(pluginsIndex, 'listPlugins').mockReturnValue(
+      [active('pack-host-monitors'), active('pack-windows-output')]
+    )
+  })
+  afterEach(() => {
+    clearCaptureError('screenshot')
+    closeDB(); fs.rmSync(tmp, { recursive: true, force: true }); vi.restoreAllMocks()
+  })
+
+  // On Windows `shell-zsh` is never installed, and `checkInstalled` returns a
+  // boolean, so `a ?? b ?? c` stopped at `false` and the row claimed the shell
+  // hook was absent while PowerShell commands were landing.
+  it('counts the shell hook installed when ANY shell hook is, not just the first', () => {
+    mockHooks({ 'shell-zsh': false, 'shell-bash': false, 'shell-powershell': true })
+    ins('shell', { subtype: 'command_end', command: 'whoami' })
+    const terminal = getCaptureHealth().sources.find((s) => s.id === 'terminal')
+    expect(terminal?.installed).toBe(true)
+    expect(terminal?.state).toBe('ready')
+  })
+
+  // The managed proxy runs the mitmproxy addon with `-s <path>` rather than
+  // installing the standalone hook, so the hook's own `installed` is false by
+  // design while HTTP events pour in. "absent" over a source that fed seconds
+  // ago is the one reading this panel must never produce.
+  it('never calls a source unset while it is still feeding', () => {
+    mockHooks({ 'shell-zsh': false, mitmproxy: false }, ['mitmproxy'])
+    ins('scanner', { subtype: 'http_request_start', url: 'https://example.com/', method: 'GET' })
+    const mitm = getCaptureHealth().sources.find((s) => s.id === 'mitmproxy')
+    expect(mitm?.installed).toBe(false)
+    expect(mitm?.state).toBe('ready')
+  })
+
+  // mitmproxy's installMethod is `manual`, and checkInstalled() returns false
+  // for every manual hook unconditionally — so this row's `installed` said
+  // nothing about the machine it was running on. It was false with mitmdump on
+  // PATH, the managed proxy up and requests landing, and the Dashboard's
+  // HTTP(S) line read 未安裝 mitmproxy through all of it. The honest question
+  // is whether mitmdump is here, which is `available`.
+  it('calls mitmproxy installed when mitmdump is on the machine, not when a manual hook says so', () => {
+    mockHooks({ 'shell-zsh': false, mitmproxy: false })
+    const mitm = getCaptureHealth().sources.find((s) => s.id === 'mitmproxy')
+    expect(mitm?.installed).toBe(true)
+    // Able, not missing: there is nothing left for the operator to install.
+    expect(mitm?.state).toBe('ready')
+  })
+
+  it('calls mitmproxy unset only when mitmdump is missing', () => {
+    mockHooks({ 'shell-zsh': false, mitmproxy: false }, ['mitmproxy'])
+    const mitm = getCaptureHealth().sources.find((s) => s.id === 'mitmproxy')
+    expect(mitm?.installed).toBe(false)
+    expect(mitm?.state).toBe('unset')
+  })
+
+  // A camera that cannot see the screen is not a dark log.
+  it('a capture failure marks that source, and tips the verdict amber — not dark', () => {
+    mockHooks({ 'shell-zsh': true })
+    ins('shell', { subtype: 'command_end', command: 'whoami' })
+    expect(getCaptureHealth().verdict).toBe('healthy')
+
+    noteCaptureError('screenshot', new Error('screen capture came back empty'))
+    const h = getCaptureHealth()
+    const shot = h.sources.find((s) => s.id === 'screenshot')
+    expect(shot?.state).toBe('error')
+    expect(shot?.lastError?.message).toContain('came back empty')
+    expect(h.verdict).toBe('partial')
+    // It is the source's fault, not the database's: nothing here claims
+    // evidence cannot be written.
+    expect(h.lastDbError).toBeUndefined()
+
+    clearCaptureError('screenshot')
+    expect(getCaptureHealth().sources.find((s) => s.id === 'screenshot')?.state).not.toBe('error')
+  })
+})
+
+// HTTP and DNS share one `mitmproxy` row — the addon serves both, in two
+// modes, from two mitmdump processes. The row used to carry a `streams` note
+// saying which of them had traffic in the last ten minutes; that reported the
+// target's traffic rather than RedLog's capture, and it was the last of that
+// family left on the card.
+describeDB('the mitmproxy row is fed by either of its two modes', () => {
+  let tmp: string
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redlog-streams-')); initDB(tmp)
+    const active = (id: string) => ({ manifest: { id }, source: 'bundled', status: 'active' }) as never
+    vi.spyOn(pluginsIndex, 'listPlugins').mockReturnValue(
+      [active('pack-host-monitors'), active('pack-windows-output')]
+    )
+    mockHooks({ 'shell-zsh': false, mitmproxy: false })
+  })
+  afterEach(() => { closeDB(); fs.rmSync(tmp, { recursive: true, force: true }); vi.restoreAllMocks() })
+
+  const mitm = () => getCaptureHealth().sources.find((s) => s.id === 'mitmproxy')
+
+  it('counts an HTTP request', () => {
+    ins('scanner', { subtype: 'http_request_start', url: 'https://example.com/', method: 'GET' })
+    expect(mitm()?.state).toBe('ready')
+    expect(mitm()?.lastEventAt).not.toBeNull()
+  })
+
+  it('counts a DNS query, with no separate row for it', () => {
+    ins('dns', { subtype: 'dns_query', query_name: 'example.com' })
+    expect(mitm()?.lastEventAt).not.toBeNull()
+    expect(getCaptureHealth().sources.find((s) => s.id === 'dns')).toBeUndefined()
+  })
+
+  // The connection monitor also writes agent_type='scanner'; it must not read
+  // as HTTP traffic.
+  it('does not read a socket-table row as HTTP traffic', () => {
+    ins('scanner', { subtype: 'connection', remote_addr: '10.0.0.5:443' })
+    expect(mitm()?.lastEventAt).toBeNull()
+  })
+})
+
+// Spec 050: one source per AI tool, so a quiet Claude Code tailer is not
+// hidden by a busy Codex one. `data.agent` is the adapter's agentKind.
+describeDB('each AI tool reports its own last event', () => {
+  let tmp: string
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redlog-agents-')); initDB(tmp)
+    const active = (id: string) => ({ manifest: { id }, source: 'bundled', status: 'active' }) as never
+    vi.spyOn(pluginsIndex, 'listPlugins').mockReturnValue(
+      [active('pack-host-monitors'), active('pack-windows-output')]
+    )
+    mockHooks({ 'shell-zsh': false, mitmproxy: false })
+  })
+  afterEach(() => { closeDB(); fs.rmSync(tmp, { recursive: true, force: true }); vi.restoreAllMocks() })
+
+  const row = (id: string) => getCaptureHealth().sources.find((s) => s.id === id)
+
+  it('lights only the tool that produced events', () => {
+    ins('agent', { subtype: 'user_prompt', agent: 'codex', session_id: 's1' })
+    expect(row('agent-codex')?.lastEventAt).not.toBeNull()
+    expect(row('agent-claude-code')?.lastEventAt).toBeNull()
+    expect(row('agent-opencode')).toBeUndefined()
+  })
+})
+
+// The probes were rewritten from `IN (...)` lists into one equality seek per
+// value, so that an index can answer each one (see newestEvent). Nothing in the
+// suites above would notice a rewrite that quietly answers a different question:
+// they plant one row and read one source. This runs the ORIGINAL probes, kept
+// below as a verbatim copy of the SQL they replaced, against one database that
+// holds every awkward row at once, and requires the same answer from each.
+describeDB('capture-health: the indexed probes answer what the IN-list probes did', () => {
+  let tmp: string
+  const NOW = Date.now()
+  const MIN = 60_000
+  const HOUR = 60 * MIN
+  const DAY = 24 * HOUR
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redlog-equiv-')); initDB(tmp)
+    const active = (id: string) => ({ manifest: { id }, source: 'bundled', status: 'active' }) as never
+    vi.spyOn(pluginsIndex, 'listPlugins').mockReturnValue(
+      [active('pack-host-monitors'), active('pack-windows-output')]
+    )
+  })
+  afterEach(() => { closeDB(); fs.rmSync(tmp, { recursive: true, force: true }); vi.restoreAllMocks() })
+
+  const at = (agentType: string, data: Record<string, unknown>, agoMs: number): void => {
+    insertEventRaw(agentType, data, { operatorId: 'op', occurredAt: NOW - agoMs })
+  }
+
+  /** Every row below is chosen to separate a correct rewrite from a plausible
+   *  wrong one. No two different own shells share a millisecond: the original
+   *  answer for that case was whichever row the index happened to yield. */
+  function seed(): void {
+    // RedLog's own pane: not the operator's terminal, whatever it captured.
+    at('shell', { subtype: 'command_start', command: 'pane-1', shell: 'zsh', source: 'builtin-terminal' }, 5 * MIN)
+    at('shell', { subtype: 'command_end', command: 'pane-2', shell: 'zsh', source: 'builtin-terminal', output_disposition: 'captured' }, 4 * MIN)
+    // Own bash, and only 40 days old.
+    at('shell', { subtype: 'command_start', command: 'bash-1', shell: 'bash', source: 'auto-relay' }, 40 * DAY + 2000)
+    at('shell', { subtype: 'command_end', command: 'bash-1', shell: 'bash', source: 'auto-relay', output_disposition: 'none' }, 40 * DAY)
+    // No `source` at all (an older adapter) still counts as the operator's.
+    at('shell', { subtype: 'command_end', command: 'ps-1', shell: 'powershell', output_disposition: 'captured' }, 30 * MIN)
+    // No `shell`: cannot vouch for any adapter, and is the newest shell row.
+    at('shell', { subtype: 'command_start', command: 'anon-1', source: 'auto-relay' }, 1 * MIN)
+    // An empty shell name, which the no-hook probe matches by design.
+    at('shell', { subtype: 'command_start', command: 'empty-1', shell: '', source: 'auto-relay' }, 2 * HOUR)
+    // zsh: a newer command that was not captured, an older one that was.
+    at('shell', { subtype: 'command_end', command: 'zsh-1', shell: 'zsh', source: 'auto-relay', output_disposition: 'redacted' }, 1 * HOUR)
+    at('shell', { subtype: 'command_end', command: 'zsh-2', shell: 'zsh', source: 'auto-relay', output_disposition: 'captured' }, 3 * HOUR)
+    // Housekeeping and a row with no subtype are not commands.
+    at('shell', { subtype: 'session_start', shell: 'zsh', source: 'auto-relay' }, 10_000)
+    at('shell', { command: 'no-subtype', shell: 'zsh', source: 'auto-relay' }, 20_000)
+
+    // HTTP: regular, unstamped, an explicit regular stamp, and transparent rows
+    // that are old and nothing else.
+    at('scanner', { subtype: 'http_request_start', url: 'https://a.test/', method: 'GET' }, 15 * MIN)
+    at('scanner', { subtype: 'http_response', url: 'https://a.test/', status: 200 }, 20 * MIN)
+    at('scanner', { subtype: 'http_response', url: 'https://b.test/', status: 200, proxy_mode: 'regular' }, 25 * MIN)
+    at('scanner', { subtype: 'http_request_start', url: 'https://t.test/', proxy_mode: 'transparent' }, 50 * DAY + 1000)
+    at('scanner', { subtype: 'http_response', url: 'https://t.test/', proxy_mode: 'transparent' }, 50 * DAY)
+    at('scanner', { subtype: 'connection', remote_addr: '10.0.0.5:443' }, 9 * MIN)
+    at('scanner', { subtype: 'packet_flow', src: '10.0.0.5', dst: '10.0.0.9' }, 60 * DAY)
+    at('dns', { subtype: 'dns_query', query_name: 'a.test' }, 70 * DAY)
+
+    // AI tools. claude-code is chained. codex has its newest row in BOTH tiers
+    // at one millisecond (thinking is logged, user_prompt is chained).
+    at('agent', { subtype: 'tool_call', agent: 'claude-code', session_id: 's1' }, 8 * MIN)
+    at('agent', { subtype: 'thinking', agent: 'codex', session_id: 's2' }, 90 * DAY)
+    at('agent', { subtype: 'user_prompt', agent: 'codex', session_id: 's2' }, 90 * DAY)
+
+    // Heartbeats and the rest.
+    at('system', { subtype: 'producer_heartbeat', producer: 'pcap-capture' }, 10_000)
+    at('system', { subtype: 'producer_heartbeat', producer: 'c2-tailers' }, 2 * DAY)
+    at('system', { subtype: 'api_started' }, 1000)
+    at('file_transfer', { subtype: 'file_created', source: 'file-watcher', path: '/tmp/a' }, 100 * DAY)
+    at('file_transfer', { subtype: 'file_created', source: 'upload', path: '/tmp/b' }, 1 * MIN)
+    at('browser', { subtype: 'console', level: 'log' }, 12 * MIN)
+    at('process', { subtype: 'process_spawn', pid: 1 }, 6 * DAY)
+    at('clipboard', { subtype: 'clipboard_copy', text: 'x' }, 3 * MIN)
+    at('screenshot', { subtype: 'screenshot', path: 'a.png' }, 4 * HOUR)
+  }
+
+  // ---- The original probes: verbatim copies of the SQL this replaced. ------
+
+  function oldLast(where: string, params: unknown[] = []): number | null {
+    const db = getDB()
+    const chainedRow = db.prepare(
+      `SELECT timestamp AS t FROM events WHERE ${where} ORDER BY timestamp DESC LIMIT 1`
+    ).get(...params) as { t: number | null } | undefined
+    const loggedRow = db.prepare(
+      `SELECT timestamp AS t FROM events_logged WHERE ${where} ORDER BY timestamp DESC LIMIT 1`
+    ).get(...params) as { t: number | null } | undefined
+    const chained = chainedRow?.t ?? null
+    const logged = loggedRow?.t ?? null
+    if (chained === null) return logged
+    if (logged === null) return chained
+    return chained > logged ? chained : logged
+  }
+
+  function oldShellName(where: string, params: unknown[] = []): string | null {
+    const db = getDB()
+    const q = (table: string): { t: number; s: string | null } | undefined => db.prepare(
+      `SELECT timestamp AS t, json_extract(data,'$.shell') AS s FROM ${table} WHERE ${where} ORDER BY timestamp DESC LIMIT 1`
+    ).get(...params) as { t: number; s: string | null } | undefined
+    const a = q('events')
+    const b = q('events_logged')
+    const newest = !a ? b : !b ? a : (a.t >= b.t ? a : b)
+    return newest?.s ?? null
+  }
+
+  const PROXY_MODE: Record<string, string> = { 'transparent-proxy.mitmproxy-transparent': 'transparent' }
+
+  function oracle(shellNames: string[], plugins: Array<{ id: string; agentType: string; emits: string[] }>) {
+    const ownShellWhere = `agent_type = 'shell'
+     AND COALESCE(json_extract(data,'$.source'), '') != 'builtin-terminal'
+     AND json_extract(data,'$.shell') IN (${shellNames.map(() => '?').join(',') || "''"})`
+    const mitm = oldLast(`agent_type = 'scanner' AND subtype NOT IN ('connection','connection_end')
+    AND COALESCE(json_extract(data,'$.proxy_mode'), 'regular') != 'transparent'`)
+    const dns = oldLast(`agent_type = 'dns'`)
+    const core: Record<string, number | null> = {
+      terminal: oldLast(`agent_type = 'shell' AND subtype IN ('command_start','command_end')`),
+      mitmproxy: Math.max(mitm ?? 0, dns ?? 0) || null,
+      'browser-console': oldLast(`agent_type = 'browser'`),
+      'connection-monitor': oldLast(`agent_type = 'scanner' AND subtype IN ('connection','connection_end')`),
+      screenshot: oldLast(`agent_type = 'screenshot'`),
+      clipboard: oldLast(`agent_type = 'clipboard'`),
+      'process-monitor': oldLast(`agent_type = 'process'`),
+      'file-watcher': oldLast(`agent_type = 'file_transfer' AND json_extract(data,'$.source') = 'file-watcher'`)
+    }
+    const agentLast = (kind: string): number | null =>
+      oldLast(`agent_type = 'agent' AND json_extract(data,'$.agent') = ?`, [kind])
+    const own = {
+      last: oldLast(`${ownShellWhere} AND subtype IN ('command_start','command_end')`, shellNames),
+      name: oldShellName(`${ownShellWhere} AND subtype IN ('command_start','command_end')`, shellNames),
+      output: oldLast(`${ownShellWhere} AND subtype = 'command_end'
+     AND json_extract(data,'$.output_disposition') = 'captured'`, shellNames)
+    }
+    const pluginRows: Record<string, { last: number | null; hb: number | null }> = {}
+    for (const p of plugins) {
+      const mode = PROXY_MODE[p.id]
+      const placeholders = p.emits.map(() => '?').join(',')
+      pluginRows[p.id] = {
+        last: oldLast(
+          `agent_type = ? AND subtype IN (${placeholders})${mode ? ` AND json_extract(data,'$.proxy_mode') = ?` : ''}`,
+          [p.agentType, ...p.emits, ...(mode ? [mode] : [])]
+        ),
+        hb: oldLast(
+          `agent_type = 'system' AND subtype = 'producer_heartbeat' AND json_extract(data,'$.producer') = ?`,
+          [p.id.split('.')[0]]
+        )
+      }
+    }
+    return { core, agentLast, own, pluginRows }
+  }
+
+  const PLUGINS = [
+    { id: 'transparent-proxy.mitmproxy-transparent', agentType: 'scanner', emits: ['http_request_start', 'http_response'] },
+    { id: 'pcap-capture.pcap-tcpdump', agentType: 'scanner', emits: ['packet_flow', 'pcap_segment'] },
+    { id: 'c2-tailers.sliver', agentType: 'scanner', emits: ['c2_checkin'] }
+  ]
+
+  function compare(shells: string[], label: string): void {
+    invalidateHooksCache()
+    const hook = (id: string, extra: Record<string, unknown> = {}) => ({
+      id, name: id, description: '', agentType: 'shell', installed: true, available: true,
+      installMethod: 'shell-source' as const, hookFile: '', ...extra
+    })
+    vi.spyOn(hooksMod, 'detectHooks').mockReturnValue([
+      hook('shell-zsh', { installed: shells.includes('zsh') }),
+      hook('shell-bash', { installed: shells.includes('bash') }),
+      hook('shell-powershell', { installed: shells.includes('powershell') }),
+      ...PLUGINS.map((p) => hook(p.id, { agentType: p.agentType, emits: p.emits, installed: false }))
+    ])
+    const h = getCaptureHealth(NOW)
+    const o = oracle(shells, PLUGINS)
+
+    let everFed = false
+    let anyWired = false
+    let anyErrored = false
+    let producerStalled = false
+    for (const s of h.sources) {
+      if (s.informational) {
+        const p = o.pluginRows[s.id]
+        expect(p, `${label}: unexpected plugin source ${s.id}`).toBeDefined()
+        expect(s.lastEventAt, `${label}: ${s.id} lastEventAt`).toBe(p.last)
+        const running = p.hb !== null && NOW - p.hb <= 60_000
+        expect(s.running, `${label}: ${s.id} running`).toBe(running)
+        expect(s.state, `${label}: ${s.id} state`).toBe(running || p.last !== null ? 'ready' : 'off')
+        if (p.last !== null) { everFed = true; anyWired = true }
+        if (running && (p.last === null || NOW - p.last > 10 * 60_000)) producerStalled = true
+        continue
+      }
+      const last = s.id.startsWith('agent-') ? o.agentLast(s.id.slice('agent-'.length)) : o.core[s.id]
+      expect(last, `${label}: no oracle for source ${s.id}`).not.toBeUndefined()
+      expect(s.lastEventAt, `${label}: ${s.id} lastEventAt`).toBe(last)
+      // `error` comes from the catalog and the filesystem, not from a probe.
+      if (s.state === 'error') anyErrored = true
+      else {
+        const ignoreInstalled = s.id === 'terminal'
+        const expected = s.enabled === false ? 'off'
+          : last !== null ? 'ready'
+            : !ignoreInstalled && s.installed === false ? 'unset' : 'ready'
+        expect(s.state, `${label}: ${s.id} state`).toBe(expected)
+      }
+      if (last !== null) everFed = true
+      if (s.state !== 'off' && (s.installed === true || (s.installed === undefined && last !== null))) anyWired = true
+      if (s.id === 'terminal') {
+        expect(s.ownShellLastEventAt, `${label}: ownShellLastEventAt`).toBe(o.own.last)
+        expect(s.ownShellOutputAt, `${label}: ownShellOutputAt`).toBe(o.own.output)
+        expect(s.ownShellName, `${label}: ownShellName`).toBe(o.own.name)
+      }
+    }
+    expect(h.hasRecorded, `${label}: hasRecorded`).toBe(everFed)
+    const verdict = !anyWired && !everFed ? 'dark' : anyErrored || producerStalled ? 'partial' : 'healthy'
+    expect(h.verdict, `${label}: verdict`).toBe(verdict)
+  }
+
+  const HOOK_SETS: string[][] = [[], ['zsh'], ['bash'], ['zsh', 'bash', 'powershell']]
+
+  it.each(HOOK_SETS.map((s) => [s]))('a database holding every awkward row, with shell hooks %j', (shells) => {
+    seed()
+    compare(shells, `hooks [${shells}]`)
+  })
+
+  it('the fixture separates the cases it is meant to separate', () => {
+    // A guard on the guard: if these stopped differing, the comparison above
+    // would pass for a probe that ignored the term in question.
+    seed()
+    const names = HOOK_SETS.map((s) => oracle(s, PLUGINS).own)
+    expect(new Set(names.map((n) => n.name)).size, 'each hook set should see a different newest shell').toBe(4)
+    expect(new Set(names.map((n) => n.output)).size, 'and a different captured-output time').toBeGreaterThanOrEqual(3)
+    const o = oracle(['zsh'], PLUGINS)
+    expect(o.pluginRows['transparent-proxy.mitmproxy-transparent'].last, 'old-only transparent rows').not.toBeNull()
+    expect(o.core.mitmproxy, 'must not be fed by the transparent rows').toBe(NOW - 15 * MIN)
+  })
+
+  it.each(HOOK_SETS.map((s) => [s]))('an empty database, with shell hooks %j', (shells) => {
+    compare(shells, `empty, hooks [${shells}]`)
+  })
+})

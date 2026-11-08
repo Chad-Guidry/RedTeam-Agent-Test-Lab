@@ -1,0 +1,679 @@
+import { useState, useRef, useEffect, useLayoutEffect, useCallback } from 'react'
+import type { ExportDelivery } from '../../../core/export-delivery'
+import { Button, TITLEBAR_CONTROL, TITLEBAR_ICON } from './Button'
+import { useNarrowViewport } from '../hooks/useNarrowViewport'
+import { Download, X } from 'lucide-react'
+import { useI18n } from '../i18n'
+import { useFocusTrap } from '../lib/useFocusTrap'
+import { toast } from './Toast'
+import { useViewExport } from '../lib/exportScope'
+import { formatDateTime } from '../lib/time'
+import { useSharedFilter, toEventFilter } from '../lib/FilterContext'
+import { capabilitiesFor } from '../../../core/export-capabilities'
+import { selectionConditions, subsetSummary } from '../lib/exportSubsetText'
+
+export interface ExportMenuProps {
+  totalCount?: number
+  /** Opens Settings ▸ Scope, for the preview's "set a scope first". */
+  onOpenScopeSettings?: () => void
+}
+
+/** Whether the plan was resolved against a web scope at all. Masking an empty
+ *  scope masks nothing, so the preview must not say it did (Spec 060 FR-009). */
+function planScopeSet(plan: { scopeSnapshot?: { targets?: string[]; excludeTargets?: string[] } }): boolean {
+  return (plan.scopeSnapshot?.targets ?? []).length > 0 || (plan.scopeSnapshot?.excludeTargets ?? []).length > 0
+}
+
+/** What the preview says about scope, in the two places it is easy to assume
+ *  wrongly: an empty scope is not "everything verified in scope", and the web
+ *  scope does not select commands. Module scope on purpose — declared inside
+ *  ExportMenu it would remount on every render. */
+function ScopeNotes({ scopeSet, onSetScope, t }: {
+  scopeSet: boolean
+  onSetScope?: () => void
+  t: (key: string, vars?: Record<string, string | number>) => string
+}): JSX.Element {
+  return (
+    <div className="px-3 pt-2 space-y-1 text-xs">
+      {!scopeSet && (
+        <div data-testid="export-scope-unset" className="text-amber-400 space-y-1">
+          <p>{t('export.scopeUnset')}</p>
+          {onSetScope && (
+            <button type="button" data-testid="export-set-scope" onClick={onSetScope} className="underline hover:text-amber-300">
+              {t('export.scopeSetFirst')}
+            </button>
+          )}
+        </div>
+      )}
+      <p data-testid="export-commands-note" className="text-redlog-text-faint">{t('export.commandsNotScoped')}</p>
+    </div>
+  )
+}
+
+interface ExportDraft {
+  format: ExportFormat
+  range: 'current' | 'all'
+  scrubPii: boolean
+  maskScope: boolean
+  excludeAttachments: string[]
+  includeAttachments: string[]
+}
+
+interface PendingExport {
+  label: string
+  request: ExportRequest
+}
+
+function fmtBytes(n: number | null): string {
+  if (n === null) return '—'
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  return `${(n / 1024 / 1024).toFixed(1)} MB`
+}
+
+/** Every file the bundle would carry, one row each, with a switch (#222).
+ *
+ *  The counts above say how many; this says which. A terminal recording spans
+ *  every command typed in it and RedLog never trims it, so a cast tied to
+ *  several targets — or to none — is labelled as such and not presented as
+ *  scope-clean. Leaving a row out re-resolves the plan: the exclusion is part
+ *  of the request the fingerprint covers. */
+function AttachmentList({ rows, onToggle, busy, t }: {
+  rows: ExportAttachmentRow[]
+  onToggle: (id: string) => void
+  busy: boolean
+  t: (key: string, vars?: Record<string, string | number>) => string
+}): JSX.Element | null {
+  if (rows.length === 0) return null
+  return (
+    <div data-testid="export-attachments" className="px-3 py-1 border-t border-redlog-border mt-1 text-xs">
+      <p className="text-redlog-text-dim mb-1">{t('export.attachments.title')}</p>
+      {rows.some(a => a.status === 'included') && <p className="text-redlog-text-faint mb-1">{t('export.attachments.rawBoundary')}</p>}
+      <ul className="max-h-48 overflow-auto space-y-0.5">
+        {rows.map((a) => {
+          const selectable = a.status === 'included' || a.status === 'excluded-by-operator' || a.status === 'excluded-by-policy'
+          const name = a.id.split('/').slice(1).join('/')
+          const where = a.attribution === 'unattributed'
+            ? t('export.attachments.unattributed')
+            : a.attribution === 'cross-target'
+              ? t('export.attachments.crossTarget', { targets: a.targets.join(', ') })
+              : a.targets[0]
+          const detail = [
+            where,
+            ...(a.source ? [a.source] : []),
+            fmtBytes(a.bytes),
+            ...(a.status !== 'included' ? [t(`export.attachments.status.${a.status}`)] : [])
+          ].join(' · ')
+          return (
+            <li key={a.id} data-testid={`export-attachment-${a.id}`} data-status={a.status} className="flex items-start gap-2 min-h-8 py-1">
+              <input
+                type="checkbox"
+                aria-label={a.id}
+                checked={a.status === 'included'}
+                disabled={busy || !selectable}
+                onChange={() => onToggle(a.id)}
+                className="mt-0.5 w-4 h-4 shrink-0 accent-red-600"
+              />
+              <span className="flex-1 min-w-0">
+                <span className="block truncate font-mono text-redlog-text" title={a.id}>
+                  {t(`export.attachments.kind.${a.kind}`)} · {name}
+                </span>
+                <span
+                  title={detail}
+                  className={`block truncate ${a.kind === 'cast' && a.attribution !== 'target' ? 'text-amber-400' : 'text-redlog-text-faint'}`}
+                >
+                  {detail}
+                </span>
+              </span>
+            </li>
+          )
+        })}
+      </ul>
+    </div>
+  )
+}
+
+// Keep helpers at module scope so editing a policy does not remount controls.
+function PreviewRow({ label, value, warn }: {
+  label: string; value: number; warn?: boolean
+}): JSX.Element | null {
+  if (value === 0) return null
+  return (
+    <div className="flex justify-between text-xs px-3 py-0.5">
+      <span className={warn ? 'text-amber-500' : 'text-redlog-text-dim'}>{label}</span>
+      <span className={`font-mono tabular-nums ${warn ? 'text-amber-500' : 'text-redlog-text'}`}>{value}</span>
+    </div>
+  )
+}
+
+/** What a capture gap's reason means, in the words the Timeline uses for it.
+ *  A reason this does not know is shown as recorded rather than hidden. */
+function captureGapReason(t: (key: string, params?: Record<string, string>) => string, reason: string): string {
+  switch (reason) {
+    case 'queue-full': return t('export.preview.captureGapQueueFull')
+    case 'project-switched': return t('export.preview.captureGapProjectSwitched')
+    case 'delivery-unconfirmed': return t('export.preview.captureGapDeliveryUnconfirmed')
+    case 'gap-unsaved': return t('export.preview.captureGapUnsaved')
+    case 'proxy-stopped': return t('export.preview.captureGapProxyStopped')
+    case 'delivery-interrupted': return t('export.preview.captureGapDeliveryInterrupted')
+    case 'unspecified': return t('export.preview.captureGapAiPaused')
+    default: return reason
+  }
+}
+
+/** A warned row whose value is a sentence, for what one number cannot say. */
+function PreviewText({ label, value }: { label: string; value: string }): JSX.Element {
+  return (
+    <div className="flex justify-between gap-3 text-xs px-3 py-0.5 text-amber-500">
+      <span>{label}</span>
+      <span className="text-right">{value}</span>
+    </div>
+  )
+}
+
+/** One of the two things the 自用 / 交付 pair was standing in for. A mode named
+ *  after an audience made the operator translate "who is this for" into "what
+ *  comes out" every time — and it translated badly: its tooltip promised
+ *  masked metadata, scrubbed PII and excluded infrastructure while the flag
+ *  set exactly one of the three. */
+function Toggle({ on, setOn, label, warn, disabled }: {
+  on: boolean; setOn: (v: boolean) => void; label: string; warn?: boolean; disabled?: boolean
+}): JSX.Element {
+  return (
+    <label className="flex items-start gap-2 px-3 min-h-8 py-1.5 text-xs cursor-pointer">
+      <input
+        type="checkbox"
+        checked={on}
+        disabled={disabled}
+        onChange={(e) => setOn(e.target.checked)}
+        className="mt-0.5 w-4 h-4 shrink-0 accent-red-600"
+      />
+      <span className={`min-w-0 flex-1 ${warn ? 'text-amber-500' : 'text-redlog-text-dim'}`}>{label}</span>
+    </label>
+  )
+}
+
+const FORMAT_KEY = 'redlog.export.format'
+
+/** Codes the export IPC returns that mean something specific to the operator;
+ *  anything else is shown as the raw message alone. */
+const KNOWN_RUN_ERRORS: ReadonlySet<string> = new Set(['source-unavailable', 'policy-changed', 'invalid-destination'])
+
+export function ExportMenu({ totalCount, onOpenScopeSettings }: ExportMenuProps): JSX.Element {
+  const { t } = useI18n()
+  const narrow = useNarrowViewport()
+  const viewExport = useViewExport()
+  const { filter } = useSharedFilter()
+  const currentSubset: ExportSubset = viewExport?.request.subset ?? { kind: 'selection', projection: 'events', filter: toEventFilter(filter) }
+  const [draft, setDraft] = useState<ExportDraft>(() => {
+    let format: ExportFormat = 'bundle'
+    try {
+      const saved = localStorage.getItem(FORMAT_KEY)
+      if (saved === 'json' || saved === 'ndjson' || saved === 'bundle') format = saved
+    } catch { /* remembering a format is optional */ }
+    return { format, range: 'current' as 'current' | 'all', scrubPii: false, maskScope: true, excludeAttachments: [] as string[], includeAttachments: [] as string[] }
+  })
+  // Freeze the declarative selection, never the currently loaded row ids.
+  // Live view changes behind the dialog must not change what is reviewed.
+  const selection = useRef<{ subset: ExportSubset; request?: ExportRequest; disabledReason?: string } | null>(null)
+  const [destDir, setDestDir] = useState<string | null>(null)
+  const [defaultDir, setDefaultDir] = useState<string | null>(null)
+  const [open, setOpen] = useState(false)
+  const [completion, setCompletion] = useState<ExportDelivery | null>(null)
+  const [recent, setRecent] = useState<ExportDelivery | null>(null)
+  const [recentError, setRecentError] = useState(false)
+  const [recentLoading, setRecentLoading] = useState(false)
+  const [revealError, setRevealError] = useState(false)
+  const [resultWarning, setResultWarning] = useState(false)
+  const recentSequence = useRef(0)
+  const live = useRef(true)
+  const [busy, setBusy] = useState(false)
+  const [pending, setPending] = useState<PendingExport | null>(null)
+  const [resolvedPlan, setResolvedPlan] = useState<ResolvedExportPlan | null>(null)
+  const [previewError, setPreviewError] = useState<string | null>(null)
+  const [previewLoading, setPreviewLoading] = useState(false)
+  // A failed run keeps the dialog and its preview (UI/UX audit F12): closing
+  // on failure threw away exactly what the operator had just reviewed.
+  const [runError, setRunError] = useState<string | null>(null)
+  const previewSequence = useRef(0)
+  const attachmentFocus = useRef<string | null>(null)
+  const panel = useRef<HTMLDivElement | null>(null)
+  useFocusTrap(panel, open)
+
+  const loadPreview = useCallback(async (p: PendingExport) => {
+    const sequence = ++previewSequence.current
+    void window.redlog.data.exportDestination?.().then((dir) => { if (sequence === previewSequence.current) setDefaultDir(dir) }).catch(() => {})
+    setPending(p)
+    setRunError(null)
+    setPreviewLoading(true)
+    setResolvedPlan(null)
+    setPreviewError(null)
+    try {
+      const resolved = await window.redlog.data.resolveExportPlan(p.request)
+      if (!resolved.ok) throw new Error(resolved.error)
+      // The plan IS the preview. This used to be reshaped into an
+      // `ExportPreview` whose `hasScope`, `screenshotEvents` and `snapshot`
+      // were hardcoded to false/0/zeros, and whose `inScope` was
+      // `included - maskedOutOfScope` — arithmetic, not a scope
+      // classification. An operator checking what they are about to hand over
+      // was reading numbers RedLog had made up.
+      if (sequence === previewSequence.current) setResolvedPlan(resolved.plan)
+    } catch (error) {
+        if (sequence === previewSequence.current) setPreviewError(String((error as Error)?.message ?? error))
+    } finally {
+      if (sequence === previewSequence.current) setPreviewLoading(false)
+    }
+  }, [])
+
+  const requestFor = (next: typeof draft): ExportRequest => ({
+    ...selection.current?.request,
+    format: next.format,
+    subset: next.range === 'all' ? { kind: 'all' } : selection.current!.subset,
+    scrubPii: next.scrubPii,
+    maskOutOfScope: capabilitiesFor(next.format).scopeMasking && next.maskScope,
+    excludeAttachments: next.excludeAttachments,
+    includeAttachments: next.includeAttachments
+  })
+
+  const updateDraft = (next: typeof draft): void => {
+    setDraft(next)
+    const p = { label: t(next.range === 'all' ? 'export.all' : 'export.current'), request: requestFor(next) }
+    if (next.range === 'current' && selection.current?.disabledReason) {
+      ++previewSequence.current
+      setPending(p)
+      setResolvedPlan(null)
+      setPreviewLoading(false)
+      setRunError(null)
+      setPreviewError(selection.current.disabledReason)
+      return
+    }
+    void loadPreview(p)
+  }
+
+  const loadRecent = async (): Promise<void> => {
+    const mine = ++recentSequence.current
+    setRecentLoading(true)
+    setRecentError(false)
+    try {
+      const result = await window.redlog.data.recentExport()
+      if (mine !== recentSequence.current || !live.current) return
+      if (!result.ok) throw new Error(result.error)
+      setRecent(result.delivery)
+    } catch { if (mine === recentSequence.current && live.current) setRecentError(true) }
+    finally { if (mine === recentSequence.current && live.current) setRecentLoading(false) }
+  }
+
+  const reveal = async (): Promise<void> => {
+    if (!completion) return
+    setRevealError(false)
+    try { if (!await window.redlog.data.revealExport(completion.artifactPath)) setRevealError(true) }
+    catch { setRevealError(true) }
+  }
+
+  const openDialog = (): void => {
+    selection.current = JSON.parse(JSON.stringify({ subset: currentSubset, request: viewExport?.request, disabledReason: viewExport?.disabledReason }))
+    const format = viewExport?.request.format === 'har' || viewExport?.request.format === 'timeline'
+      ? viewExport.request.format : draft.format === 'har' || draft.format === 'timeline' ? 'bundle' : draft.format
+    setDestDir(null)
+    setCompletion(null)
+    setRevealError(false)
+    setResultWarning(false)
+    setOpen(true)
+    void loadRecent()
+    updateDraft({ ...draft, format, range: 'current', excludeAttachments: [], includeAttachments: [], scrubPii: false })
+  }
+
+  const changeFormat = (format: ExportFormat): void => {
+    if (draft.scrubPii && !capabilitiesFor(format).piiScrubbing) return
+    if (format === 'json' || format === 'ndjson' || format === 'bundle') {
+      try { localStorage.setItem(FORMAT_KEY, format) } catch { /* convenience only */ }
+    }
+    updateDraft({ ...draft, format })
+  }
+
+  const toggleAttachment = (id: string): void => {
+    attachmentFocus.current = id
+    const excluded = new Set(draft.excludeAttachments)
+    const included = new Set(draft.includeAttachments)
+    const attachment = resolvedPlan?.attachments.find(a=>a.id===id)
+    if(attachment?.status==='included') { excluded.add(id); included.delete(id) }
+    else { excluded.delete(id); included.add(id) }
+    updateDraft({ ...draft, excludeAttachments: [...excluded], includeAttachments:[...included] })
+  }
+
+  useLayoutEffect(() => {
+    if (!resolvedPlan || previewLoading || !attachmentFocus.current) return
+    const id = attachmentFocus.current
+    attachmentFocus.current = null
+    // Re-resolving replaces the attachment list. Restore its checkbox only
+    // when focus fell to the body; do it before paint, once controls are
+    // enabled, and never steal it from another draft control.
+    if (document.activeElement === document.body) {
+      const input = [...(panel.current?.querySelectorAll<HTMLInputElement>('input') ?? [])]
+        .find(el => el.getAttribute('aria-label') === id)
+      input?.focus()
+    }
+  }, [resolvedPlan, previewLoading])
+
+  const closeAll = (): void => {
+    attachmentFocus.current = null
+    ++recentSequence.current
+    setCompletion(null)
+    ++previewSequence.current
+    setPending(null)
+    setResolvedPlan(null)
+    setPreviewError(null)
+    setRunError(null)
+    setOpen(false)
+  }
+
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape' && !busy) { e.preventDefault(); closeAll() }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [open, busy])
+  useEffect(() => { live.current = true; return () => { live.current = false; ++previewSequence.current; ++recentSequence.current } }, [])
+
+  const confirmExport = async (): Promise<void> => {
+    if (!pending) return
+    setBusy(true)
+    setRunError(null)
+    try {
+      if (!resolvedPlan) throw new Error('export plan unavailable')
+      const result = await window.redlog.data.executeExportPlan({ planId: resolvedPlan.id, ...(destDir ? { destDir } : {}) })
+      if (!result.ok) throw new Error(result.error)
+      const path = result.artifactPath
+      if (!path) throw new Error(t('toast.exportFailedWhy'))
+      if (!live.current) return
+      ++previewSequence.current
+      setPending(null)
+      setResolvedPlan(null)
+      ++recentSequence.current
+      setRecentLoading(false)
+      setCompletion(result.delivery)
+      setRecent(result.delivery)
+      setRevealError(false)
+      setResultWarning(result.warnings.includes('recent-export-not-saved'))
+    } catch (e) {
+      if (!live.current) return
+      // Stay open with the preview. A plan is single-use, so resolve it again
+      // for the retry: the operator retries the same request, not a stale id.
+      setRunError(String((e as Error)?.message ?? e))
+      toast(t('export.failed', { label: pending.label }), {
+        type: 'error',
+        why: t('toast.exportFailedWhy'),
+        detail: String((e as Error)?.message ?? e)
+      })
+    } finally {
+      if (live.current) setBusy(false)
+    }
+  }
+
+  const changeDestination = async (): Promise<void> => {
+    const dir = await window.redlog.data.pickExportDir().catch(() => null)
+    if (dir) setDestDir(dir)
+  }
+
+  const retryRun = async (): Promise<void> => {
+    if (!pending) return
+    // A destination main refused is not tried again; the default is.
+    if (runError === 'invalid-destination') setDestDir(null)
+    await loadPreview(pending)
+  }
+
+  const formats: ExportFormat[] = ['bundle']
+  const viewFormat = selection.current?.request?.format
+  if (viewFormat === 'har') formats.push(viewFormat)
+  const otherFormats: ExportFormat[] = ['json', 'ndjson', ...(viewFormat === 'timeline' ? ['timeline' as const] : [])]
+  const capability = capabilitiesFor(draft.format)
+
+  return (
+    <div className="relative">
+      {/* Narrow, the word and the chevron go and the icon stays (#298): the
+          name is already the button's aria-label, and the strip has to keep
+          room for the project's own name and the Mark button. */}
+      <button
+        onClick={() => { if (open) closeAll(); else openDialog() }}
+        disabled={busy}
+        aria-expanded={open}
+        aria-haspopup="dialog"
+        aria-label={t('export.title')}
+        title={narrow ? t('export.title') : undefined}
+        className={`${narrow ? TITLEBAR_ICON : TITLEBAR_CONTROL} border-redlog-border bg-redlog-elevated text-redlog-text-dim hover:text-redlog-text hover:bg-redlog-elevated-hover focus-visible:ring-redlog-accent/40`}
+      >
+        <Download size={13} strokeWidth={1.5} aria-hidden />
+        {!narrow && t('export.title')}
+      </button>
+
+      {open && (
+        <>
+          <div className="fixed inset-0 z-[90] bg-black/60" onClick={() => { if (!busy) closeAll() }} />
+          <div
+            ref={panel}
+            role="dialog"
+            aria-modal="true"
+            aria-label={t('export.title')}
+            data-testid="export-dialog"
+            className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-[91] w-[min(560px,92vw)] max-h-[82vh] flex flex-col overflow-hidden whitespace-normal break-words bg-redlog-surface border border-redlog-border rounded-lg shadow-2xl"
+          >
+            <div className="shrink-0 flex items-center justify-between px-3 py-2 border-b border-redlog-border">
+              <h2 className="text-sm text-redlog-text">{t(completion ? 'export.completedTitle' : 'export.title')}</h2>
+              {!completion && recent && <Button size="compact" level="quiet" data-testid="export-recent" disabled={busy || recentLoading || recentError} onClick={() => { setCompletion(recent); setRevealError(false); setResultWarning(false) }}>{t('export.recent')}</Button>}
+              <button type="button" onClick={closeAll} disabled={busy} aria-label={t('common.close')} className="p-1 text-redlog-text-dim hover:text-redlog-text disabled:opacity-40"><X size={16} /></button>
+            </div>
+            <div className="min-h-0 overflow-y-auto">
+            {completion ? (
+              <div data-testid="export-completed" className="p-3 space-y-3 text-xs">
+                <div className="flex items-center justify-between gap-3 text-redlog-text-dim"><span>{completion.format.toUpperCase()}</span><time>{formatDateTime(completion.completedAt, { seconds: true })}</time></div>
+                <code className="block break-all text-redlog-text">{completion.artifactPath}</code>
+                {completion.availability !== 'available' && <p role="alert" className="text-amber-400">{t(completion.availability === 'missing' ? 'export.artifactMissing' : 'export.artifactUnavailable')}</p>}
+                {resultWarning && <p role="alert" className="text-amber-400">{t('export.recentNotSaved')}</p>}
+                {revealError && <p role="alert" data-testid="export-reveal-error" className="text-red-400">{t('artifacts.revealFailed')}</p>}
+              </div>
+            ) : <>
+            {recentError && <div role="alert" className="px-3 pt-2 text-xs text-amber-400"><span>{t('export.recentFailed')}</span> <Button size="compact" level="quiet" onClick={() => void loadRecent()}>{t('common.retry')}</Button></div>}
+            <div className="px-3 pt-3 pb-2 grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+              <label className="min-w-0 text-redlog-text-dim">
+                {t('export.rangeLabel')}
+                <select aria-label={t('export.rangeLabel')} value={draft.range} disabled={busy} onChange={e => updateDraft({ ...draft, range: e.target.value as 'current' | 'all' })} className="mt-1 block w-full bg-redlog-elevated border border-redlog-border rounded px-2 py-1.5 text-redlog-text">
+                  <option value="current">{t('export.current')}</option>
+                  <option value="all">{t('export.range.all')}</option>
+                </select>
+              </label>
+              <label className="min-w-0 text-redlog-text-dim">
+                {t('export.currentFormat')}
+                <select aria-label={t('export.currentFormat')} value={formats.includes(draft.format) ? draft.format : 'other'} disabled={busy} onChange={e => changeFormat(e.target.value === 'other' ? 'json' : e.target.value as ExportFormat)} className="mt-1 block w-full bg-redlog-elevated border border-redlog-border rounded px-2 py-1.5 text-redlog-text">
+                  {formats.map(format => <option key={format} value={format} disabled={draft.scrubPii && !capabilitiesFor(format).piiScrubbing}>{format === 'bundle' ? t('export.bundle') : format.toUpperCase()}</option>)}
+                  <option value="other">{t('export.otherFormats')}</option>
+                </select>
+              </label>
+            </div>
+            {!formats.includes(draft.format) && <label className="block px-3 pb-2 text-xs text-redlog-text-dim">
+              {t('export.otherFormats')}
+              <select aria-label={t('export.otherFormats')} value={draft.format} disabled={busy} onChange={e => changeFormat(e.target.value as ExportFormat)} className="mt-1 block w-full bg-redlog-elevated border border-redlog-border rounded px-2 py-1.5 text-redlog-text">
+                {otherFormats.map(format => <option key={format} value={format}>{format.toUpperCase()}</option>)}
+              </select>
+            </label>}
+            <p data-testid="export-range-current" className="px-3 pb-1 text-xs text-redlog-text-dim">{draft.range === 'current' ? t('export.range.current', { summary: subsetSummary(selection.current!.subset, t) }) : t('export.range.allHint')}</p>
+            <p className="px-3 pb-2 text-xs text-redlog-text-faint">{t(`export.formatHelp.${draft.format}`)}</p>
+            {totalCount === 0 && <p className="px-3 pb-2 text-xs text-redlog-text-faint">{t('export.empty')}</p>}
+            <Toggle on={draft.scrubPii} setOn={scrubPii => updateDraft({ ...draft, scrubPii })} label={t('export.scrubPii')} disabled={busy || !capability.piiScrubbing} />
+            {!capability.piiScrubbing && <p className="px-3 text-xs text-redlog-text-faint">{t('export.cannotScrub')}</p>}
+            <Toggle on={capability.scopeMasking && draft.maskScope} setOn={maskScope => updateDraft({ ...draft, maskScope })} label={draft.maskScope ? t('export.maskScope') : t('export.maskScopeOff')} warn={!draft.maskScope} disabled={busy || !capability.scopeMasking} />
+            {!capability.scopeMasking && <p className="px-3 text-xs text-redlog-text-faint">{t('export.cannotMask')}</p>}
+            <div className="border-t border-redlog-border mt-2 pt-2" aria-busy={previewLoading}>
+                {previewLoading ? (
+                  <p role="status" className="px-3 py-3 text-xs text-redlog-text-faint text-center">{t('export.preview.loading')}</p>
+                ) : resolvedPlan ? (
+                  <div className="py-1">
+                    {(
+                      <div className="px-3 pb-2 mb-1 border-b border-redlog-border text-xs space-y-1">
+                        <div className="flex justify-between gap-3">
+                          <span className="text-redlog-text-dim shrink-0">{t('export.preview.format')}</span>
+                          <span className="font-mono text-redlog-text">{resolvedPlan.request.format.toUpperCase()}</span>
+                        </div>
+                        <div className="flex justify-between gap-3">
+                          <span className="text-redlog-text-dim shrink-0">{t('export.preview.subset')}</span>
+                          {/* The actual boundary, not just "bounded": an
+                              operator checking a delivery needs the dates and
+                              the target they are about to hand over. */}
+                          {/* min-w-0: a flex item will not shrink below its
+                              content's intrinsic minimum, so without this the
+                              joined condition line pushes the dialog wider than
+                              the window instead of wrapping. English only —
+                              CJK breaks anywhere and hid this in zh-TW. */}
+                          <span data-testid="export-preview-subset" className="min-w-0 text-right text-redlog-text">
+                            {resolvedPlan.request.subset.kind === 'all'
+                              ? t('export.preview.subsetAll')
+                              : resolvedPlan.request.subset.kind === 'selection'
+                                ? <span className="break-words">{t('export.current')}<br />{selectionConditions(resolvedPlan.request.subset, t).join(' · ')}</span>
+                                : resolvedPlan.request.subset.kind === 'activity' || resolvedPlan.request.subset.kind === 'session'
+                                  ? subsetSummary(resolvedPlan.request.subset,t)
+                                : <>
+                                  {formatDateTime(resolvedPlan.request.subset.since, { seconds: true })}
+                                  {' → '}
+                                  {formatDateTime(resolvedPlan.request.subset.before, { seconds: true })}
+                                  {resolvedPlan.request.subset.targetId
+                                    && <><br />{t('export.preview.subsetTarget', { target: resolvedPlan.request.subset.targetId })}</>}
+                                </>}
+                          </span>
+                        </div>
+                        <div className="flex justify-between gap-3">
+                          <span className="text-redlog-text-dim shrink-0">{t('export.preview.policy')}</span>
+                          <span data-testid="export-preview-policy" className="text-right text-redlog-text">
+                            {[
+                              !resolvedPlan.request.maskOutOfScope
+                                ? t('export.preview.policyNoMask')
+                                : planScopeSet(resolvedPlan) ? t('export.preview.policyMask') : t('export.preview.policyNoScope'),
+                              ...(resolvedPlan.request.scopeOnly ? [t('export.preview.policyScopeOnly')] : []),
+                              ...(resolvedPlan.request.scrubPii ? [t('export.preview.policyScrubPii')] : [])
+                            ].join(' · ')}
+                          </span>
+                        </div>
+                        <div className="flex justify-between gap-3">
+                          <span className="text-redlog-text-dim shrink-0">{t('export.preview.scope')}</span>
+                          <span data-testid="export-preview-scope" className="text-right text-redlog-text">
+                            {(resolvedPlan.scopeSnapshot?.targets ?? []).length === 0
+                              ? t('export.preview.scopeNone')
+                              : resolvedPlan.scopeSnapshot.targets.join(', ')}
+                          </span>
+                        </div>
+                        <div className="flex justify-between gap-3" title={resolvedPlan.fingerprint}>
+                          <span className="text-redlog-text-dim">{t('export.preview.fingerprint')}</span>
+                          <span className="font-mono text-redlog-text">{resolvedPlan.fingerprint.slice(0, 12)}</span>
+                        </div>
+                        <div className="flex justify-between gap-3">
+                          <span className="text-redlog-text-dim">{t('export.preview.boundary')}</span>
+                          <span className="text-right text-redlog-text">
+                            {formatDateTime(resolvedPlan.snapshot.takenAt, { seconds: true })}
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="text-redlog-text-dim shrink-0">{t('export.preview.destination')}</span>
+                          <span className="flex min-w-0 items-center gap-2">
+                            <span data-testid="export-destination" title={destDir ?? defaultDir ?? undefined} className="min-w-0 truncate font-mono text-redlog-text">
+                              {destDir ?? defaultDir ?? t('export.preview.destinationDefault')}
+                            </span>
+                            <button type="button" data-testid="export-change-destination" onClick={() => void changeDestination()} disabled={busy} className="shrink-0 text-redlog-text-dim underline hover:text-redlog-text disabled:opacity-40">
+                              {t('export.preview.destinationChange')}
+                            </button>
+                          </span>
+                        </div>
+                      </div>
+                    )}
+                    {/* Every row below is a number the resolver measured.
+                        `inScope` used to be `included - maskedOutOfScope`,
+                        which is not a scope classification, and `screenshots`
+                        was hardcoded 0 - both are gone rather than guessed. */}
+                    <ScopeNotes
+                      scopeSet={planScopeSet(resolvedPlan)}
+                      onSetScope={onOpenScopeSettings && !busy ? () => { closeAll(); onOpenScopeSettings() } : undefined}
+                      t={t}
+                    />
+                    {resolvedPlan.request.subset.kind !== 'all' && <p data-testid="export-projection-notice" className="px-3 py-2 text-xs text-amber-400">{t('export.projectionNotice')}</p>}
+                    {resolvedPlan.counts.exchanges !== undefined && <p className="px-3 text-xs">{t('export.exchanges', { count: resolvedPlan.counts.exchanges })}</p>}
+                    <PreviewRow label={t('export.preview.total')} value={resolvedPlan.counts.examined} />
+                    {(resolvedPlan.counts.outOfScopeHttpFlows ?? 0) > 0 && <PreviewRow label={t('export.preview.outOfScopeHttp')} value={resolvedPlan.counts.outOfScopeHttpFlows!} warn />}
+                    {planScopeSet(resolvedPlan) && <PreviewRow label={t('export.preview.outOfScope')} value={resolvedPlan.counts.maskedOutOfScope} warn />}
+                    <PreviewRow label={t('export.preview.dropped')} value={resolvedPlan.counts.excludedDoNotExport} warn />
+                    <PreviewRow label={t('export.preview.personalDropped')} value={resolvedPlan.counts.excludedPersonal} warn />
+                    <PreviewRow label={t('export.preview.sanitized')} value={resolvedPlan.counts.sanitized} />
+                    {/* Three different things that all used to read as "0
+                        attachments": this format carries none, none were
+                        referenced, or some could not be attached. */}
+                    {!resolvedPlan.capabilities.attachments ? (
+                      <div data-testid="export-preview-no-attachments" className="flex justify-between text-xs px-3 py-0.5">
+                        <span className="text-redlog-text-dim">{t('export.preview.attachments')}</span>
+                        <span className="text-redlog-text-faint">{t('export.preview.attachmentsUnsupported')}</span>
+                      </div>
+                    ) : (
+                      <>
+                        <PreviewRow label={t('export.preview.attachments')} value={resolvedPlan.counts.attachmentsIncluded} />
+                        <PreviewRow label={t('export.preview.attachmentsMissing')} value={resolvedPlan.counts.attachmentsMissing} warn />
+                        <PreviewRow label={t('export.preview.attachmentsUnattributed')} value={resolvedPlan.counts.attachmentsUnattributed} warn />
+                        <PreviewRow label={t('export.preview.attachmentsExcludedByOperator')} value={resolvedPlan.counts.attachmentsExcludedByOperator ?? 0} />
+                        <AttachmentList rows={resolvedPlan.attachments ?? []} onToggle={toggleAttachment} busy={busy || previewLoading} t={t} />
+                      </>
+                    )}
+                    <PreviewRow label={t('export.preview.unsupportedAttachments')} value={resolvedPlan.counts.unsupported} warn />
+                    <PreviewRow label={t('export.preview.truncatedOutputs')} value={resolvedPlan.counts.truncatedOutputs ?? 0} warn />
+                    <PreviewRow label={t('export.preview.pauseWindows')} value={resolvedPlan.counts.pauseWindows ?? 0} warn />
+                    {(resolvedPlan.counts.captureGaps ?? []).map(gap => (
+                      <PreviewText key={gap.reason} label={t('export.preview.captureGaps', { reason: captureGapReason(t, gap.reason) })} value={[
+                        t('export.preview.captureGapsCount', { count: String(gap.gaps) }),
+                        ...(gap.skippedUnits > 0 ? [t('export.preview.captureGapsSkipped', { count: String(gap.skippedUnits) })] : []),
+                        ...(gap.unknownAmount > 0 ? [t('export.preview.captureGapsUnknown', { count: String(gap.unknownAmount) })] : [])
+                      ].join(' · ')} />
+                    ))}
+                    {(resolvedPlan.counts.interruptedRecordings ?? 0) > 0 && <PreviewRow label={t('export.preview.interruptedRecordings')} value={resolvedPlan.counts.interruptedRecordings!} warn />}
+                    {(resolvedPlan.counts.interruptedCommands ?? 0) > 0 && <PreviewRow label={t('export.preview.interruptedCommands')} value={resolvedPlan.counts.interruptedCommands!} warn />}
+                    {(resolvedPlan.counts.partialHttpFlows ?? 0) > 0 && <PreviewRow label={t('export.preview.partialHttpFlows')} value={resolvedPlan.counts.partialHttpFlows!} warn />}
+                    {(resolvedPlan.counts.partialHttpFlowsOutside ?? 0) > 0 && <PreviewRow label={t('export.preview.partialHttpFlowsOutside')} value={resolvedPlan.counts.partialHttpFlowsOutside!} warn />}
+                    <div className="border-t border-redlog-border mt-1 pt-1">
+                      <div className="flex justify-between text-xs px-3 py-0.5 font-medium">
+                        <span className="text-redlog-text">{t('export.preview.included')}</span>
+                        <span className="text-redlog-text font-mono tabular-nums">{resolvedPlan.counts.included}</span>
+                      </div>
+                    </div>
+                    {runError && (
+                      <div data-testid="export-run-error" role="alert" className="mx-3 mt-2 rounded border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-200">
+                        <div>{t('export.runFailed')}</div>
+                        {KNOWN_RUN_ERRORS.has(runError) && <div data-testid="export-run-error-meaning" className="mt-1">{t(`export.error.${runError}`)}</div>}
+                        <div className="mt-1 break-all font-mono text-redlog-text-faint">{runError}</div>
+                        <button type="button" onClick={() => void retryRun()} className="mt-2 text-red-300 underline hover:text-red-200">
+                          {t('export.retryResolve')}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                ) : previewError ? (
+                  <div data-testid="export-preview-error" role="alert" className="px-3 py-2 text-xs text-red-400">
+                    <div>{t('export.failed', { label: pending?.label ?? t('export.title') })}: {previewError}</div>
+                    <button type="button" onClick={() => { if (pending) updateDraft(draft) }} className="mt-2 text-red-300 underline hover:text-red-200">
+                      {t('common.retry')}
+                    </button>
+                  </div>
+                ) : null}
+            </div>
+            </>}
+            </div>
+            <div className="shrink-0 bg-redlog-surface border-t border-redlog-border px-3 py-2 flex gap-2 justify-end">
+              <Button size="compact" level="quiet" type="button" onClick={closeAll} disabled={busy}>{t(completion ? 'common.close' : 'common.cancel')}</Button>
+              {completion && <Button size="compact" level="secondary" onClick={openDialog}>{t('export.another')}</Button>}
+              {(completion || (resolvedPlan && !previewLoading)) && <Button size="compact" level="primary"
+                data-testid={completion ? 'export-reveal' : 'export-confirm'}
+                onClick={() => { if (completion) void reveal(); else void confirmExport() }}
+                disabled={completion ? completion.availability !== 'available' : busy || !!runError || resolvedPlan?.counts.included === 0}
+                aria-busy={busy}>
+                {completion ? t('export.reveal') : busy ? t('export.running') : t('export.preview.confirm')}
+              </Button>}
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  )
+}

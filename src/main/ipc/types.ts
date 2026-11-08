@@ -1,0 +1,31 @@
+import type { BrowserWindow } from 'electron'
+import type { ProjectMeta } from '../../core/project-manager'
+
+/**
+ * Shared context passed to extracted IPC handler modules.
+ *
+ * Carries the mutable state that lives in index.ts's module scope so each
+ * handler group can read/write it without importing the file directly.
+ * Pure functions (loadConfig, getProjectPath, …) are imported directly by each
+ * module — only the things that change at runtime go here.
+ */
+export interface IpcContext {
+  /** The runtime's open project: read-only, replaced on rename. */
+  getActiveProject: () => Readonly<ProjectMeta> | null
+  getMainWindow: () => BrowserWindow | null
+  getOverlayWindow: () => BrowserWindow | null
+  getCurrentEngagementId: () => string | null
+  getCurrentOperatorId: () => string | null
+  /** Safe send that ignores destroyed windows. */
+  send: (win: BrowserWindow | null, channel: string, ...payload: unknown[]) => void
+  /** Opens the marker dialog in the main window. */
+  triggerBookmark: () => void
+  /** Drops a HUD marker into the chain, timed at `at` (the click). */
+  addHudMarker: (input: { title?: string; notes?: string; at?: number; bind?: string }) => { ok: boolean; id?: string; reason?: 'project-changed' }
+  /** Names the project a HUD marker draft belongs to (the engagement id). The
+   *  draft hands it back on save; a different project by then refuses the save. */
+  hudMarkerBinding?: () => string | null
+  /** Re-applies the open project's capture packs after a plugin was enabled,
+   *  disabled or reloaded (Spec 035: a pack runs only while its plugin is). */
+  onPluginsChanged: () => void
+}

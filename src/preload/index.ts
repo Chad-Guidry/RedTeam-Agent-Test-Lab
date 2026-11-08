@@ -1,0 +1,393 @@
+/// <reference path="../renderer/src/env.d.ts" />
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
+import type { RedLogEvent } from '../core/db/events'
+import type { ArtifactAddResponse } from '../core/artifacts'
+import type { EventNote } from '../core/db/event-notes'
+
+// Single source of truth: the bridge is typed against the RedLogAPI contract
+// declared in the renderer's env.d.ts. Before this, env.d.ts was a hand-copied
+// mirror of this object and drifted (a method added here but not there, or a
+// signature that disagreed, went unnoticed — the renderer just saw `any`).
+// Now `tsc` checks this literal against the contract, so the two cannot
+// diverge without a typecheck error.
+const api: RedLogAPI = {
+  platform: process.platform,
+  app: {
+    checkForUpdates: () => ipcRenderer.invoke('app:checkForUpdates'),
+    updateStatus: () => ipcRenderer.invoke('app:updateStatus') as Promise<import('../main/services/update-status').UpdateStatus>,
+    cancelUpdate: () => ipcRenderer.invoke('app:cancelUpdate') as Promise<boolean>,
+    installUpdate: () => ipcRenderer.invoke('app:installUpdate') as Promise<void>,
+    setAutoUpdateCheck: (on: boolean) => ipcRenderer.invoke('app:setAutoUpdateCheck', on) as Promise<import('../main/services/update-status').UpdateStatus>,
+    takeUpdateOutcome: () => ipcRenderer.invoke('app:takeUpdateOutcome') as Promise<import('../main/services/update-marker').UpdateOutcome | null>,
+    onUpdateOutcomeReady: (cb: () => void) => {
+      const handler = (): void => cb()
+      ipcRenderer.on('app:updateOutcomeReady', handler)
+      return () => ipcRenderer.removeListener('app:updateOutcomeReady', handler)
+    },
+    onUpdateStatus: (cb: (status: import('../main/services/update-status').UpdateStatus) => void) => {
+      const handler = (_e: unknown, status: import('../main/services/update-status').UpdateStatus): void => cb(status)
+      ipcRenderer.on('app:updateStatusChanged', handler)
+      return () => ipcRenderer.removeListener('app:updateStatusChanged', handler)
+    },
+    openExternal: (url: string) => ipcRenderer.invoke('app:openExternal', url),
+    setQuitText: (text: Record<string, string>) => ipcRenderer.send('app:setQuitText', text),
+    setTrayText: (text: Record<string, string>) => ipcRenderer.send('app:setTrayText', text)
+  },
+  debug: {
+    status: () => ipcRenderer.invoke('debug:status'),
+    set: (on: boolean) => ipcRenderer.invoke('debug:set', on),
+    reveal: () => ipcRenderer.invoke('debug:reveal')
+  },
+  ui: {
+    // Pops a native menu at the cursor and resolves with the clicked item's id
+    // (null if dismissed). Only the renderer knows what a right-click means
+    // inside xterm, so it names the entries; the main process owns the actual
+    // menu and validates the payload.
+    contextMenu: (items: Array<{ id?: string; label?: string; enabled?: boolean; type?: 'separator' }>) =>
+      ipcRenderer.invoke('ui:contextMenu', items) as Promise<string | null>
+  },
+  // `navigator.clipboard` is denied by the renderer's permission handler —
+  // see src/main/ipc/clipboard.ts. Renderer code goes through lib/clipboard.
+  clipboard: {
+    writeText: (text: string) => ipcRenderer.invoke('clipboard:writeText', text) as Promise<boolean>,
+    readText: () => ipcRenderer.invoke('clipboard:readText') as Promise<string>
+  },
+  project: {
+    list: () => ipcRenderer.invoke('project:list'),
+    scopeSummaries: () => ipcRenderer.invoke('project:scopeSummaries'),
+    root: () => ipcRenderer.invoke('project:root'),
+    create: (name: string, initialConfig?: unknown) => ipcRenderer.invoke('project:create', name, initialConfig),
+    open: (id: string) => ipcRenderer.invoke('project:open', id),
+    delete: (id: string) => ipcRenderer.invoke('project:delete', id),
+    rename: (id: string, name: string) => ipcRenderer.invoke('project:rename', id, name),
+    active: () => ipcRenderer.invoke('project:active'),
+    close: () => ipcRenderer.invoke('project:close')
+  },
+  ip: {
+    getStatus: () => ipcRenderer.invoke('ip:getStatus'),
+    onStatus: (cb: (status: IPStatus) => void) => {
+      const handler = (_e: Electron.IpcRendererEvent, s: IPStatus) => cb(s)
+      ipcRenderer.on('ip:status', handler)
+      return () => ipcRenderer.removeListener('ip:status', handler)
+    }
+  },
+  config: {
+    get: () => ipcRenderer.invoke('config:get'),
+    save: (config: unknown, opts?: { expectProjectId?: string }) => ipcRenderer.invoke('config:save', config, opts),
+    exportProfile: () => ipcRenderer.invoke('config:exportProfile'),
+    importProfile: () => ipcRenderer.invoke('config:importProfile')
+  },
+  targetContext: {
+    get: () => ipcRenderer.invoke('targetContext:get') as Promise<string | null>,
+    set: (target: string | null) => ipcRenderer.invoke('targetContext:set', target) as Promise<{ ok: boolean; target: string | null }>,
+    onChange: (cb: (target: string | null) => void) => {
+      const handler = (_e: Electron.IpcRendererEvent, target: string | null): void => cb(target)
+      ipcRenderer.on('targetContext:changed', handler)
+      return () => ipcRenderer.removeListener('targetContext:changed', handler)
+    }
+  },
+  artifacts: {
+    add: (title?: string) => ipcRenderer.invoke('artifacts:add', title) as Promise<ArtifactAddResponse | null>,
+    // A dropped File's path is only reachable here (contextIsolation); the
+    // main process confirms the list with the operator before reading any.
+    addDropped: (files: File[], text: { title: string; message: string; confirm: string; cancel: string }) =>
+      ipcRenderer.invoke('artifacts:addDropped', files.map((f) => webUtils.getPathForFile(f)).filter(Boolean), text) as Promise<ArtifactAddResponse | null>,
+    reveal: (kind: 'artifact' | 'screenshot', file: string) => ipcRenderer.invoke('artifacts:reveal', kind, file) as Promise<boolean>
+  },
+  agents: {
+    sessions: () => ipcRenderer.invoke('agents:sessions') as Promise<Array<{ agentKind: string; sessionId: string; cwd?: string; recording: boolean }>>,
+    sources: (roots?: Record<string, string>) => ipcRenderer.invoke('agents:sources', roots) as Promise<Array<{ id: string; label: string; root: string; detected: boolean }>>
+  },
+  hookConfig: {
+    get: () => ipcRenderer.invoke('hookConfig:get') as Promise<{ excludedPaths: string[] }>,
+    save: (cfg: { excludedPaths?: string[] }) => ipcRenderer.invoke('hookConfig:save', cfg) as Promise<boolean>,
+    pickPath: (title?: string) => ipcRenderer.invoke('hookConfig:pickPath', title) as Promise<string | null>
+  },
+  content: {
+    copySaved: (ref: import('../core/content-contract').ContentRef) => ipcRenderer.invoke('content:copySaved', ref) as Promise<import('../core/content-contract').ContentResult<{bytes:number}>>,
+    save: (ref: import('../core/content-contract').ContentRef) => ipcRenderer.invoke('content:save', ref) as Promise<import('../core/content-contract').ContentResult<{path:string;bytes:number}|null>>,
+    anchor: (req: import('../core/content-contract').ContentAnchorRequest) => ipcRenderer.invoke('content:anchor', req) as Promise<import('../core/content-contract').ContentResult<import('../core/content-contract').ContentAnchor>>,
+    resolveAnchor: (req: import('../core/content-contract').ContentAnchor) => ipcRenderer.invoke('content:resolveAnchor', req) as Promise<import('../core/content-contract').ContentResult<{ text: string; offset: number }>>,
+
+    list: (req: { projectId: string; eventId: string }) => ipcRenderer.invoke('content:list', req) as Promise<import('../core/content-contract').ContentResult<import('../core/content-contract').ContentDescriptor[]>>,
+    read: (req: import('../core/content-contract').ContentReadRequest) => ipcRenderer.invoke('content:read', req) as Promise<import('../core/content-contract').ContentResult<import('../core/content-contract').ContentWindow>>,
+    find: (req: import('../core/content-contract').ContentFindRequest) => ipcRenderer.invoke('content:find', req) as Promise<import('../core/content-contract').ContentResult<import('../core/content-contract').ContentFindResult>>
+  },
+  events: {
+    commandEvidence: () => ipcRenderer.invoke('events:commandEvidence') as Promise<{ builtin: boolean; external: boolean }>,
+    query: (opts: import('../core/db/events').EventQueryOptions) => ipcRenderer.invoke('events:query', opts),
+    queryPage: (opts: import('../core/db/events').EventFilter & { limit?: number; cursor?: string | null; excludeHousekeeping?: boolean }) =>
+      ipcRenderer.invoke('events:queryPage', opts) as Promise<{
+        items: import('../core/db/events').RedLogEvent[]
+        hasMore: boolean
+        nextCursor: string | null
+      }>,
+    queryHttpFlowPage: (opts: import('../core/db/events').HttpFlowQueryOptions) =>
+      ipcRenderer.invoke('events:queryHttpFlowPage', opts) as Promise<import('../core/db/events').HttpFlowPage>,
+    getCount: (tier: import('../core/db/events').EventTierFilter) => ipcRenderer.invoke('events:getCount', tier),
+    // Spec 017: the renderer parses, so a parse failure never crosses the bridge.
+    runQuery: (req: import('../core/db/events').EventQueryRequest) =>
+      ipcRenderer.invoke('events:runQuery', req) as Promise<import('../core/db/events').EventQueryResult>,
+    sourceSessions: (req: import('../core/source-sessions').SourceSessionRequest) => ipcRenderer.invoke('events:sourceSessions', req) as Promise<import('../core/source-sessions').SourceSessionPage>,
+    activityPage: (req: import('../core/activity-contract').ActivityRequest) =>
+      ipcRenderer.invoke('events:activityPage', req) as Promise<import('../core/activity-contract').ActivityPage>,
+    activityMembers: (req: import('../core/activity-contract').ActivityMembersRequest) =>
+      ipcRenderer.invoke('events:activityMembers', req) as Promise<import('../core/activity-contract').ActivityMembersPage>,
+    // Spec 038: the Timeline's total, earlier matches and held-row checks.
+    count: (req: import('../core/db/events').EventCountRequest) =>
+      ipcRenderer.invoke('events:count', req) as Promise<number>,
+    span: (req: import('../core/db/events').EventCountRequest) =>
+      ipcRenderer.invoke('events:span', req) as Promise<{ first: number; last: number } | null>,
+    matchIds: (req: import('../core/db/events').EventMatchRequest) =>
+      ipcRenderer.invoke('events:matchIds', req) as Promise<string[]>,
+    toolCounterparts: (keys: import('../core/db/events').ToolPairKey[]) =>
+      ipcRenderer.invoke('events:toolCounterparts', keys) as Promise<import('../core/db/events').RedLogEvent[]>,
+    distinctAgentTypes: () => ipcRenderer.invoke('events:distinctAgentTypes') as Promise<string[]>,
+    aggregateTargets: () => ipcRenderer.invoke('events:aggregateTargets') as Promise<import('../core/db/events').TargetAggregate[]>,
+    queryScreenshotPage: (opts: { limit?: number; cursor?: string | null; trigger?: string | null }) =>
+      ipcRenderer.invoke('events:queryScreenshotPage', opts) as Promise<{
+        items: import('../core/db/events').RedLogEvent[]
+        hasMore: boolean
+        nextCursor: string | null
+      }>,
+    distinctHosts: () => ipcRenderer.invoke('events:distinctHosts') as Promise<import('../core/db/events').HostAggregate[]>,
+    // Recordings are searched separately from events — see casts:search in
+    // main. `status` is not optional decoration: a project whose recordings
+    // are still being indexed returns fewer hits than it will in a minute,
+    // and this product cannot let that read as "nothing there".
+    searchCasts: (query: string, limit?: number) => ipcRenderer.invoke('casts:search', query, limit),
+    castIndexStatus: () => ipcRenderer.invoke('casts:status'),
+    readCastRange: (castRel: string, off: number, len: number, version?:string) =>
+      ipcRenderer.invoke('casts:readRange', castRel, off, len, version),
+    queryByFlowId: (flowId: string) => ipcRenderer.invoke('events:queryByFlowId', flowId) as Promise<RedLogEvent[]>,
+    streamCompletion: (flowId: string) => ipcRenderer.invoke('events:streamCompletion', flowId) as Promise<import('../core/stream-completion').StreamCompletion | null>,
+    commandOutput: (commandId: string) => ipcRenderer.invoke('events:commandOutput', commandId) as Promise<import('../core/db/events').CommandOutputPage>,
+    commandEnds: (commandIds: string[]) => ipcRenderer.invoke('events:commandEnds', commandIds) as Promise<RedLogEvent[]>,
+    getById: (ids: string[]) => ipcRenderer.invoke('events:getById', ids) as Promise<RedLogEvent[]>,
+    causalChain: (anchorId: string, opts?: { maxDepth?: number; eventLimit?: number }) =>
+      ipcRenderer.invoke('events:causalChain', anchorId, opts) as Promise<import('../core/db/events').EventCausalChain>,
+    // The main process coalesces burst traffic into one delivery per turn.
+    onNewBatch: (cb: (events: RedLogEvent[]) => void) => {
+      const handler = (_e: Electron.IpcRendererEvent, events: RedLogEvent[]) => cb(events)
+      ipcRenderer.on('events:new-batch', handler)
+      return () => ipcRenderer.removeListener('events:new-batch', handler)
+    },
+    toggleDoNotExport: (eventId: string) =>
+      ipcRenderer.invoke('events:toggleDoNotExport', eventId) as Promise<boolean | null>,
+    setNote: (eventId: string, note: string) =>
+      ipcRenderer.invoke('events:setNote', eventId, note) as Promise<EventNote | null>,
+    getNote: (eventId: string) =>
+      ipcRenderer.invoke('events:getNote', eventId) as Promise<EventNote | null>,
+    annotatedIds: () => ipcRenderer.invoke('events:annotatedIds') as Promise<string[]>,
+    attributionStats: () =>
+      ipcRenderer.invoke('events:attributionStats') as Promise<{ attempted: number; resolved: number }>,
+    isDoNotExport: (eventId: string) =>
+      ipcRenderer.invoke('events:isDoNotExport', eventId) as Promise<boolean>
+  },
+  httpBody: {
+    read: (ref: { sha256: string; size: number; file: string; encoding: 'text' | 'base64' }) =>
+      ipcRenderer.invoke('httpBody:read', ref) as Promise<string | null>
+  },
+  marker: {
+    create: (data: Record<string, unknown>) => ipcRenderer.invoke('marker:create', data),
+    amend: (markerId: string, changes: Record<string, unknown>) =>
+      ipcRenderer.invoke('marker:amend', markerId, changes),
+    amendments: (ids: string[]) => ipcRenderer.invoke('marker:amendments', ids) as Promise<RedLogEvent[]>,
+    onShortcut: (cb: (info: { heldFrame?: string }) => void) => {
+      const handler = (_e: Electron.IpcRendererEvent, info?: { heldFrame?: string }): void => cb(info ?? {})
+      ipcRenderer.on('shortcut:marker', handler)
+      return () => ipcRenderer.removeListener('shortcut:marker', handler)
+    }
+  },
+  screenshot: {
+    capture: (causeEventId?: string, opts?: { heldFrame?: string; hideOwnWindows?: boolean }) =>
+      ipcRenderer.invoke('screenshot:capture', causeEventId, opts),
+    onShortcutResult: (cb: (r: { ok: boolean }) => void) => {
+      const handler = (_e: Electron.IpcRendererEvent, r: { ok: boolean }): void => cb(r)
+      ipcRenderer.on('screenshot:shortcutResult', handler)
+      return () => ipcRenderer.removeListener('screenshot:shortcutResult', handler)
+    },
+    deleteFile: (eventId: string, filePath: string) => ipcRenderer.invoke('screenshot:deleteFile', eventId, filePath)
+    // v0.6.98 B: `read` IPC dropped. v0.6.97 B moved every renderer call site
+    // onto the `redlog-screenshot://` custom protocol (streamed direct from
+    // disk, no base64 round-trip). Nothing in-tree references screenshot.read
+    // any more, and keeping the IPC alive means any future path-traversal
+    // regression in the handler is still exploitable via a compromised
+    // renderer. The main-process handler is dropped in the same commit.
+  },
+  scope: {
+    policy: () => ipcRenderer.invoke('scope:policy'),
+    getObservations: () => ipcRenderer.invoke('scope:getObservations'),
+    getObservationCount: () => ipcRenderer.invoke('scope:getObservationCount'),
+    isConfigured: () => ipcRenderer.invoke('scope:isConfigured'),
+    addTarget: (target: string, opts?: { expectProjectId?: string }) => ipcRenderer.invoke('scope:addTarget', target, opts) as Promise<boolean>,
+    fileInForce: () => ipcRenderer.invoke('scope:fileInForce'),
+    getLastRecompute: () => ipcRenderer.invoke('scope:getLastRecompute')
+  },
+  chain: {
+    length: () => ipcRenderer.invoke('chain:length'),
+    anchors: () => ipcRenderer.invoke('chain:anchors'),
+    anchorNow: () => ipcRenderer.invoke('chain:anchorNow'),
+    verify: () => ipcRenderer.invoke('chain:verify'),
+    upgrade: (id?: string) => ipcRenderer.invoke('chain:upgrade', id)
+  },
+  loot: {
+    getCount: () => ipcRenderer.invoke('loot:getCount'),
+    rules: () => ipcRenderer.invoke('loot:rules')
+  },
+  bookmarks: {
+    list: () => ipcRenderer.invoke('bookmarks:list'),
+    get: (id: string) => ipcRenderer.invoke('bookmarks:get', id),
+    create: (data: { title: string; url?: string; note?: string }) => ipcRenderer.invoke('bookmarks:create', data),
+    update: (id: string, data: Record<string, unknown>) => ipcRenderer.invoke('bookmarks:update', id, data),
+    delete: (id: string) => ipcRenderer.invoke('bookmarks:delete', id)
+  },
+  cdp: {
+    getTab: () => ipcRenderer.invoke('cdp:getTab'),
+    setPort: (port: number) => ipcRenderer.invoke('cdp:setPort', port)
+  },
+  browser: {
+    detect: () => ipcRenderer.invoke('browser:detect'),
+    status: () => ipcRenderer.invoke('browser:status'),
+    launch: () => ipcRenderer.invoke('browser:launch'),
+    stop: () => ipcRenderer.invoke('browser:stop'),
+    /** Fires whoever ended it, including the operator closing the window. */
+    onExited: (cb: () => void) => {
+      const handler = (): void => cb()
+      ipcRenderer.on('browser:exited', handler)
+      return () => ipcRenderer.removeListener('browser:exited', handler)
+    }
+  },
+  httpCapture: {
+    status: () => ipcRenderer.invoke('httpCapture:status'),
+    start: () => ipcRenderer.invoke('httpCapture:start'),
+    stop: () => ipcRenderer.invoke('httpCapture:stop'),
+    verifyInBrowser: (nonce: string) => ipcRenderer.invoke('httpCapture:verifyInBrowser', nonce),
+    onVerify: (cb: (report: import('../core/http-verify').HttpVerifyReport) => void) => {
+      const handler = (_e: Electron.IpcRendererEvent, report: import('../core/http-verify').HttpVerifyReport) => cb(report)
+      ipcRenderer.on('httpCapture:verify', handler)
+      return () => ipcRenderer.removeListener('httpCapture:verify', handler)
+    }
+  },
+  data: {
+    resolveExportPlan: (request: ExportRequest) => ipcRenderer.invoke('data:resolveExportPlan', request),
+    executeExportPlan: (input: { planId: string; destDir?: string }) => ipcRenderer.invoke('data:executeExportPlan', input),
+    recentExport: () => ipcRenderer.invoke('data:recentExport'),
+    exportDestination: () => ipcRenderer.invoke('data:exportDestination') as Promise<string | null>,
+    pickExportDir: () => ipcRenderer.invoke('data:pickExportDir') as Promise<string | null>,
+    revealExport: (target: string) => ipcRenderer.invoke('data:revealExport', target) as Promise<boolean>
+  },
+  hooks: {
+    detect: () => ipcRenderer.invoke('hooks:detect'),
+    terminalPolicy: () => ipcRenderer.invoke('hooks:terminalPolicy'),
+    setTerminalApp: (value: string) => ipcRenderer.invoke('hooks:setTerminalApp', value),
+    install: (hookId: string) => ipcRenderer.invoke('hooks:install', hookId),
+    uninstall: (hookId: string) => ipcRenderer.invoke('hooks:uninstall', hookId)
+  },
+  tools: {
+    detection: () => ipcRenderer.invoke('tools:detection'),
+    rescan: (reason: 'settings-open' | 'manual') => ipcRenderer.invoke('tools:rescan', reason)
+  },
+  runtime: {
+    preflight: () => ipcRenderer.invoke('runtime:preflight'),
+    install: (id: string) => ipcRenderer.invoke('runtime:install', id),
+    cancelInstall: (id: string) => ipcRenderer.invoke('runtime:cancelInstall', id)
+  },
+  plugins: {
+    officialAgents: () => ipcRenderer.invoke('plugins:officialAgents') as Promise<import('../core/plugins/official-agents').OfficialAgentPlugin[]>,
+    installOfficialAgent: (agentKind: string) => ipcRenderer.invoke('plugins:installOfficialAgent', agentKind) as Promise<import('../core/plugins/official-agents').OfficialAgentMutation>,
+    uninstallOfficialAgent: (agentKind: string) => ipcRenderer.invoke('plugins:uninstallOfficialAgent', agentKind) as Promise<import('../core/plugins/official-agents').OfficialAgentMutation>,
+    list: () => ipcRenderer.invoke('plugins:list'),
+    eventTypes: () => ipcRenderer.invoke('plugins:eventTypes'),
+    reload: () => ipcRenderer.invoke('plugins:reload'),
+    testSample: (text: string) => ipcRenderer.invoke('plugins:testSample', text),
+    openFolder: () => ipcRenderer.invoke('plugins:openFolder'),
+    setEnabled: (id: string, enabled: boolean) => ipcRenderer.invoke('plugins:setEnabled', id, enabled),
+    grant: (id: string) => ipcRenderer.invoke('plugins:grant', id),
+    revoke: (id: string) => ipcRenderer.invoke('plugins:revoke', id)
+  },
+  capture: {
+    health: () => ipcRenderer.invoke('capture:health'),
+    clearUnattributedSpool: (upTo: number) => ipcRenderer.invoke('capture:clearUnattributedSpool', upTo)
+  },
+  operators: {
+    list: () => ipcRenderer.invoke('operators:list')
+  },
+  visibility: {
+    signals: () => ipcRenderer.invoke('visibility:signals')
+  },
+  recording: {
+    get: (): Promise<boolean> => ipcRenderer.invoke('recording:get'),
+    toggle: (): Promise<boolean> => ipcRenderer.invoke('recording:toggle'),
+    onChange: (cb: (recording: boolean) => void) => {
+      const handler = (_e: Electron.IpcRendererEvent, r: boolean) => cb(r)
+      ipcRenderer.on('recording:changed', handler)
+      return () => ipcRenderer.removeListener('recording:changed', handler)
+    }
+  },
+  pivots: {
+    getActive: (): Promise<Array<{ via: string; tool: string; route?: string; ts: number }>> =>
+      ipcRenderer.invoke('pivots:getActive'),
+    onChange: (cb: (pivots: Array<{ via: string; tool: string; route?: string; ts: number }>) => void) => {
+      const handler = (_e: Electron.IpcRendererEvent, p: Array<{ via: string; tool: string; route?: string; ts: number }>) => cb(p)
+      ipcRenderer.on('pivots:changed', handler)
+      return () => ipcRenderer.removeListener('pivots:changed', handler)
+    }
+  },
+  terminal: {
+    spawn: (id: string, cols: number, rows: number, shellId?: string) =>
+      ipcRenderer.invoke('terminal:spawn', id, cols, rows, shellId),
+    shells: () => ipcRenderer.invoke('terminal:shells'),
+    write: (id: string, data: string) => ipcRenderer.send('terminal:write', id, data),
+    resize: (id: string, cols: number, rows: number) => ipcRenderer.send('terminal:resize', id, cols, rows),
+    kill: (id: string) => ipcRenderer.send('terminal:kill', id),
+    list: () => ipcRenderer.invoke('terminal:list'),
+    onData: (id: string, cb: (data: string) => void) => {
+      const channel = `terminal:data:${id}`
+      const handler = (_e: Electron.IpcRendererEvent, data: string) => cb(data)
+      ipcRenderer.on(channel, handler)
+      return () => ipcRenderer.removeListener(channel, handler)
+    },
+    onExit: (id: string, cb: (exitCode: number) => void) => {
+      const channel = `terminal:exit:${id}`
+      const handler = (_e: Electron.IpcRendererEvent, code: number) => cb(code)
+      ipcRenderer.on(channel, handler)
+      return () => ipcRenderer.removeListener(channel, handler)
+    },
+    onCastState: (id: string, cb: (state: TerminalCastState) => void) => {
+      const channel = `terminal:castState:${id}`
+      const handler = (_e: Electron.IpcRendererEvent, state: TerminalCastState) => cb(state)
+      ipcRenderer.on(channel, handler)
+      return () => ipcRenderer.removeListener(channel, handler)
+    },
+    replay: (eventId: string) => ipcRenderer.invoke('terminal:replay', eventId),
+    replaySession: (eventId: string) => ipcRenderer.invoke('terminal:replaySession', eventId),
+    replayAtTime: (atMs: number) => ipcRenderer.invoke('terminal:replayAtTime', atMs)
+  },
+  wsl: {
+    listDistros: () => ipcRenderer.invoke('wsl:listDistros'),
+    getNetworkMode: () => ipcRenderer.invoke('wsl:getNetworkMode'),
+    installHook: (distro: string, shell: string) => ipcRenderer.invoke('wsl:installHook', distro, shell),
+    uninstallHook: (distro: string, shell: string) => ipcRenderer.invoke('wsl:uninstallHook', distro, shell),
+    runDiagnostics: (distro: string) => ipcRenderer.invoke('wsl:runDiagnostics', distro)
+  },
+  overlay: {
+    toggle: () => ipcRenderer.send('overlay:toggle'),
+    hide: () => ipcRenderer.send('overlay:hide'),
+    isVisible: () => ipcRenderer.invoke('overlay:isVisible'),
+    onVisibilityChanged: (cb: (visible: boolean) => void) => {
+      const handler = (_e: Electron.IpcRendererEvent, visible: boolean): void => cb(visible)
+      ipcRenderer.on('overlay:visibilityChanged', handler)
+      return () => ipcRenderer.removeListener('overlay:visibilityChanged', handler)
+    },
+    moveToCorner: (corner: 'tl' | 'tr' | 'bl' | 'br') => ipcRenderer.send('overlay:moveToCorner', corner),
+    setPassThrough: (on: boolean) => ipcRenderer.send('overlay:setPassThrough', on),
+    onPassThroughChanged: (cb: (on: boolean) => void) => {
+      const handler = (_e: Electron.IpcRendererEvent, on: boolean): void => cb(on)
+      ipcRenderer.on('overlay:passThroughChanged', handler)
+      return () => ipcRenderer.removeListener('overlay:passThroughChanged', handler)
+    }
+  }
+}
+
+contextBridge.exposeInMainWorld('redlog', api)

@@ -1,0 +1,148 @@
+import type { IpcMain } from 'electron'
+import { shell } from 'electron'
+import path from 'path'
+import { homedir } from 'os'
+import fs from 'fs'
+import type { IpcContext } from './types'
+import { loadConfig } from '../../core/config'
+import { getProjectDir as getProjectPath } from '../../core/project-manager'
+import { testSample } from '../../core/plugins/test-sample'
+import { getContributionReport } from '../../core/plugins/contributions'
+import { requiresApproval, installingCaptures } from '../../core/plugins/manifest'
+import { createOfficialAgentPluginManager } from '../../core/plugins/official-agents'
+import { listPlugins, listEventTypes, setPluginEnabled, grantPluginTrust, revokePluginTrust, reloadPlugins, terminalProfilesError } from '../../core/plugins'
+import { checkTerminalProfiles } from '../../core/terminal-profiles'
+import { invalidateHooksCache } from '../../core/capture-health'
+import { invalidateHooksCache as invalidateHooksDetectCache } from '../../core/hooks-manager'
+import { insertEvent } from '../../core/db/events'
+import { eventBus } from '../../core/event-bus'
+
+// Serialise LoadedPlugin to a UI-friendly shape (drop absolute dirs/hashes we
+// don't need in the renderer; keep what the panel renders + acts on).
+//
+// `terminalProfiles` and `captureInstalls` are what the approval dialog shows:
+// the profiles the plugin declares that RedLog would accept, and the capture
+// entries that RedLog would install. Both are read from the manifest and not
+// from the report, because a plugin awaiting approval has registered nothing yet.
+// `profilesError` is the same on every row: the shell's snapshot of the
+// profiles could not be brought up to date, whichever plugin the change was to.
+function pluginView() {
+  const official = createOfficialAgentPluginManager(path.join(homedir(), '.redlog', 'plugins')).list()
+  const profilesError = terminalProfilesError() ?? null
+  return listPlugins().map((p) => ({
+    officialAgent: official.some(entry => entry.pluginId === p.manifest.id),
+    id: p.manifest.id, name: p.manifest.name, version: p.manifest.version,
+    description: p.manifest.description ?? '', author: p.manifest.author ?? '',
+    source: p.source, tier: p.tier, needsApproval: requiresApproval(p.manifest), status: p.status,
+    capabilities: p.manifest.capabilities ?? [],
+    contributes: Object.keys(p.manifest.contributes ?? {}),
+    terminalProfiles: checkTerminalProfiles(p.manifest.id, p.manifest.contributes?.terminalProfiles).accepted
+      .map(({ name, mode, executables, reason }) => ({ name, mode, executables, reason })),
+    captureInstalls: installingCaptures(p.manifest),
+    profilesError,
+    error: p.error,
+    apiAhead: p.apiAhead === true,
+    report: getContributionReport(p.manifest.id) ?? null
+  }))
+}
+
+/** Write a plugin state change into the open project's record, when there is
+ *  one. No open project means no chain to write to; the change still happens
+ *  (the flag is app-wide) and the next project inherits it. */
+function auditPluginChange(ctx: IpcContext, changed: Record<string, { from: unknown; to: unknown }>, description: string): void {
+  const engagementId = ctx.getCurrentEngagementId()
+  const operatorId = ctx.getCurrentOperatorId()
+  if (!engagementId || !operatorId) return
+  try {
+    const ev = insertEvent('system', { subtype: 'config_changed', changed, description }, { engagementId, operatorId })
+    if (ev) eventBus.publish(ev)
+  } catch { /* additive: the state change is not undone by a failed log */ }
+}
+
+export function registerPluginsIpc(ipcMain: IpcMain, ctx: IpcContext): void {
+  ipcMain.handle('plugins:list', () => pluginView())
+  const officialAgents = createOfficialAgentPluginManager(path.join(homedir(), '.redlog', 'plugins'))
+  ipcMain.handle('plugins:officialAgents', () => officialAgents.list())
+  const mutateOfficialAgent = (operation: 'install' | 'uninstall', agentKind: unknown) => {
+    const before = officialAgents.list().find(entry => entry.agentKind === agentKind)
+    const result = officialAgents[operation](agentKind)
+    // Recovery is explicit, source-owned and does not authorize any project.
+    const disabled = result.ok && operation === 'install' && result.pluginId
+      ? listPlugins().find(p => p.manifest.id === result.pluginId)?.status === 'disabled' : false
+    if (disabled && result.pluginId) {
+      setPluginEnabled(result.pluginId, true)
+      invalidateHooksCache(); invalidateHooksDetectCache(); ctx.onPluginsChanged()
+      auditPluginChange(ctx, { [`plugin.${result.pluginId}.enabled`]: { from: false, to: true } }, `AI capture integration restored: ${result.pluginId}`)
+    }
+    // A final-directory cleanup failure can follow a successful manifest
+    // removal. Refresh in that case too, while keeping the error visible.
+    if (result.changed && result.pluginId) {
+      reloadPlugins()
+      invalidateHooksCache(); invalidateHooksDetectCache(); ctx.onPluginsChanged()
+      auditPluginChange(ctx, {
+        [`plugin.${result.pluginId}.installed`]: { from: before?.state === 'installed', to: operation === 'install' }
+      }, `Official AI capture integration ${operation === 'install' ? 'installed' : 'removed'}: ${result.pluginId}`)
+    }
+    return result
+  }
+  ipcMain.handle('plugins:installOfficialAgent', (_e, agentKind: unknown) => mutateOfficialAgent('install', agentKind))
+  ipcMain.handle('plugins:uninstallOfficialAgent', (_e, agentKind: unknown) => mutateOfficialAgent('uninstall', agentKind))
+  // Dry run on pasted text: writes nothing, emits nothing.
+  ipcMain.handle('plugins:testSample', (_e, text: unknown) => {
+    const project = ctx.getActiveProject()
+    const disabledRules = project ? loadConfig(getProjectPath(project)).loot?.disabledRules ?? [] : []
+    return testSample(typeof text === 'string' ? text : '', { disabledRules })
+  })
+  ipcMain.handle('plugins:eventTypes', () => listEventTypes())
+  ipcMain.handle('plugins:reload', () => { invalidateHooksCache(); invalidateHooksDetectCache(); reloadPlugins(); ctx.onPluginsChanged(); return pluginView() })
+  // Open the user plugin dir in Finder/Explorer so operators can drop new
+  // plugin folders in and reload without hunting for the path.
+  ipcMain.handle('plugins:openFolder', async () => {
+    const dir = path.join(homedir(), '.redlog', 'plugins')
+    try { await fs.promises.mkdir(dir, { recursive: true }) } catch { /* ignore */ }
+    shell.openPath(dir)
+    return dir
+  })
+  // Switching a capture source on or off changes what the record will contain
+  // from this moment, and it left no trace of itself: `setPluginEnabled`
+  // writes ~/.redlog/plugins/state.json and nothing else. config-audit covers
+  // packs and pack members, never plugins, so a handed-over record could have
+  // a gap in it that nothing in the record explains. The flag is app-wide, so
+  // the gap is not even confined to the project it was thrown in.
+  ipcMain.handle('plugins:setEnabled', (_e, id: string, enabled: boolean) => {
+    if (officialAgents.list().some(entry => entry.pluginId === id)) throw new Error('Manage official AI integrations in capture sources')
+    const before = listPlugins().find((p) => p.manifest.id === id)
+    setPluginEnabled(id, enabled)
+    invalidateHooksCache(); invalidateHooksDetectCache(); ctx.onPluginsChanged()
+    auditPluginChange(ctx, {
+      [`plugin.${id}.enabled`]: { from: before ? before.status !== 'disabled' : null, to: enabled }
+    }, `Plugin ${enabled ? 'enabled' : 'disabled'}: ${before?.manifest.name ?? id}`)
+    return pluginView()
+  })
+  // Approval decides whether a plugin's code runs, or what the shell does with
+  // the commands it names, so the grant and the revoke are as much a part of
+  // the record as enable/disable are: a handed-over record has to be able to
+  // explain why a source started or stopped.
+  ipcMain.handle('plugins:grant', (_e, id: string) => {
+    const project = ctx.getActiveProject()
+    const opId = project ? loadConfig(getProjectPath(project)).operator.id : 'unknown'
+    const before = listPlugins().find((p) => p.manifest.id === id)
+    const r = grantPluginTrust(id, opId)
+    if (r.ok) {
+      invalidateHooksCache(); invalidateHooksDetectCache(); ctx.onPluginsChanged()
+      auditPluginChange(ctx, {
+        [`plugin.${id}.trusted`]: { from: false, to: true },
+        [`plugin.${id}.capabilities`]: { from: null, to: before?.manifest.capabilities ?? [] },
+        ...(before?.contentHash ? { [`plugin.${id}.content_sha256`]: { from: null, to: before.contentHash } } : {})
+      }, `Plugin trusted: ${before?.manifest.name ?? id}`)
+    }
+    return { ...r, plugins: pluginView() }
+  })
+  ipcMain.handle('plugins:revoke', (_e, id: string) => {
+    const before = listPlugins().find((p) => p.manifest.id === id)
+    revokePluginTrust(id)
+    invalidateHooksCache(); invalidateHooksDetectCache(); ctx.onPluginsChanged()
+    auditPluginChange(ctx, { [`plugin.${id}.trusted`]: { from: true, to: false } }, `Plugin trust revoked: ${before?.manifest.name ?? id}`)
+    return pluginView()
+  })
+}

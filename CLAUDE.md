@@ -1,0 +1,304 @@
+# Working in this repository
+
+UI copy rules and the Electron sandbox note live in `AGENTS.md` and apply to
+every agent, including Claude Code.
+The single global UI/UX standard is `docs/UIUX-STANDARD.md`; `AGENTS.md`
+§"Which document is authoritative" says which documents may be relied on.
+
+## Before you push
+
+Run all five, in this order. `npm test` passing is not the bar — CI runs three
+gates that Vitest does not, and each has caught a real problem that a green
+suite did not.
+
+```bash
+npm run typecheck && npm run verify:specs && npm run verify:architecture && npm run verify:i18n && npm test
+```
+
+The order is CI's, and it is deliberate:
+
+- **typecheck** first, because a type error makes every test result suspect. It
+  is also the guard Vitest cannot be: a name used but never imported typechecks
+  as an error and *runs* as a `ReferenceError`. One such import went missing in
+  the scope-recompute work and stopped capture for three commits.
+- **verify:specs** — spec statuses are known, a Verified spec carries its tasks,
+  plan and verification record, and the executable aliases are current.
+- **verify:architecture** — every export is reachable from production code. This
+  is how dead code is found here. Deleting a feature usually orphans something
+  one file away from the thing you deleted, and nothing else will tell you.
+- **verify:i18n** — nothing in `test/` or `e2e/` asserts a UI string this branch
+  deleted. Typecheck cannot see a string literal in a test, and the i18n key
+  test checks the opposite direction, so until this existed the only thing that
+  caught it was a full e2e round — six minutes in, and only when every gate
+  before it was green. It compares against the merge base with `origin/main`,
+  so a stale `origin/main` checks less than you think; `git fetch` first.
+- **npm test** last.
+
+A green `npm test` with a red gate is the normal shape of this mistake, because
+the gates check things tests structurally cannot.
+
+### A gate green on main may never have run
+
+`verify:i18n` compares HEAD against its merge base with `origin/main`. On `main`
+that base **is** HEAD, so it resolves trivially and passes on any checkout, however
+shallow. On a branch it needs real history on **both** sides — and when it
+shipped, `actions/checkout` was at its default `fetch-depth: 1`, so the branch
+had one commit for that base to be found against. Green on main, red on every
+PR, which is the only place it does any work.
+
+Two things follow for any gate that compares against another ref:
+
+- Judge it by a run on a **branch**. A green tick on `main` can mean the
+  comparison was free.
+- `--depth` on a fetch is not a cheaper `fetch-depth`. On a complete clone
+  `git fetch --depth=N` makes that ref **shallow again** and takes the merge
+  base back out. Deepen at the checkout, and leave `--depth` off the fetch.
+
+### A skipped gate hides what is behind it
+
+`e2e` used to need every unit leg, and was skipped, not queued, when one failed
+— so a red gate was also a blindfold. While the i18n gate was failing on every
+PR, `e2e/screenshot-capture.spec.ts` was red on `main` and nobody saw it: there
+had not been a completed e2e run to look at. Both halves of that were found in
+one afternoon, and they were the same fault seen from two ends.
+
+So `e2e` no longer waits for `unit`: the two run side by side and each reports
+on its own. The steps *inside* a unit leg are still ordered — a typecheck
+failure stops that leg before Vitest — so within a leg the rule still holds:
+when a step has been red for a while, assume the ones after it have been
+reporting nothing, and read the first full run after the fix as new information
+rather than a regression.
+
+On a PR a new push cancels the run in progress. On `main` it does not: each
+merge gets its own run, so every commit on `main` has been checked whole.
+
+### The known flake
+
+The unit suite has an intermittent failure that lands on a **different file each
+run**, passes in isolation, and shows up roughly once in ten. It is documented
+in `.github/workflows/ci.yml`. If a failure matches that shape — a file you did
+not touch, green on a re-run — it is this and not you. If it does not match that
+shape, it is you.
+
+## e2e
+
+CI runs e2e on **ubuntu only**, which means two things:
+
+- A spec can be POSIX-only without anyone noticing. Several use `#!/bin/sh`
+  fixtures. If you are on Windows and one fails on its fixture rather than on
+  the behaviour, make the spec say so with `test.skip(process.platform === 'win32', …)`
+  rather than leaving it failing locally.
+- A spec that only fails on Windows or macOS never shows up in CI at all. Run
+  the spec yourself before a large branch goes up:
+
+```bash
+npm run build && npx playwright test e2e/<spec>.spec.ts --reporter=line
+```
+
+CI splits the suite by spec file across three runners, checks `e2e (1/3)` to
+`e2e (3/3)`, each with its own `e2e-artifacts-<n>` on failure. A failing shard
+names its spec; run that spec as above rather than the shard. A spec that
+passes alone and fails in its shard depends on an earlier spec's leftovers —
+`--shard=<n>/3` locally runs the same files in the same order.
+
+### A bare "Test timeout exceeded" names nothing — make it name something
+
+A spec that fails with only `Test timeout of N exceeded`, no locator and no call
+log, usually did **not** hang where the timeout says. The assertion failed, the
+`finally` ran `await app.close()` against an app left in the broken state, the
+close did not return, and the teardown ate the rest of the budget before the
+real error could be reported. `Worker teardown timeout` beside it is the tell.
+
+Do not start by bisecting the hang. Make the error speak first:
+
+```ts
+} catch (e) {
+  console.log(`[DBG] ${(e as Error).message.split('\n').slice(0, 5).join(' | ')}`)
+  throw e
+} finally {
+  await app.close()
+}
+```
+
+Three separate real failures hid behind one bare timeout in
+`managed-http-capture.spec.ts` for as long as nobody did this.
+
+A fixture that outlives a signal makes the same mess: a `#!/bin/sh` loop around
+`sleep` cannot act on SIGTERM until the current `sleep` returns, and leaves a
+grandchild behind. `exec` the long-running command instead, so the stand-in is
+one process that dies when it is told to.
+
+### Measuring geometry in e2e
+
+The app renders at `body { zoom }` (default 0.9). `getBoundingClientRect()`
+returns **device** pixels; `offsetLeft`, `offsetWidth` and `clientWidth` return
+**CSS** pixels. Mixing them silently scales one side of a comparison by the zoom
+factor — a dot at 1898 inside a 2000px track reads as 98px outside it. Pick one
+family and stay in it; `offset*` is usually the one you want.
+
+## React
+
+**Never declare a component inside another component's body.** A function
+defined there is a new type on every render, so React unmounts and remounts its
+entire subtree each time. Three things follow, and only the first is obvious:
+
+- focus and state are lost on the keystroke that caused the render
+- Fast Refresh cannot reconcile the old tree against the new one, so a panel
+  renders part of itself and stops — which is how this was reported, not as a
+  focus bug
+- it is invisible in tests, because a test renders once
+
+Declare them at module scope and pass what they closed over. `ExportMenu` had
+three such components and shipped broken; the unit suite was green.
+
+The same shape, different symptom: anything a component reads at render time
+must exist before the render that reads it. This repo has been bitten by both
+the TDZ version (a `const` below the JSX that uses it — see the contract note
+in `Timeline.tsx`) and the stale-bridge version (a renderer calling a preload
+method that the running window's preload predates; it needs a full reload, not
+HMR).
+
+## Branches
+
+**A branch that has been merged once stops being watched.** `refactor/
+onboarding-controls` went to `main` through #261 and was then kept as the
+integration branch for the causal-graph work. Four commits landed on it over
+the following week, through two more PRs that targeted *it* rather than `main`,
+and nobody opened a PR for the result — so that work sat finished, green and
+unreachable until someone went looking for open PRs and found none.
+
+Nothing was wrong with any single step. Reusing the branch was reasonable, and
+each PR into it was correctly targeted. What went missing is that a merged
+branch no longer appears in anyone's list of things with somewhere to go.
+
+- Before merging a PR, read its **base**. `gh pr view <n> --json baseRefName`.
+  A PR into a feature branch is a normal thing to want; it is also the thing
+  that quietly needs a second PR afterwards, and "it was green so I merged it"
+  is not the same as "it reached main".
+- After merging a branch to `main`, **start the next change from a new branch**
+  off the new `main`. If a branch is deliberately kept as an integration point,
+  it needs its own open PR to `main` the whole time, so it stays on the list.
+- `git log --oneline origin/main..origin/<branch>` on a branch you thought was
+  finished is the cheap check.
+
+**Never force-push a shared branch.** Several branches here are checked out in
+other sessions' worktrees (`git worktree list`), and a rewrite strands them. To
+bring one up to date, merge `main` *into* it on a branch of your own and push
+that as a fast-forward — no history is rewritten and the other worktree is
+merely behind.
+
+**Switching branches moves everyone's uncommitted work with you.** In this
+checkout the branch is global and the working tree is shared: `git checkout`
+carries every modified file across, including the ones other sessions are
+mid-edit on. Nothing is lost and git says nothing, because from git's side
+nothing happened — but work now sits on a branch its author never chose, and
+the author is usually the last to find out.
+
+It has happened both ways in one afternoon: this session moved the checkout to
+`main` and carried another session's twelve files over, and that session then
+opened a branch of its own and carried a third session's nine-file e2e change
+onto it.
+
+- Before `git checkout <branch>` here, run `git status` and see whose work is
+  in flight. If it is not yours, say so to that session first (`ListAgents` /
+  `SendMessage`) — switching is not destructive, but it is not yours to decide
+  silently either.
+- A switch that git **refuses** ("Your local changes would be overwritten") is
+  the good case: it means the two branches disagree about a file someone is
+  editing. Do not reach for `git stash` — see the memory note; the pop
+  conflicts and recovery is manual. Save a patch and the raw files somewhere
+  outside the repo, restore just the blocking paths, switch, then re-apply
+  with `git apply -3` and resolve by hand.
+- If the local `main` ref is stale the switch spans more history than you
+  expect and collides with files it otherwise would not. `git branch -f main
+  origin/main` first (check `git merge-base --is-ancestor main origin/main` so
+  it is lossless), then switch.
+- When you commit afterwards, name only your own paths. The §Staging rule is
+  doing twice the work here: the tree in front of you may hold three sessions'
+  changes, and one of the files may hold two of them at once — then it is
+  `git apply --cached` of your own hunks, not `git add <file>`.
+
+**The index is shared too, and it has no author.** The working tree is the
+obvious hazard; `.git/index` is the quiet one. Two sessions staging at once are
+writing to one file, and `git commit` takes whatever is in it — so a commit can
+carry content its author never staged, on a path they never touched, and
+nothing in the result says so.
+
+It happened here within the same minute. One session ran
+`git apply --cached` to stage its own hunk of
+`e2e/timeline-geometry.spec.ts`; another committed a nine-file e2e change a few
+seconds later and, for that one path, got the first session's staged version
+instead of its own. The commit reads as a clean change; the author's own two
+hunks are still sitting unstaged, and the other session's assertion is now on a
+branch it does not belong to.
+
+- **Commit with a pathspec**: `git commit -- <paths>` builds the commit from
+  the *working tree* at those paths and ignores whatever else is in the index.
+  It is the one-line defence against all of this, and it costs nothing.
+- For anything more than that — staging selected hunks, or any sequence where
+  another session could land between your `add` and your `commit` — use a
+  private index and plumbing, which touches no shared state at all:
+
+  ```bash
+  export GIT_INDEX_FILE=$(mktemp)        # not .git/index
+  git read-tree HEAD && git apply --cached mine.patch
+  tree=$(git write-tree)
+  commit=$(git commit-tree "$tree" -p HEAD -m "…")
+  git update-ref refs/heads/<your-branch> "$commit"
+  ```
+
+- **Only ever move your own ref.** `update-ref`, `checkout -B` and `reset` on a
+  branch someone else opened will silently relocate their work; one branch was
+  moved onto another session's commit this way and had to be restored from a
+  `wip/` tag its owner had the sense to plant.
+
+**The one symptom you can catch at the time: the two counts disagree.** Stage,
+then read `git diff --cached --stat`, then read what `git commit` reports back.
+They are the same numbers unless the index changed in between.
+
+```
+git diff --cached --stat   →  44 insertions / 16 deletions
+git commit                 →  45 / 13          ← someone else staged in the gap
+```
+
+That is the whole tell, and it is the only one available before the fact —
+everything else needs the commit read back afterwards against what you meant to
+write. The gap can be a single edit: the session this happened to made one
+`Edit` call between the two commands.
+
+It verifies the repair too. After the owner rebuilt that commit, the branch's
+net diff against `origin/main` came back to exactly `44 insertions / 16
+deletions`, and the blob hash of the recovered file matched the version that had
+been swapped out. Same two numbers, used the other way round: they say the
+content you got back is the content you meant to commit.
+
+**Every session here commits as the same git identity**, so `git log --author`
+and the blame on a line tell you nothing about which session wrote it. Do not
+attribute a commit from the author field — check the branch it is on, its
+timestamp, and what it actually contains. Two misattributions in one afternoon
+came from reading the author and stopping there.
+
+## Token economy
+
+`rtk` (see [docs/TOKEN-SAVING-TOOLS.md](docs/TOKEN-SAVING-TOOLS.md)) may be used
+for read-only exploration: `rtk git status`, `rtk git log`, `rtk ls`. It
+compresses output, and compression drops detail.
+
+**Never put it in front of a gate, a test runner or a CI log** — `typecheck`,
+`verify:*`, `vitest`, `playwright`, `gh run view --log-failed`. A failure is
+diagnosed from the whole line, and a collapsed pass count shows none of it. If a
+result disagrees with what you expect, rerun without `rtk` (or `rtk bypass`)
+before concluding anything.
+
+## Staging
+
+Do not `git add -A` or `git add .`. Parallel sessions write to this checkout,
+and both of this session's accidental commits of other people's work came from
+staging everything. Name the paths.
+
+## Changing behaviour
+
+When a change replaces a contract rather than fixing a defect, the specs that
+assert the old contract are part of the change — not follow-up work. e2e will
+find them, but only after a full CI round trip, and only if the gates above let
+it run.

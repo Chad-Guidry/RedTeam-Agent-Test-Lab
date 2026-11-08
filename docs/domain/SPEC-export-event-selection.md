@@ -1,0 +1,196 @@
+# SPEC: Export Event Selection
+
+> Domain: Evidence / Engagement / Handoff
+> Invariant: Export selection must operate across ALL persisted event tiers.
+> Status: Implemented and regression-tested across both tiers. Every file-producing export resolves an ExportPlan (Spec 001, Verified).
+
+## Domain Concepts
+
+| Concept | Definition |
+|---------|-----------|
+| Chained Event | `events` table — hash chain + signature |
+| Logged Event | `events_logged` table — high-volume, no chain |
+| Scope Target | Target within engagement authorization |
+| Personal Domain | Operator's personal traffic — always excluded from export |
+| Do-Not-Export | Events explicitly excluded by policy |
+| Export Selection | The set of events included in an export operation |
+
+## Invariant
+
+```
+Export operates on the complete persisted event population
+(events ∪ events_logged) unless policy explicitly excludes an event.
+```
+
+## Scenarios
+
+### Scenario 1: Both tiers included
+
+```
+Given:
+  chained shell:command_end event A targeting 10.0.0.1
+  logged scanner:http_response event B targeting 10.0.0.1
+  scope targets = [10.0.0.1]
+When:
+  queryScopeFilteredEvents(scopeTargets)
+Then:
+  A included
+  B included
+  result.events contains both A and B
+```
+
+### Scenario 2: Out-of-scope filtering applies to both tiers
+
+```
+Given:
+  chained event A targeting 10.0.0.1 (in scope)
+  logged event B targeting 192.168.1.1 (out of scope)
+  scope targets = [10.0.0.1]
+When:
+  queryScopeFilteredEvents(scopeTargets)
+Then:
+  A included
+  B excluded
+```
+
+### Scenario 3: No-target whitelist applies to both tiers
+
+```
+Given:
+  chained marker event (no target_id) — whitelisted
+  chained clipboard event (no target_id) — not whitelisted
+When:
+  queryScopeFilteredEvents(scopeTargets)
+Then:
+  marker included
+  clipboard excluded
+```
+
+### Scenario 4: Empty scope returns all eligible events from both tiers
+
+```
+Given:
+  chained event A
+  logged event B
+  scope targets = [] (empty — no scope filtering)
+When:
+  queryScopeFilteredEvents([])
+Then:
+  both A and B included (minus excluded agent_types)
+```
+
+### Scenario 5: Excluded agent_types filtered from both tiers
+
+```
+Given:
+  logged system:process_monitor_saturated event (excluded type)
+  scope targets = []
+When:
+  queryScopeFilteredEvents([])
+Then:
+  system event excluded
+```
+
+### Scenario 6: A target subset selects every casing
+
+```
+Given:
+  chained event A with target_id = 'Example.COM'
+  logged event B with target_id = 'example.com'
+  a time-range subset over both, targetId = 'example.com'
+When:
+  the plan is previewed, then executed
+Then:
+  both select A and B — the Targets page counted them as one target
+  (SPEC-target-identity, Scenario 3)
+```
+
+## Acceptance Criteria
+
+1. `queryScopeFilteredEvents` queries BOTH `events` AND `events_logged` tables
+2. Scope filtering (target matching) applies identically to both tiers
+3. Agent type whitelist/blacklist applies identically to both tiers
+4. Result ordering is by timestamp DESC across both tiers
+5. Callers (`data-export.ts` NDJSON and scope-filtered JSON) receive events from both tiers without code changes
+6. A target subset selects every casing of the target. Preview and execute (the Timeline slice and HAR) both read through `queryEvents`, and so through the one target predicate, `targetPredicate` (`COLLATE NOCASE`, SPEC-target-identity); they still agree (Spec 038)
+
+## Property
+
+```
+∀ export preset ∈ {sharing, forensic, ...}:
+  previewCount(preset) == actualExportCount(preset)
+
+∀ event e ∈ (events ∪ events_logged):
+  eligible(e, scope) ↔ e ∈ queryScopeFilteredEvents(scope).events
+```
+
+## ExportPlan Contract
+
+Every file-producing export exposed by the main menu resolves an immutable
+plan before confirmation. The plan records the normalized format/subset,
+two-tier row boundary, scope and sharing inputs, selected Event IDs, policy
+outcome counts, expiry, and a SHA-256 fingerprint. Execution accepts the plan
+identifier instead of reconstructing those choices in the renderer.
+
+Current format semantics:
+
+| Format | Dataset boundary | Bounded view | Attachments | Sharing PII scrub |
+|---|---|---|---|---|
+| JSON | Chained + logged snapshot | No | No | Yes |
+| NDJSON | Chained + logged snapshot | No | No | Yes |
+| Evidence Bundle | Chained + logged snapshot and approved IDs | No | Yes | Unsupported; resolution is blocked |
+| HAR | Logged scanner snapshot | Time + target | Body references only | Unsupported; resolution is blocked |
+| Timeline slice | Chained + logged snapshot | Time + target | No | Yes |
+
+### Evidence Bundle attachments (Spec 040)
+
+The bundle carries four kinds of file, each only with an approved Event that
+references it: screenshots, terminal casts, HTTP bodies and operator-added
+artifacts (`file_transfer` / `artifact_added`, Spec 043).
+`src/core/export-attachments.ts` lists them, one row per file, with the targets
+tied to it and an attribution:
+
+- `target`: exactly one target;
+- `cross-target`: more than one, which a cast spanning several hosts is;
+- `unattributed`: none.
+
+A cast is never trimmed or scope-dropped: RedLog does not cut a recording, so a
+session that touched A and B is labelled as spanning both, never as A-only.
+Scope masking still drops an artifact when every target tied to it is out of scope.
+
+The operator may leave any listed file out. `ExportRequest.excludeAttachments`
+is normalised to valid bundle paths, sorted and de-duplicated, and is part of
+the request, so the plan fingerprint covers the choice. Execution re-checks the
+counts and content digests with the exclusions applied. A changed included file
+invalidates the preview even when its byte count is unchanged; excluded files
+are not frozen. The manifest records
+`excludedByOperator` plus, for each included cast, its targets and attribution.
+Source files are never modified.
+
+Bundle does not support operator-PII scrubbing. Included casts retain the exact
+approved snapshot prefix bytes, including their header, paths and identifiers;
+they are not implicitly rewritten. Later output is outside that frozen prefix.
+The operator excludes a recording if its whole approved prefix is unsuitable
+for delivery. This preserves the byte offsets referenced by command events.
+
+An unsupported requested protection is an explicit preview failure. It must not
+fall back to a legacy export or produce a success state.
+
+
+## Projection verification boundary
+
+A complete-chain bundle verifies links and the original chain head. A projection
+retains original identities/hashes without manufacturing a new chain; policy
+omission and delivery masking never rewrite the source DB. Its verifier checks
+manifest checksum, delivered-file digests, declared counts and distinct IDs, and
+hashes/signatures of eligible unchanged rows. It explicitly cannot establish
+original-chain completeness or transformed source bytes from that projection.
+Checksums and selection declarations do not authenticate source identity against
+an adversary who replaces both content and metadata. Projection success must
+state this boundary rather than report the source chain as INTACT.
+
+## Completed artifact receipt (2026-10-24, Spec 062)
+
+The export dialog retains the actual successful artifact until explicitly dismissed. A main-owned machine-local receipt permits finding the current project's last successful result again. It contains only path, format and completion time; file availability is rechecked. It is not an Export Selection or a plan and cannot authorize a new export. Failed/canceled attempts never replace it. Metadata persistence failure reports a warning without changing a successfully produced artifact into a failed export.
+
+The first export defaults to evidence bundle; applicable HTTP views still start with HAR. Explicitly remembered JSON/NDJSON/bundle choices are preserved. Other formats remain selectable without altering the frozen query, scope policy, attachments or snapshot.

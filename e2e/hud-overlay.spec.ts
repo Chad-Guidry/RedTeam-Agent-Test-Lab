@@ -1,0 +1,268 @@
+import { test, expect, _electron as electron, type ElectronApplication, type Page } from '@playwright/test'
+import { MAIN_ENTRY, REPO_ROOT, makeTempHome, openTestProject, launchWithTempHome } from './helpers'
+
+// HUD overlay geometry. The window sizes itself from `overlay:autosize`, which
+// the renderer fires on every layout-affecting render. Both halves of that
+// contract have bitten operators: the reported width is a formula rather than a
+// measurement, and the main-side x correction was one-directional.
+
+let app: ElectronApplication
+let hud: Page
+let main: Page
+
+async function bounds(a: ElectronApplication): Promise<{ x: number; width: number }> {
+  return a.evaluate(async ({ BrowserWindow }) => {
+    const w = BrowserWindow.getAllWindows().find((b) => b.webContents.getURL().includes('overlay'))!
+    const b = w.getBounds()
+    return { x: b.x, width: b.width }
+  })
+}
+
+/** Park the HUD hard against the right edge of its display. The x-correction
+ *  rule below only does anything when widening would push the window off
+ *  screen, so the test has to establish that precondition itself — it used to
+ *  come for free from the HUD's default position, which §8 moved off the right
+ *  edge and next to the notch instead. */
+async function parkAtRightEdge(a: ElectronApplication): Promise<void> {
+  await a.evaluate(async ({ BrowserWindow, screen }) => {
+    const w = BrowserWindow.getAllWindows().find((b) => b.webContents.getURL().includes('overlay'))!
+    const b = w.getBounds()
+    const area = screen.getDisplayNearestPoint({ x: b.x, y: b.y }).workArea
+    w.setBounds({ ...b, x: area.x + area.width - b.width })
+  })
+}
+
+async function autosize(page: Page, h: number, w: number): Promise<void> {
+  await page.evaluate(([hh, ww]) => {
+    ;(window as unknown as { redlog: { overlay: { autosize: (h: number, w?: number) => void } } })
+      .redlog.overlay.autosize(hh, ww)
+  }, [h, w])
+  await page.waitForTimeout(250)
+}
+
+test.describe.serial('HUD overlay geometry', () => {
+  test.beforeAll(async () => {
+    const tmpHome = makeTempHome('redlog-hud-')
+    app = await electron.launch({
+      args: [MAIN_ENTRY], cwd: REPO_ROOT,
+      env: { ...process.env, NODE_ENV: 'test', HOME: tmpHome, USERPROFILE: tmpHome, REDLOG_E2E: '1' }
+    })
+    main = await app.firstWindow()
+    await main.waitForLoadState('domcontentloaded')
+    await openTestProject(main, 'hud-geom')
+    await main.waitForTimeout(2000)
+    hud = app.windows().find((w) => w.url().includes('overlay'))!
+    expect(hud, 'overlay window never opened').toBeTruthy()
+  })
+
+  test.afterAll(async () => { if (app) await app.close() })
+
+  // Characterisation, not a fix. v0.9.4 changed the x rule to anchor to the
+  // nearer display edge so width changes were symmetric; the operator reported
+  // that the v0.9.3 HUD was correct and the new one was not, so the handler
+  // was reverted verbatim. This test now records what v0.9.3 actually does, so
+  // any future change to it is a deliberate one. The leftward drift it pins
+  // down is tracked in docs/AUDIT-2026-08-08.md rather than patched blind.
+  test('v0.9.3 behaviour: widening slides x left and narrowing does not restore it', async () => {
+    await parkAtRightEdge(app)
+    const start = await bounds(app)
+
+    await autosize(hud, 58, 720)
+    const wide = await bounds(app)
+    expect(wide.width).toBe(720)
+    expect(wide.x, 'widening slides the HUD left to keep it on screen').toBeLessThan(start.x)
+
+    await autosize(hud, 58, 440)
+    const back = await bounds(app)
+    expect(back.width).toBe(440)
+    expect(back.x, 'v0.9.3 leaves x where widening put it').toBe(wide.x)
+  })
+
+  test('reported width covers the rendered content', async () => {
+    const fit = await hud.evaluate(() => {
+      // The measured element is the one autosize reports on.
+      const el = document.querySelector('#root > div > div > div > div:last-child') as HTMLElement | null
+      const inner = el ?? (document.getElementById('root') as HTMLElement)
+      return { need: inner.scrollWidth, have: document.documentElement.clientWidth }
+    })
+    expect(fit.need, `content needs ${fit.need}px but the window is ${fit.have}px — it is being clipped`)
+      .toBeLessThanOrEqual(fit.have)
+  })
+
+  test('pointer can expand and hide the HUD', async () => {
+    const expand = hud.getByTestId('hud-expand')
+    await expand.hover()
+    await expand.click()
+    await expect(expand).toHaveText('▲')
+
+    await hud.getByTestId('hud-hide').click()
+    await expect.poll(() => app.evaluate(async ({ BrowserWindow }) =>
+      BrowserWindow.getAllWindows().find((w) => w.webContents.getURL().includes('overlay'))?.isVisible()
+    )).toBe(false)
+
+    // Restore the shared serial fixture for the following HUD checks.
+    await app.evaluate(async ({ BrowserWindow }) => {
+      BrowserWindow.getAllWindows().find((w) => w.webContents.getURL().includes('overlay'))?.show()
+    })
+    await expect.poll(() => app.evaluate(async ({ BrowserWindow }) =>
+      BrowserWindow.getAllWindows().find((w) => w.webContents.getURL().includes('overlay'))?.isVisible()
+    )).toBe(true)
+  })
+})
+
+// v0.9.7 regression: the v0.9.4 width fix measured `scrollWidth` on a flex
+// row, whose content stretches to the container — so scrollWidth tracked
+// clientWidth and each render asked for 8px more than the last. The window
+// ran away to the clamp ceiling and the x anchoring slid with it.
+test.describe.serial('HUD size stability', () => {
+  let app2: ElectronApplication
+  let hud2: Page
+
+  test.beforeAll(async () => {
+    const tmpHome = makeTempHome('redlog-hud2-')
+    app2 = await electron.launch({
+      args: [MAIN_ENTRY], cwd: REPO_ROOT,
+      env: { ...process.env, NODE_ENV: 'test', HOME: tmpHome, USERPROFILE: tmpHome, REDLOG_E2E: '1' }
+    })
+    const main = await app2.firstWindow()
+    await main.waitForLoadState('domcontentloaded')
+    await openTestProject(main, 'hud-stability')
+    await main.waitForTimeout(2500)
+    hud2 = app2.windows().find((w) => w.url().includes('overlay'))!
+  })
+
+  test.afterAll(async () => { if (app2) await app2.close() })
+
+  test('the HUD settles instead of growing on every render', async () => {
+    const read = async (): Promise<{ x: number; width: number; height: number }> =>
+      app2.evaluate(async ({ BrowserWindow }) => {
+        const w = BrowserWindow.getAllWindows().find((b) => b.webContents.getURL().includes('overlay'))!
+        const b = w.getBounds()
+        return { x: b.x, width: b.width, height: b.height }
+      })
+
+    const first = await read()
+    // Force a burst of re-renders — every one fires the autosize effect.
+    for (let i = 0; i < 8; i++) {
+      await hud2.evaluate(() => window.dispatchEvent(new Event('resize')))
+      await hud2.waitForTimeout(120)
+    }
+    const after = await read()
+
+    expect(after.width, `width drifted ${first.width} -> ${after.width} across renders`).toBe(first.width)
+    expect(after.height, `height drifted ${first.height} -> ${after.height}`).toBe(first.height)
+    expect(after.x, `x drifted ${first.x} -> ${after.x}`).toBe(first.x)
+  })
+
+  // v0.11.1: the expanded panel's label column was a hard 70px while its
+  // labels render at fs(11) — "Last check" sat on the boundary at scale 1 and
+  // wrapped to two lines, and every label wrapped at scale 1.25+. The column
+  // now scales with the type. This checks the geometry rather than a
+  // screenshot: a wrapped row is exactly twice the height of an unwrapped one.
+  test('expanded panel labels stay on one line at every offered HUD scale', async () => {
+    const main2 = app2.windows().find((w) => !w.url().includes('overlay'))!
+
+    const setScale = async (sc: number): Promise<void> => {
+      await main2.evaluate(async (s2) => {
+        const api = (window as unknown as { redlog: { config: { get: () => Promise<Record<string, unknown>>; save: (c: unknown) => Promise<unknown> } } }).redlog.config
+        const cfg = await api.get()
+        await api.save({ ...cfg, overlay: { ...(cfg.overlay as Record<string, unknown> ?? {}), scale: s2 } })
+      }, sc)
+      await hud2.waitForTimeout(500)
+    }
+    const clickChevron = async (glyph: string): Promise<void> => {
+      await hud2.evaluate((g) => {
+        const el = Array.from(document.querySelectorAll('button, div')).find((d) => d.textContent?.trim() === g) as HTMLElement | undefined
+        el?.click()
+      }, glyph)
+      await hud2.waitForTimeout(400)
+    }
+
+    // The restore belongs in a `finally`.
+    //
+    // It used to sit after the loop, guarded by nothing, under a comment
+    // naming the hazard it did not guard against: these specs share one app,
+    // so a HUD left expanded at scale 1.5 makes the compact-size check below
+    // read a large height. Any `expect` in the loop throwing skipped the
+    // restore and left the HUD that way.
+    //
+    // Today that cannot actually reach the next test — `describe.serial` with
+    // no retries stops the block on the first failure, so the compact-size
+    // check is skipped rather than misled. Verified by forcing the scale-1.5
+    // iteration to fail: the run ends 1 failed / 3 passed and the
+    // compact-size test does not run at all. So this is hardening, not a bug
+    // fix, and it is worth the four lines because all three of the conditions
+    // holding it back are incidental — turning on retries, dropping
+    // `.serial`, or adding a test between the two would each make a HUD left
+    // at the wrong height into a second, misleading failure.
+    try {
+      for (const scale of [1.0, 1.25, 1.5]) {
+        await setScale(scale)
+        await clickChevron('▼')
+
+        const wrapped = await hud2.evaluate(() => {
+          const cells = Array.from(document.querySelectorAll('div')).find((d) =>
+            getComputedStyle(d).display === 'grid' && d.children.length >= 8)
+          if (!cells) return null
+          return Array.from(cells.children).map((c) => {
+            const el = c as HTMLElement
+            const lh = parseFloat(getComputedStyle(el).lineHeight) || el.getBoundingClientRect().height
+            return { text: el.textContent?.trim().slice(0, 14), lines: Math.round(el.getBoundingClientRect().height / lh) }
+          }).filter((x) => x.lines > 1)
+        })
+        expect(wrapped, `labels wrapped at HUD scale ${scale}: ${JSON.stringify(wrapped)}`).toEqual([])
+      }
+    } finally {
+      await clickChevron('▲')   // collapse
+      await setScale(1)
+    }
+  })
+
+  test('the collapsed HUD stays at its compact size', async () => {
+    const b = await app2.evaluate(async ({ BrowserWindow }) => {
+      const w = BrowserWindow.getAllWindows().find((x) => x.webContents.getURL().includes('overlay'))!
+      return w.getBounds()
+    })
+    // Collapsed at scale 1 is a single row: 440px wide and, measured, 58px
+    // tall — 40pt of content plus HUD_CONTENT_CHROME. Runaway growth showed up
+    // here first as a window pinned near the cap.
+    //
+    // The bound used to be 120, more than twice the real height, which let the
+    // HUD double before this test noticed — and noticing is the only reason it
+    // exists. 80 keeps room for font and DPI differences across the platforms
+    // this runs on while still catching a doubling.
+    expect(b.width, 'collapsed HUD should be near its 440px base, not the ceiling').toBeLessThan(560)
+    expect(b.height, 'collapsed HUD should be one row tall').toBeLessThan(80)
+    // And it must not have collapsed to nothing: below the floor the bar is
+    // clipped, which reads as "the HUD is broken" rather than "it is small".
+    expect(b.height, 'collapsed HUD should still clear the height floor').toBeGreaterThanOrEqual(46)
+  })
+})
+
+// Native-window delivery is independent of the OS global hotkey. Playwright's
+// CDP keyboard bypasses before-input-event, so send through Electron's native
+// input pipeline instead. Manual acceptance covers actual macOS key delivery.
+test('the release chord works in main and HUD windows without enabling it again', async () => {
+  const { app, page } = await launchWithTempHome(process.env.REDLOG_PACKAGED_APP, { showHud: true })
+  try {
+    await openTestProject(page, 'hud-window-release')
+    await expect.poll(() => app.windows().some(w => w.url().includes('overlay'))).toBe(true)
+    const hud = app.windows().find(w => w.url().includes('overlay'))!
+    for (const target of [page, hud]) {
+      await page.evaluate(() => window.redlog.overlay.setPassThrough(true))
+      await expect.poll(() => page.evaluate(async () => (await window.redlog.config.get())?.overlay?.passThrough)).toBe(true)
+      const window = await app.browserWindow(target)
+      await window.evaluate(w => { w.setFocusable(true); w.show(); w.focus() })
+      await target.bringToFront()
+      const release = () => window.evaluate(w => {
+        const modifiers: ('shift' | 'meta' | 'control')[] = ['shift', process.platform === 'darwin' ? 'meta' : 'control']
+        w.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'P', modifiers })
+        w.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'P', modifiers })
+      })
+      await release()
+      await expect.poll(() => page.evaluate(async () => (await window.redlog.config.get())?.overlay?.passThrough)).toBe(false)
+      await release()
+      expect((await page.evaluate(() => window.redlog.config.get()))?.overlay?.passThrough).toBe(false)
+    }
+  } finally { await app.close() }
+})

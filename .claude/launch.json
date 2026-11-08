@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "redlog-dev",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["electron-vite", "dev", "--", "--remote-debugging-port=9222"],
+      "port": 5173,
+      "autoPort": true
+    }
+  ]
+}

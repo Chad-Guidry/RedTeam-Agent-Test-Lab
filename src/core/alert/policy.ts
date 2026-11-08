@@ -1,0 +1,120 @@
+// The Policy layer of the alert subsystem (v0.12.0).
+//
+// A **Policy** classifies signals into **verdicts**. Policies are the pure
+// half of the subsystem — no I/O, no DB, no timers. Every side effect
+// happens in a Surface consumer.
+//
+// Verdict shapes track ea's `ALERT-ROLES.md`:
+//   • Self alarm (IP) — five values on the fact/inferred/unknown authority
+//     tier, with modifiers (`settling`, `stale`, `listConflict`) that are
+//     independent of the base verdict (ea G-A2/G-A3).
+//   • Target alarm (scope) — four-rung distance ladder (`in_scope`,
+//     `excluded`, `adjacent_subnet`/`adjacent_domain`, `unrelated`) with
+//     the same authority tier attached to each rung (ea G-B4/G-C2).
+//
+// Verdicts do NOT hold references to sources or event ids — that context
+// is on the originating Signal. When a Surface writes an event it composes
+// verdict + signal into event data. Keeping verdicts self-contained keeps
+// them testable in isolation. It is also why a verdict derived from other
+// verdicts has nothing to cite: the Combined and Burst verdicts removed in
+// Spec 024 were written to the chain with no source at all.
+
+import type { IPChangeSignal, TargetHitSignal, Signal } from './signal'
+
+// ─── Authority tier (from ea's K1) ──────────────────────────────────────────
+
+/** Every verdict declares whether it is observed (`fact`), derived
+ *  (`inferred`), or absent (`unknown`). A `fact` may not be silenced by a
+ *  preference toggle; `inferred` may. `unknown` never collapses into
+ *  `safe`/`in_scope` — it is its own colour. */
+export type Authority = 'fact' | 'inferred' | 'unknown'
+
+/** The four-step severity scale shared by all verdicts (ea G-C1). Every
+ *  Surface can render / forward / count based on this alone without
+ *  knowing the underlying policy. */
+export type Severity = 'clean' | 'notice' | 'warning' | 'critical'
+
+// ─── IP verdict (Self alarm) ────────────────────────────────────────────────
+
+/** Five IP verdict values covering every reachable cell in the
+ *  `whitelist × blacklist × w × b` matrix (ea A-1..A-9). A whitelist miss
+ *  is never `safe`; a blacklist miss with no whitelist is never `safe`
+ *  either — that's the `A-9 false green` bug the vocabulary exists to
+ *  prevent. */
+export type IPVerdictKind =
+  | 'safe'           // explicit whitelist match (fact)
+  | 'presumed_safe'  // no whitelist configured, IP not on blacklist (inferred)
+  | 'off_profile'    // whitelist configured, IP not on it AND not on blacklist (fact)
+  | 'exposed'        // blacklist match (fact) — always dominates
+  | 'unknown'        // no data / no lists (unknown)
+
+export interface IPVerdict {
+  /** The verdict value itself — see `IPVerdictKind`. Named `value` (not
+   *  `kind`) so it doesn't collide with the outer `Verdict` union's
+   *  discriminator (`{kind: 'ip'}`). */
+  value: IPVerdictKind
+  authority: Authority
+  severity: Severity
+  /** Modifiers are independent of the base verdict (ea A.3). A
+   *  `settling` `safe` is still `safe` semantically — the modifier
+   *  qualifies the presentation. */
+  settling?: boolean
+  stale?: boolean
+  /** IP is on BOTH lists at once — the verdict is still `exposed` (the
+   *  worse of the two wins), and the modifier surfaces the config bug so
+   *  the operator can fix it (ea A-6 / G-A2). */
+  listConflict?: boolean
+  /** Optional LAN-profile secondary verdict computed from the internal
+   *  address (ea G-A4). Held separately so the primary badge doesn't get
+   *  confused when the operator is on-VPN externally but off-VPN on the
+   *  wired jack. */
+  lanSafety?: IPVerdictKind
+}
+
+// ─── Scope verdict (Target alarm) ───────────────────────────────────────────
+
+/** The four-rung distance ladder (ea Part B). `in_scope` is the
+ *  everything-is-fine floor; `excluded` is an explicit deny-list hit and
+ *  the strongest signal a Target verdict carries; the two `adjacent_*`
+ *  values are inferred proximity ("same subnet, wrong host" / "same
+ *  registrable domain, wrong subdomain"); `unrelated` is the residual
+ *  bucket that fires only under the strictest `alertFloor`. */
+// Where a target sits is a scope fact; the verdicts below carry it.
+import type { ScopeDistance } from '../scope-evaluator'
+
+export interface ScopeVerdict {
+  matchedBy?: string
+  distance: ScopeDistance
+  authority: Authority
+  severity: Severity
+  /** The plugin/extractor that identified the target, if any (v0.9.1
+   *  attribution). Held on the verdict so downstream surfaces can render
+   *  "flagged by rule X" without another lookup. */
+  extractorPluginId?: string
+  extractorName?: string
+}
+
+// ─── Verdict union + Policy interface ───────────────────────────────────────
+
+/** Discriminated union of every verdict shape. Surfaces switch on
+ *  `.kind` (added by the wrapper below) to route to the right renderer. */
+export type Verdict =
+  | (IPVerdict & { kind: 'ip' })
+  | (ScopeVerdict & { kind: 'scope'; signal: TargetHitSignal })
+
+/** A Policy consumes a Signal and returns 0..N verdicts. The bus feeds each
+ *  registered policy the same signal; each policy decides whether it
+ *  applies. Returning `[]` is normal — a policy that doesn't handle the
+ *  signal kind, or one whose classifier says nothing changed, produces
+ *  nothing.
+ *
+ *  A policy that holds state (the IP alarm's settling window, the scope
+ *  alarm's cached indexes) keeps it small and clears it in `reset()`. */
+export interface Policy {
+  readonly name: string
+  /** Called for every dispatched signal. Return verdicts to emit; empty
+   *  array = policy didn't fire. */
+  evaluate(signal: Signal): Verdict[]
+  /** Optional reset for test isolation and for engagement/project switches. */
+  reset?(): void
+}

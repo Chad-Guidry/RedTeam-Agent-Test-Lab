@@ -1,0 +1,217 @@
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { useI18n } from '../i18n'
+import { Button } from './Button'
+import { useFocusTrap } from '../lib/useFocusTrap'
+
+// Confirmation, graded by consequence (docs/UIUX-STANDARD.md §5.5).
+//
+// One dialog for everything means the friction is identical whether the
+// operator is clearing a filter or breaking an evidence chain, so it stops
+// being read — and the one time it mattered, it had already been trained away.
+// Three levels, and the difference between them is what the operator has to do
+// with their hands:
+//
+//   plain         Enter confirms. For anything recoverable.
+//   irreversible  a checkbox has to be ticked first. It cannot be dismissed by
+//                 reflex, because reflex does not tick boxes.
+//   chain         the project name has to be typed, and the concrete
+//                 consequences are listed above the field. Reserved for
+//                 anything touching the hash chain or the audit record.
+//
+// Level `plain` is also what the old two-argument `confirm()` produces, so
+// existing call sites keep working and get graded deliberately rather than
+// by a sweep.
+
+export type ConfirmLevel = 'plain' | 'irreversible' | 'chain'
+
+export interface ConfirmOpts {
+  title: string
+  message: string
+  level?: ConfirmLevel
+  confirmLabel?: string
+  /** Names the way out, when "Cancel" is vaguer than the thing it does.
+   *  Leaving a project is the case that asked for it: "Cancel" there could
+   *  equally mean "cancel the recording", which is the opposite. */
+  cancelLabel?: string
+  /** Concrete, itemised outcomes. §5.5: name what goes and what stays. */
+  consequences?: string[]
+  /** `chain` level: the exact string the operator has to type. */
+  requireTyped?: string
+  /** `irreversible` level: label for the acknowledgement checkbox. */
+  ackLabel?: string
+}
+
+type ConfirmFn = (opts: ConfirmOpts) => Promise<boolean>
+let _showConfirm: ConfirmFn = () => Promise.resolve(false)
+
+/** Recoverable, or at least cheap to redo. Enter confirms. */
+export function confirm(title: string, message: string, destructive = false): Promise<boolean> {
+  return _showConfirm({ title, message, level: destructive ? 'irreversible' : 'plain' })
+}
+
+/** Touches the evidence chain or the audit record. Gated by typing the
+ *  project name, with the consequences listed. */
+export function confirmChainImpact(opts: Omit<ConfirmOpts, 'level'>): Promise<boolean> {
+  return _showConfirm({ ...opts, level: 'chain' })
+}
+
+/** The graded dialog in full, for a caller that picks its own level — see
+ *  lib/leaveProject.ts, where the level follows what is actually open. */
+export function confirmGraded(opts: ConfirmOpts): Promise<boolean> {
+  return _showConfirm(opts)
+}
+
+export function ConfirmDialogContainer(): JSX.Element | null {
+  const [state, setState] = useState<(ConfirmOpts & { resolve: (v: boolean) => void }) | null>(null)
+  const { t } = useI18n()
+
+  const show = useCallback<ConfirmFn>((opts) => {
+    return new Promise((resolve) => setState({ ...opts, resolve }))
+  }, [])
+
+  useEffect(() => {
+    _showConfirm = show
+    return (): void => { _showConfirm = () => Promise.resolve(false) }
+  }, [show])
+
+  if (!state) return null
+
+  const close = (result: boolean): void => {
+    state.resolve(result)
+    setState(null)
+  }
+
+  return <ConfirmDialogInner key={state.title + state.message} state={state} close={close} t={t} />
+}
+
+function ConfirmDialogInner({ state, close, t }: {
+  state: ConfirmOpts & { resolve: (v: boolean) => void }
+  close: (result: boolean) => void
+  t: (key: string, vars?: Record<string, string | number>) => string
+}): JSX.Element {
+  const level: ConfirmLevel = state.level ?? 'plain'
+  const dialog = useRef<HTMLDivElement | null>(null)
+  const confirmBtn = useRef<HTMLButtonElement | null>(null)
+  const typedField = useRef<HTMLInputElement | null>(null)
+  const ackBox = useRef<HTMLInputElement | null>(null)
+  const [acked, setAcked] = useState(false)
+  const [typed, setTyped] = useState('')
+
+  // Armed = the operator has done the thing this level asks of them. Until
+  // then the confirm button is genuinely disabled, not just styled as such,
+  // and Enter does nothing.
+  const armed =
+    level === 'plain' ? true
+      : level === 'irreversible' ? acked
+        : typed.trim() === (state.requireTyped ?? '').trim() && typed.trim() !== ''
+
+  // Focus lands on the gate rather than the confirm button at the two graded
+  // levels: putting it on a disabled button says "you are done here" to a
+  // keyboard user at the exact moment they are not. Worse than misleading —
+  // a disabled button cannot take focus at all, so `irreversible` left focus
+  // outside the dialog entirely, which is the exact failure the trap exists to
+  // prevent. The comment said this before the code did.
+  const initialFocus = level === 'chain' ? typedField : level === 'irreversible' ? ackBox : confirmBtn
+  useFocusTrap(dialog, true, initialFocus)
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') { e.preventDefault(); close(false) }
+      // Enter only confirms once armed, and never from inside the typed field
+      // while it is still wrong — otherwise the gate is one keystroke of
+      // muscle memory away from not existing.
+      if (e.key === 'Enter' && armed) { e.preventDefault(); close(true) }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [armed, close])
+
+  return (
+    <div
+      className="fixed inset-0 z-[200] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm select-text"
+      onClick={() => close(false)}
+    >
+      <div
+        ref={dialog}
+        role="dialog"
+        aria-modal="true"
+        aria-label={state.title}
+        tabIndex={-1}
+        className="bg-redlog-surface border border-redlog-border rounded-xl shadow-2xl max-w-sm w-full max-h-full min-h-0 flex flex-col overflow-hidden animate-toast-in outline-none"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div data-testid="confirm-content" className="min-h-0 overflow-y-auto px-5 py-4 [overflow-wrap:anywhere]">
+          <h3 className="text-sm font-semibold text-redlog-text break-words mb-2">{state.title}</h3>
+          <p className="text-xs text-redlog-text-dim leading-relaxed">{state.message}</p>
+
+          {state.consequences && state.consequences.length > 0 && (
+            <ul className="mt-3 space-y-1">
+              {state.consequences.map((c) => (
+                <li key={c} className="flex gap-2 text-xs text-redlog-text-dim leading-relaxed">
+                  <span className="text-redlog-danger shrink-0" aria-hidden>•</span>
+                  <span>{c}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          {level === 'irreversible' && (
+            <label className="mt-4 flex items-start gap-2 min-h-8 py-1 text-xs text-redlog-text cursor-pointer">
+              <input
+                ref={ackBox}
+                type="checkbox"
+                checked={acked}
+                onChange={(e) => setAcked(e.target.checked)}
+                className="mt-0.5 w-4 h-4 shrink-0 accent-redlog-danger"
+              />
+              <span className="min-w-0 flex-1">{state.ackLabel ?? t('confirm.ackDefault')}</span>
+            </label>
+          )}
+
+          {level === 'chain' && (
+            <div className="mt-4">
+              {/* The name to type is set in the same prose as the instruction
+                  around it, so the exact string -- where it starts, where it
+                  ends, whether the punctuation is part of it -- had to be
+                  guessed on the app's most destructive action. It is a value
+                  now, and it looks like one. */}
+              <label htmlFor="confirm-typed" className="block text-xs text-redlog-text-dim mb-1">
+                {t('confirm.typeToConfirmBefore')}{' '}
+                <code className="font-mono text-redlog-text bg-redlog-elevated border border-redlog-border rounded px-1.5 py-0.5 select-all">
+                  {state.requireTyped ?? ''}
+                </code>{' '}
+                {t('confirm.typeToConfirmAfter')}
+              </label>
+              <input
+                id="confirm-typed"
+                ref={typedField}
+                value={typed}
+                onChange={(e) => setTyped(e.target.value)}
+                autoComplete="off"
+                spellCheck={false}
+                className="w-full px-2 py-1.5 bg-redlog-elevated border border-redlog-border rounded text-xs font-mono text-redlog-text focus:border-redlog-danger outline-none"
+              />
+            </div>
+          )}
+
+        </div>
+        <div data-testid="confirm-actions" className="shrink-0 flex flex-wrap justify-end gap-2 px-5 py-3 border-t border-redlog-border">
+          {/* Both carry the app's button geometry rather than a second,
+              smaller one invented here: a dialog is where the two controls are
+              compared most closely, and Cancel had no edge at all. */}
+          <Button level="secondary" onClick={() => close(false)}>
+            {state.cancelLabel || t('confirm.cancel')}
+          </Button>
+          <Button
+            ref={confirmBtn}
+            level={level === 'plain' ? 'secondary' : 'danger'}
+            onClick={() => close(true)}
+            disabled={!armed}
+          >
+            {state.confirmLabel || (level === 'plain' ? t('confirm.confirm') : t('confirm.delete'))}
+          </Button>
+        </div>
+      </div>
+    </div>
+  )
+}

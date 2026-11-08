@@ -1,0 +1,1315 @@
+import { readActivitySnapshot } from './dataset-snapshot'
+import { createHash } from 'node:crypto'
+import type { ActivitySnapshot } from '../activity-contract'
+import { decodeSourceSession } from '../source-sessions'
+import { getDB, getReadonlyDB, getProjectDir } from './index'
+import type { EventCausalChain, EventCausalEdge, RedLogEvent } from './event-types'
+import { rowToEvent } from './event-types'
+import { _getCachedEventCount, _setCachedEventCount } from './event-write'
+import {
+  decodeCursor, encodeCursor, buildPerArmCursorWhere, toQueryPage,
+  TIER_RANK_CHAINED, TIER_RANK_LOGGED, CANONICAL_ORDER,
+  type QueryPage, type CursorKey
+} from '../query-page'
+import type { ExportSnapshot } from '../export-plan'
+import type { StreamSegments } from '../stream-completion'
+import { evaluateScope, type ScopePolicy } from '../scope-evaluator'
+import { bodySearchCoverage, type BodySearchCoverage, searchHttpBodyEventIds, rawTranscriptFiltersUnsupported } from '../http-body-index'
+import type { ParsedQuery, QueryCondition } from '../query/contract'
+import { toFtsMatch } from '../query/fts-match'
+
+/** Operator-selected predicates shared by investigation surfaces. Scope rules
+ * are attached by trusted main-process code when `inScopeOnly` is requested. */
+export interface EventFilter {
+  targetId?: string
+  agentType?: string
+  since?: number
+  before?: number
+  inScopeOnly?: boolean
+  scope?: ScopePolicy
+  hidePersonal?: boolean
+  personalDomains?: string[]
+  /** Spec 038: `chained` reads the chained tier only; absent reads both. */
+  tier?: 'chained'
+}
+
+const scopeActive = (filter: EventFilter): boolean =>
+  !!filter.inScopeOnly && !!filter.scope && (filter.scope.targets.length > 0 || filter.scope.excludeTargets.length > 0)
+const personalActive = (filter: EventFilter): boolean =>
+  !!filter.hidePersonal && !!filter.personalDomains?.length
+
+/** The targets the scope and personal predicates decide over: every target
+ *  in the project, or only those of `ids` when the rows are already named.
+ *  Each target's decision is the same either way, so the answer for those
+ *  rows is too. Spec 038: a check of 100 live rows scanned every target of
+ *  the project, once per tier arm, which a busy second of batches could not
+ *  afford (research R10). */
+function candidateTargets(ids?: string[]): string[] {
+  const db = getReadonlyDB()
+  const named = ids ? ' AND id IN (SELECT value FROM json_each(?))' : ''
+  const params = ids ? [JSON.stringify(ids), JSON.stringify(ids)] : []
+  const rows = db.prepare(`
+    SELECT target_id FROM events WHERE target_id IS NOT NULL AND target_id <> ''${named}
+    UNION
+    SELECT target_id FROM events_logged WHERE target_id IS NOT NULL AND target_id <> ''${named}
+  `).all(...params) as Array<{ target_id: string }>
+  return rows.map((row) => row.target_id)
+}
+
+function inScopeTargetIds(filter: EventFilter, candidates: string[]): string[] {
+  const { targets, excludeTargets } = filter.scope ?? { targets: [], excludeTargets: [] }
+  return candidates.filter((target) => {
+    const decision = evaluateScope(target, { targets, excludeTargets })
+    return decision.status === 'in-scope' || decision.status === 'no-scope'
+  })
+}
+
+function personalTargetIds(filter: EventFilter, candidates: string[]): string[] {
+  return candidates.filter((target) =>
+    evaluateScope(target, { targets: [], excludeTargets: filter.personalDomains ?? [] }).status === 'excluded')
+}
+
+/** Scope and personal traffic over a target column: untargeted rows always
+ *  pass. The tier arms apply it to rows, the HTTP flow page to flow heads. */
+function appendTargetPolicy(
+  filter: EventFilter, column: string, conditions: string[], params: unknown[], ids?: string[]
+): void {
+  const byScope = scopeActive(filter)
+  const byPersonal = personalActive(filter)
+  if (!byScope && !byPersonal) return
+  const candidates = candidateTargets(ids)
+  if (byScope) {
+    conditions.push(`(${column} IS NULL OR ${column} = '' OR ${column} IN (SELECT value FROM json_each(?)))`)
+    params.push(JSON.stringify(inScopeTargetIds(filter, candidates)))
+  }
+  const personal = byPersonal ? personalTargetIds(filter, candidates) : []
+  if (personal.length) {
+    conditions.push(`(${column} IS NULL OR ${column} = '' OR ${column} NOT IN (SELECT value FROM json_each(?)))`)
+    params.push(JSON.stringify(personal))
+  }
+}
+
+/** Target identity is `target_id`, compared lowercased (SPEC-target-identity):
+ *  the Targets page groups `LOWER(target)`, so every filter has to match a
+ *  target in any casing or the two counts part. NOCASE folds ASCII, which is
+ *  what hostnames (IDN as punycode) and addresses are. The one place a target
+ *  is compared, so no reader can compare it another way. */
+export function targetPredicate(column: string): string {
+  return `${column} = ? COLLATE NOCASE`
+}
+
+/** The one evaluator of the shared filter. `arm` is the tier whose SQL this
+ *  is: a filter can exclude a whole tier, so a caller building both arms from
+ *  one call could not express it. Required so that a new caller cannot forget.
+ *  `ids`: the caller's WHERE already restricts the rows to these. */
+function appendEventFilter(
+  filter: EventFilter,
+  conditions: string[],
+  params: unknown[],
+  arm: 'chained' | 'logged',
+  alias = '',
+  ids?: string[]
+): void {
+  const col = (name: string): string => alias ? `${alias}.${name}` : name
+  // "Chained only" leaves the logged arm nothing. It is a predicate like the
+  // rest, so the arm still runs and its count is an honest 0.
+  if (filter.tier === 'chained' && arm === 'logged') conditions.push('0 = 1')
+  if (filter.agentType) { conditions.push(`${col('agent_type')} = ?`); params.push(filter.agentType) }
+  if (filter.since != null) { conditions.push(`${col('timestamp')} >= ?`); params.push(filter.since) }
+  if (filter.before != null) { conditions.push(`${col('timestamp')} <= ?`); params.push(filter.before) }
+  if (filter.targetId) { conditions.push(targetPredicate(col('target_id'))); params.push(filter.targetId) }
+  appendTargetPolicy(filter, col('target_id'), conditions, params, ids)
+}
+
+// HOUSEKEEPING_SQL (below) hides RedLog's plumbing rows, which still land in
+// the chain for audit integrity but are not the operator's activity. It is the
+// one housekeeping rule: the Timeline's pages, counts and live admission all
+// apply it here (spec 038), so no renderer copy can drift from it.
+/**
+ * What counts as the operator having DONE something, as opposed to the app
+ * talking to itself.
+ *
+ * A new, positive predicate rather than a widening of HOUSEKEEPING_SQL, which
+ * the Timeline mirrors — `system.ip_verdict` must stay visible there, and it is
+ * exactly the row that makes the negative version useless here: the alert
+ * runtime starts on every project open and the IP policy emits its first
+ * verdict unconditionally (even offline, as `unknown`), so a chained
+ * non-housekeeping row lands on a virgin project within seconds. Defining
+ * evidence as "not housekeeping" would dismiss the first-run screen before
+ * anything had been captured, and unlock a search page with nothing to find.
+ *
+ * `shell.session_end` is excluded for the same reason: a pty exiting, or an
+ * orphaned session being recovered at startup, is the app tidying up.
+ *
+ * Null-safe on purpose: the ingest stores a missing subtype as NULL, and
+ * `NOT (NULL)` is NULL, which a WHERE drops. Without the COALESCEs a shell row
+ * with no subtype, or a command row with no command, was not evidence, though
+ * isEvidence (the renderer's twin) counted it.
+ */
+export const EVIDENCE_SQL = `
+  agent_type NOT IN ('system', 'cleanup')
+  AND NOT (agent_type = 'shell' AND COALESCE(subtype, '') IN ('session_start','session_end'))
+  AND NOT (agent_type = 'terminal' AND COALESCE(subtype, '') = 'session_start')
+  AND NOT (
+    agent_type = 'shell' AND COALESCE(subtype, '') IN ('command_start','command','command_end')
+    AND (COALESCE(json_extract(data,'$.command'), '') LIKE '%shell-bash-hook.sh%' OR COALESCE(json_extract(data,'$.command'), '') LIKE '%shell-zsh-hook.zsh%' OR COALESCE(json_extract(data,'$.command'), '') LIKE '%shell-hook.ps1%')
+  )
+`
+
+/** The last pause/resume this project's record holds, or null if none. */
+export function lastRecordingSubtype(): string | null {
+  const row = getReadonlyDB().prepare(
+    `SELECT subtype FROM events
+     WHERE agent_type = 'system' AND subtype IN ('recording_paused', 'recording_resumed')
+     ORDER BY timestamp DESC, rowid DESC LIMIT 1`
+  ).get() as { subtype: string } | undefined
+  return row?.subtype ?? null
+}
+
+/** Every pause and resume, oldest first, for judging replayed gaps (#460). */
+export function recordingStateRows(): Array<{ subtype: string; timestamp: number }> {
+  return getReadonlyDB().prepare(`SELECT subtype, timestamp FROM events
+    WHERE agent_type = 'system' AND subtype IN ('recording_paused', 'recording_resumed')
+    ORDER BY timestamp ASC, rowid ASC`).all() as Array<{ subtype: string; timestamp: number }>
+}
+
+/** Durable stream boundary, including a resume before an app restart. Delayed
+ * bytes from a closed recording interval may be omitted, never replayed. */
+export function lastRecordingResumeTime(): number {
+  const row = getReadonlyDB().prepare(`SELECT timestamp FROM events
+    WHERE agent_type = 'system' AND subtype = 'recording_resumed'
+    ORDER BY timestamp DESC, rowid DESC LIMIT 1`).get() as { timestamp: number } | undefined
+  return row?.timestamp ?? 0
+}
+
+/** Historical command proof for the open project, independent of recent rows.
+ * This does not assert that the source is still running or that stdout arrived. */
+export function commandEvidence(): { builtin: boolean; external: boolean } {
+  const db = getReadonlyDB()
+  const has = (builtin: boolean): boolean => {
+    const source = builtin
+      ? "COALESCE(json_extract(data, '$.source'), '') = 'builtin-terminal'"
+      : "COALESCE(json_extract(data, '$.source'), '') <> 'builtin-terminal'"
+    const predicate = `agent_type = 'shell' AND subtype IN ('command_start','command','command_end') AND ${source} AND (${EVIDENCE_SQL})`
+    return !!db.prepare(`SELECT 1 FROM events WHERE ${predicate}
+      UNION ALL SELECT 1 FROM events_logged WHERE ${predicate} LIMIT 1`).get()
+  }
+  return { builtin: has(true), external: has(false) }
+}
+
+// Ingest now drops RedLog's own plumbing before it is written at all
+// (src/core/capture-plumbing.ts), which is the real fix — a chained row
+// cannot be removed from an export without breaking the chain. This filter
+// stays for projects recorded before that landed, and picks up the two
+// patterns the old list missed: the POSIX adapter's own prompt function, and
+// reloading the PowerShell profile (`. $PROFILE`, which is literally what the
+// install flow tells the operator to run).
+//
+// Null-safe on purpose: the ingest stores a missing subtype as NULL, and
+// `NOT (NULL)` is NULL, which a WHERE drops. Without the COALESCEs, a shell,
+// system or terminal row with no subtype, or a command row with no command,
+// was hidden as though it were housekeeping.
+export const HOUSEKEEPING_SQL = `
+  NOT (
+    (agent_type = 'system' AND COALESCE(subtype, '') IN ('api_started','session_start'))
+    OR (agent_type = 'shell' AND COALESCE(subtype, '') = 'session_start')
+    OR (agent_type = 'shell' AND COALESCE(subtype, '') = 'command_output' AND (COALESCE(json_extract(data,'$.late'), 0) = 1 OR COALESCE(json_extract(data,'$.streamed'), 0) = 1))
+    OR (agent_type = 'terminal' AND COALESCE(subtype, '') = 'session_start')
+    OR (agent_type = 'shell' AND COALESCE(subtype, '') IN ('command_start','command','command_end') AND (COALESCE(json_extract(data,'$.command'), '') LIKE '%shell-bash-hook.sh%' OR COALESCE(json_extract(data,'$.command'), '') LIKE '%shell-zsh-hook.zsh%' OR COALESCE(json_extract(data,'$.command'), '') LIKE '%shell-hook.ps1%' OR COALESCE(json_extract(data,'$.command'), '') LIKE '%tlogger_prompt_command%' OR COALESCE(json_extract(data,'$.command'), '') LIKE '%Microsoft.PowerShell_profile.ps1%'))
+  )
+`
+
+/** `tier` here picks which arms run, a wider choice than the shared filter's
+ *  "chained only", so it replaces that field rather than extending it. */
+export interface EventQueryOptions extends Omit<EventFilter, 'tier'> {
+  limit?: number
+  since?: number
+  // Time-range upper bound: return events strictly older than this wall-clock
+  // timestamp. Pagination uses `beforeCreatedAt` because wall-clock time can
+  // regress on NTP correction.
+  before?: number
+  // Preferred pager anchor — created_at is monotonic within a run (Date.now
+  // at write instant, but callers can't rewind DB insertion order) so walking
+  // strictly older rows works even under wall-clock backwards jump. v0.6.87
+  // audit A1.
+  beforeCreatedAt?: number
+  // When true, drop RedLog's own housekeeping rows (api_started, shell
+  // session_start, hook-source command_start) at the SQL
+  // layer. Previously Timeline fetched 200 rows and filtered them to ~30
+  // visible client-side, which meant the pager marked itself "all loaded"
+  // when fewer than 200 came back — but the visible count was tiny.
+  excludeHousekeeping?: boolean
+  /** v0.13.0: which tier(s) to include. Default `all` — the operator's
+   *  Timeline shows both tiers. `chained` is what the auditor view and
+   *  the bundle verifier consume; `logged` is available for
+   *  logged-tier-only queries (rare — mostly a debug affordance). */
+  tier?: 'all' | 'chained' | 'logged'
+  snapshot?: ExportSnapshot
+}
+
+export interface HttpFlowPage {
+  items: RedLogEvent[]
+  flowCount: number
+  hasMore: boolean
+  nextCursor: string | null
+}
+
+function encodeHttpFlowCursor(startTs: number, flowId: string): string {
+  return Buffer.from(JSON.stringify({ v: 1, startTs, flowId })).toString('base64url')
+}
+
+function decodeHttpFlowCursor(value?: string | null): { startTs: number; flowId: string } | null {
+  if (!value) return null
+  try {
+    const parsed = JSON.parse(Buffer.from(value, 'base64url').toString()) as Record<string, unknown>
+    return parsed.v === 1 && Number.isSafeInteger(parsed.startTs) && typeof parsed.flowId === 'string'
+      ? { startTs: parsed.startTs as number, flowId: parsed.flowId }
+      : null
+  } catch { return null }
+}
+
+/** Page complete HTTP flows, never individual rows. Shared time and target
+ * predicates apply to the request start (or earliest surviving flow row when
+ * capture began mid-flow); all request/response rows for selected flows return. */
+export interface HttpFlowQueryOptions extends EventFilter {
+  limit?: number
+  cursor?: string | null
+  snapshot?: ExportSnapshot
+  http?: { method?: string; statusPrefix?: string; host?: string; text?: string }
+}
+
+export function queryHttpFlowPage(opts: HttpFlowQueryOptions): HttpFlowPage {
+  if (opts.tier === 'chained' || (opts.agentType && opts.agentType !== 'scanner')) return { items: [], flowCount: 0, hasMore: false, nextCursor: null }
+  const db = getReadonlyDB()
+  const limit = Math.max(1, opts.limit ?? 200)
+  const cursor = decodeHttpFlowCursor(opts.cursor)
+  if (opts.cursor && !cursor) throw new Error('Invalid HTTP cursor')
+  const where: string[] = []
+  const params: unknown[] = []
+  if (opts.targetId) { where.push(targetPredicate('target_id')); params.push(opts.targetId) }
+  if (opts.since != null) { where.push('start_ts >= ?'); params.push(opts.since) }
+  if (opts.before != null) { where.push('start_ts <= ?'); params.push(opts.before) }
+  appendTargetPolicy(opts, 'target_id', where, params)
+  if (opts.http?.method) { where.push('method = ?'); params.push(opts.http.method) }
+  if (opts.http?.host) { where.push('host = ? COLLATE NOCASE'); params.push(opts.http.host) }
+  if (opts.http?.statusPrefix) { where.push("CAST(status AS TEXT) LIKE ?"); params.push(opts.http.statusPrefix + '%') }
+  if (opts.http?.text) {
+    where.push('(instr(lower(url), lower(?)) > 0 OR instr(lower(host), lower(?)) > 0 OR instr(lower(content_type), lower(?)) > 0)')
+    params.push(opts.http.text, opts.http.text, opts.http.text)
+  }
+  if (cursor) { where.push('(start_ts < ? OR (start_ts = ? AND flow_id < ?))'); params.push(cursor.startTs, cursor.startTs, cursor.flowId) }
+  const boundary = opts.snapshot?.loggedMaxRowId ?? Number.MAX_SAFE_INTEGER
+  // Rank only selection metadata: carrying inline bodies through the window
+  // sort is expensive. The second query below still returns complete evidence.
+  const heads = db.prepare(`
+    WITH records AS (
+      SELECT rowid AS source_row, timestamp, subtype, target_id,
+        json_extract(data, '$.flow_id') AS flow_id,
+        json_extract(data, '$.method') AS method,
+        json_extract(data, '$.url') AS url,
+        json_extract(data, '$.host') AS host,
+        json_extract(data, '$.status') AS status,
+        json_extract(data, '$.content_type') AS content_type
+      FROM events_logged
+      WHERE agent_type = 'scanner' AND subtype IN ('http_request_start','http_response')
+        AND rowid <= ? AND json_type(data,'$.flow_id') = 'text' AND json_extract(data,'$.flow_id') <> ''
+    ), ranked AS (
+      SELECT *, ROW_NUMBER() OVER (PARTITION BY flow_id, subtype ORDER BY
+        CASE WHEN subtype = 'http_request_start' THEN timestamp END ASC,
+        CASE WHEN subtype = 'http_response' THEN timestamp END DESC,
+        CASE WHEN subtype = 'http_request_start' THEN source_row END ASC,
+        source_row DESC) AS rank
+      FROM records
+    ), flow_heads AS (
+      SELECT flow_id,
+        COALESCE(MAX(CASE WHEN subtype='http_request_start' THEN timestamp END), MIN(timestamp)) AS start_ts,
+        COALESCE(MAX(CASE WHEN subtype='http_request_start' THEN target_id END), MAX(target_id)) AS target_id,
+        COALESCE(MAX(CASE WHEN subtype='http_request_start' THEN method END), MAX(method), '') AS method,
+        COALESCE(MAX(CASE WHEN subtype='http_request_start' THEN url END), MAX(url), '') AS url,
+        COALESCE(MAX(CASE WHEN subtype='http_request_start' THEN host END), MAX(host), '') AS host,
+        MAX(CASE WHEN subtype='http_response' THEN status END) AS status,
+        COALESCE(MAX(CASE WHEN subtype='http_response' THEN content_type END), '') AS content_type
+      FROM ranked WHERE rank = 1 GROUP BY flow_id
+    ) SELECT flow_id, start_ts FROM flow_heads ${where.length ? 'WHERE '+where.join(' AND ') : ''}
+    ORDER BY start_ts DESC, flow_id DESC LIMIT ?
+  `).all(boundary, ...params, limit + 1) as Array<{ flow_id: string; start_ts: number }>
+  const hasMore = heads.length > limit
+  const pageHeads = heads.slice(0, limit)
+  if (!pageHeads.length) return { items: [], flowCount: 0, hasMore: false, nextCursor: null }
+  const rows = db.prepare(`SELECT *, 'logged' AS tier FROM events_logged
+    WHERE agent_type='scanner' AND subtype IN ('http_request_start','http_response') AND rowid <= ?
+    AND json_extract(data,'$.flow_id') IN (SELECT value FROM json_each(?)) ORDER BY timestamp DESC, rowid DESC
+  `).all(boundary, JSON.stringify(pageHeads.map(row => row.flow_id))) as Array<Record<string, unknown>>
+  const last = pageHeads[pageHeads.length - 1]
+  return { items: rows.map(rowToEvent), flowCount: pageHeads.length, hasMore,
+    nextCursor: hasMore ? encodeHttpFlowCursor(last.start_ts, last.flow_id) : null }
+}
+
+export function queryEvents(opts: EventQueryOptions): RedLogEvent[] {
+  // Heavy read: route through the cached read-only handle so a large timeline
+  // scan doesn't serialise capture writes on the read-write connection.
+  const db = getReadonlyDB()
+  const conditions: string[] = []
+  const params: unknown[] = []
+
+  if (opts.beforeCreatedAt) {
+    conditions.push('created_at < ?')
+    params.push(opts.beforeCreatedAt)
+  }
+  if (opts.excludeHousekeeping) {
+    conditions.push(HOUSEKEEPING_SQL)
+  }
+
+  const limit = opts.limit ?? 200
+  const tier = opts.tier ?? 'all'
+  const snap = opts.snapshot
+
+  // Per-arm WHERE: the shared filter for that tier, the shared conditions,
+  // and an optional rowid upper bound from ExportSnapshot — ensures preview
+  // and execute see the same dataset.
+  const chainedConds: string[] = []
+  const chainedParams: unknown[] = []
+  const loggedConds: string[] = []
+  const loggedParams: unknown[] = []
+  const { tier: _arms, ...filterOpts } = opts
+  appendEventFilter(filterOpts, chainedConds, chainedParams, 'chained')
+  appendEventFilter(filterOpts, loggedConds, loggedParams, 'logged')
+  chainedConds.push(...conditions)
+  chainedParams.push(...params)
+  loggedConds.push(...conditions)
+  loggedParams.push(...params)
+  if (snap) {
+    chainedConds.push('rowid <= ?')
+    chainedParams.push(snap.chainedMaxRowId)
+    loggedConds.push('rowid <= ?')
+    loggedParams.push(snap.loggedMaxRowId)
+  }
+  const chainedWhere = chainedConds.length ? `WHERE ${chainedConds.join(' AND ')}` : ''
+  const loggedWhere = loggedConds.length ? `WHERE ${loggedConds.join(' AND ')}` : ''
+
+  const chainedSelect = `
+    SELECT rowid AS _row,
+           id, timestamp, engagement_id, session_id, operator_id, agent_type,
+           hostname, source_ip, target_id, data, hash, prev_hash, created_at,
+           monotonic_ns, ntp_offset_ms, signature, 'chained' AS tier
+    FROM events ${chainedWhere}
+  `
+  const loggedSelect = `
+    SELECT rowid AS _row,
+           id, timestamp, engagement_id, session_id, operator_id, agent_type,
+           hostname, source_ip, target_id, data,
+           NULL AS hash, NULL AS prev_hash, created_at,
+           NULL AS monotonic_ns, NULL AS ntp_offset_ms, NULL AS signature,
+           'logged' AS tier
+    FROM events_logged ${loggedWhere}
+  `
+
+  let sql: string
+  let bind: unknown[]
+  if (tier === 'chained') {
+    sql = `${chainedSelect} ORDER BY timestamp DESC, _row DESC LIMIT ?`
+    bind = [...chainedParams, limit]
+  } else if (tier === 'logged') {
+    sql = `${loggedSelect} ORDER BY timestamp DESC, _row DESC LIMIT ?`
+    bind = [...loggedParams, limit]
+  } else {
+    sql = `SELECT * FROM (
+             SELECT * FROM (${chainedSelect} ORDER BY timestamp DESC, _row DESC LIMIT ?)
+             UNION ALL
+             SELECT * FROM (${loggedSelect} ORDER BY timestamp DESC, _row DESC LIMIT ?)
+           ) ORDER BY timestamp DESC, _row DESC LIMIT ?`
+    bind = [...chainedParams, limit, ...loggedParams, limit, limit]
+  }
+
+  const rows = db.prepare(sql).all(...bind) as Array<Record<string, unknown>>
+  return rows.map(rowToEvent)
+}
+
+/** What a parsed query contributes to each tier's WHERE. Prepared once and
+ *  shared by the page, the count and the id match, so none of them can read
+ *  one query a second way. */
+interface PreparedQuery {
+  conditions: QueryCondition[]
+  /** FTS MATCH expression for the free text, or null when there is none. */
+  match: string | null
+  /** Event ids whose indexed HTTP body matches the text, as JSON. */
+  bodyIdsJson: string | null
+  toolSession?: ToolSessionResolution
+}
+
+const isEmptyQuery = (parsed: ParsedQuery): boolean =>
+  parsed.conditions.length === 0 && parsed.text.trim() === ''
+
+function prepareQuery(db: ReturnType<typeof getReadonlyDB>, parsed: ParsedQuery, filter?: EventFilter,snapshot?:ExportSnapshot): PreparedQuery {
+  // A bare tool-use condition has to choose a session, because the id is
+  // unique only within one. Choosing silently would let pair completion join
+  // a call from one session to a result from another, so the choice and the
+  // sessions not chosen both travel back with the page.
+  let conditions = parsed.conditions
+  let toolSession: ToolSessionResolution | undefined
+  const tool = conditions.find((c) => c.field === 'tool')
+  if (tool && !conditions.some((c) => c.field === 'session')) {
+    const sessions = sessionsForToolUse(db, tool.value)
+    if (sessions.length > 0) {
+      const [chosen, ...others] = sessions
+      toolSession = { toolUseId: tool.value, sessionId: chosen, otherSessionIds: others }
+      conditions = [...conditions, { field: 'session', value: chosen }]
+    }
+  }
+  const match = parsed.text.trim() ? toFtsMatch(parsed.text) : null
+  const bodyIdsJson = match ? JSON.stringify(searchHttpBodyEventIds(parsed.text, undefined, rawTranscriptFiltersUnsupported(conditions,filter),snapshot)) : null
+  return { conditions, match, bodyIdsJson, ...(toolSession ? { toolSession } : {}) }
+}
+
+interface TierWhereInput {
+  snapshot?: ExportSnapshot
+  query?: PreparedQuery
+  filter?: EventFilter
+  cursor?: CursorKey | null
+  excludeHousekeeping?: boolean
+  /** Restrict evaluation to these event ids. */
+  ids?: string[]
+}
+
+/** One tier's WHERE over the alias `e`, for every read that pages, counts or
+ *  checks events against the shared filter and a query. */
+function buildTierWhere(tier: 'chained' | 'logged', input: TierWhereInput): { where: string; params: unknown[] } {
+  const parts: string[] = []
+  const params: unknown[] = []
+  if (input.snapshot) {
+    parts.push('e.rowid <= ?')
+    params.push(tier === 'chained' ? input.snapshot.chainedMaxRowId : input.snapshot.loggedMaxRowId)
+  }
+  const q = input.query
+  if (q?.match) {
+    const ftsTable = tier === 'chained' ? 'events_fts' : 'events_logged_fts'
+    parts.push(`(e.rowid IN (SELECT rowid FROM ${ftsTable} WHERE ${ftsTable} MATCH ?)
+                 OR e.id IN (SELECT value FROM json_each(?)))`)
+    params.push(q.match, q.bodyIdsJson)
+  }
+  if (q) appendConditions(q.conditions, parts, params, tier)
+  appendEventFilter(input.filter ?? {}, parts, params, tier, 'e', input.ids)
+  if (input.excludeHousekeeping) parts.push(HOUSEKEEPING_SQL)
+  if (input.ids) {
+    parts.push('e.id IN (SELECT value FROM json_each(?))')
+    params.push(JSON.stringify(input.ids))
+  }
+  if (input.cursor) {
+    const c = buildPerArmCursorWhere(input.cursor, tier)
+    parts.push(c.sql.replace(/\browid\b/g, 'e.rowid'))
+    params.push(...c.params)
+  }
+  return { where: parts.length ? 'WHERE ' + parts.join(' AND ') : '', params }
+}
+
+/** Both tiers' rows through their own WHERE and per-arm limit, merged in
+ *  canonical order and cut at `limit + 1` for `hasMore`. */
+function queryTierPage(
+  db: ReturnType<typeof getReadonlyDB>,
+  chained: { where: string; params: unknown[] },
+  logged: { where: string; params: unknown[] },
+  limit: number
+): QueryPage<RedLogEvent> {
+  const perArmLimit = limit + 1
+  const sql = `
+    SELECT * FROM (
+      SELECT * FROM (
+        SELECT e.rowid AS _row,
+               e.id, e.timestamp, e.engagement_id, e.session_id, e.operator_id, e.agent_type,
+               e.hostname, e.source_ip, e.target_id, e.data, e.hash, e.prev_hash, e.created_at,
+               e.monotonic_ns, e.ntp_offset_ms, e.signature,
+               'chained' AS tier, ${TIER_RANK_CHAINED}
+        FROM events e
+        ${chained.where}
+        ORDER BY e.timestamp DESC, e.rowid DESC
+        LIMIT ?
+      )
+      UNION ALL
+      SELECT * FROM (
+        SELECT e.rowid AS _row,
+               e.id, e.timestamp, e.engagement_id, e.session_id, e.operator_id, e.agent_type,
+               e.hostname, e.source_ip, e.target_id, e.data,
+               NULL AS hash, NULL AS prev_hash, e.created_at,
+               NULL AS monotonic_ns, NULL AS ntp_offset_ms, NULL AS signature,
+               'logged' AS tier, ${TIER_RANK_LOGGED}
+        FROM events_logged e
+        ${logged.where}
+        ORDER BY e.timestamp DESC, e.rowid DESC
+        LIMIT ?
+      )
+    ) ${CANONICAL_ORDER}
+    LIMIT ?`
+
+  // No catch. The query paths this replaced returned an empty page when their
+  // statement threw, which made a failed query indistinguishable from an
+  // engagement in which nothing matched — and only the second licenses "this
+  // did not happen". The caller renders the failure; it is not this layer's
+  // to hide.
+  const rows = db.prepare(sql).all(
+    ...chained.params, perArmLimit,
+    ...logged.params, perArmLimit,
+    limit + 1
+  ) as Array<Record<string, unknown>>
+  const page = toQueryPage(rows, limit, (row) => ({
+    ts: row.timestamp as number,
+    row: row._row as number,
+    tier: row.tier as 'chained' | 'logged'
+  }))
+  return { ...page, items: page.items.map(rowToEvent) }
+}
+
+export function queryEventsPage(opts: EventFilter & {
+  snapshot?: ExportSnapshot
+  limit?: number
+  cursor?: string | null
+  /** Drop RedLog's own plumbing rows (`HOUSEKEEPING_SQL`), as the Timeline does. */
+  excludeHousekeeping?: boolean
+}): QueryPage<RedLogEvent> {
+  const db = getReadonlyDB()
+  const limit = opts.limit ?? 200
+  const cursor: CursorKey | null = opts.cursor ? decodeCursor(opts.cursor) : null
+  const input: TierWhereInput = { filter: opts, cursor, excludeHousekeeping: opts.excludeHousekeeping, snapshot: opts.snapshot }
+  return queryTierPage(db, buildTierWhere('chained', input), buildTierWhere('logged', input), limit)
+}
+
+/** Canonical predicates without paging. Activity grouping and Event reads
+ * must share these conditions; grouping is applied after this selection. */
+export function compileEventSelection(request: Omit<EventQueryRequest, 'limit' | 'cursor'>): {
+  sql: string; params: unknown[]; resolved: ParsedQuery; toolSession?: ToolSessionResolution; bodyMatchIds: string[]
+} {
+  const db = getReadonlyDB()
+  const query = prepareQuery(db, request.parsed, request.filter,request.snapshot)
+  const input: TierWhereInput = { query, filter: request.filter, snapshot: request.snapshot, excludeHousekeeping: request.excludeHousekeeping }
+  const chained = buildTierWhere('chained', input), logged = buildTierWhere('logged', input)
+  return {
+    sql: `SELECT e.id FROM events e ${chained.where} UNION SELECT e.id FROM events_logged e ${logged.where}`,
+    params: [...chained.params, ...logged.params],
+    resolved: { ...request.parsed, conditions: query.conditions },
+    toolSession: query.toolSession,
+    bodyMatchIds: query.bodyIdsJson ? JSON.parse(query.bodyIdsJson) as string[] : []
+  }
+}
+
+export interface EventCountRequest {
+  snapshot?: ExportSnapshot
+  /** Omitted: count what the filter admits, as `queryEventsPage` pages it. */
+  parsed?: ParsedQuery
+  filter?: EventFilter
+  /** Count strictly past this position, which is where the next page starts. */
+  cursor?: string | null
+  excludeHousekeeping?: boolean
+}
+
+/** How many rows the page query or the event query walks from `cursor` to
+ *  the end, over the same predicates, so "N of M" and "K earlier" can never
+ *  disagree with the rows they describe. */
+export function countEvents(req: EventCountRequest): number {
+  if (req.parsed && isEmptyQuery(req.parsed)) return 0
+  const db = getReadonlyDB()
+  const { chained, logged } = countWhere(db, req)
+  const row = db.prepare(`
+    SELECT (SELECT COUNT(*) FROM events e ${chained.where})
+         + (SELECT COUNT(*) FROM events_logged e ${logged.where}) AS n
+  `).get(...chained.params, ...logged.params) as { n: number }
+  return row.n
+}
+
+/** The two tiers' WHERE for a count request, cursor and search checks
+ *  included, so the count and the span read exactly the same rows. */
+function countWhere(db: ReturnType<typeof getReadonlyDB>, req: EventCountRequest): {
+  chained: ReturnType<typeof buildTierWhere>; logged: ReturnType<typeof buildTierWhere>
+} {
+  let cursor: CursorKey | null = null
+  if (req.cursor) {
+    cursor = decodeCursor(req.cursor)
+    // Counting from the start instead would report every row as "earlier".
+    if (!cursor) throw new Error('countEvents: unreadable cursor')
+  }
+  const input: TierWhereInput = {
+    query: req.parsed ? prepareQuery(db, cursor?.search?.parsed??req.parsed, req.filter,cursor?.search?.snapshot??req.snapshot) : undefined,
+    filter: req.filter,
+    cursor,
+    excludeHousekeeping: req.excludeHousekeeping,
+    snapshot:cursor?.search?.snapshot??req.snapshot
+  }
+  if(cursor?.search){
+    readActivitySnapshot(db,cursor.search.snapshot)
+    if(!req.parsed||searchRequestKey({...req,parsed:req.parsed})!==cursor.search.key
+      ||bodySearchCoverage(cursor.search.snapshot,undefined,{parsed:cursor.search.parsed,filter:req.filter}).revision!==cursor.search.revision)
+      throw new Error('Search index coverage or query changed; refresh the query')
+  }
+  return { chained: buildTierWhere('chained', input), logged: buildTierWhere('logged', input) }
+}
+
+/** First and last `timestamp` of the rows `countEvents` counts, or null when
+ *  there are none. The Timeline's 全階段 span reads this rather than the loaded
+ *  page, which only covers the project once every older page is fetched. */
+export function spanEvents(req: EventCountRequest): { first: number; last: number } | null {
+  if (req.parsed && isEmptyQuery(req.parsed)) return null
+  const db = getReadonlyDB()
+  const { chained, logged } = countWhere(db, req)
+  const row = db.prepare(`
+    SELECT MIN(lo) AS first, MAX(hi) AS last FROM (
+      SELECT MIN(e.timestamp) AS lo, MAX(e.timestamp) AS hi FROM events e ${chained.where}
+      UNION ALL
+      SELECT MIN(e.timestamp) AS lo, MAX(e.timestamp) AS hi FROM events_logged e ${logged.where}
+    )
+  `).get(...chained.params, ...logged.params) as { first: number | null; last: number | null }
+  return row.first == null || row.last == null ? null : { first: row.first, last: row.last }
+}
+
+export const MATCH_EVENT_IDS_MAX = 1000
+
+export interface EventMatchRequest {
+  snapshot?:ExportSnapshot
+  ids: string[]
+  /** Omitted: check the filter only. */
+  parsed?: ParsedQuery
+  filter?: EventFilter
+  excludeHousekeeping?: boolean
+}
+
+/** Which of `ids` the filter admits and, with `parsed`, the query matches, in
+ *  input order. For surfaces that already hold rows and must dim or admit
+ *  them by the same predicates a page would apply. */
+export function matchEventIds(req: EventMatchRequest): string[] {
+  // Refused, not truncated: a silently shortened answer would dim, or drop,
+  // rows the caller never learns were not checked.
+  if (req.ids.length > MATCH_EVENT_IDS_MAX) {
+    throw new Error(`matchEventIds takes at most ${MATCH_EVENT_IDS_MAX} ids`)
+  }
+  if (req.ids.length === 0) return []
+  if (req.parsed && isEmptyQuery(req.parsed)) return []
+  const db = getReadonlyDB()
+  const input: TierWhereInput = {
+    query: req.parsed ? prepareQuery(db, req.parsed, req.filter,req.snapshot) : undefined,
+    filter: req.filter,
+    excludeHousekeeping: req.excludeHousekeeping,
+    snapshot:req.snapshot,
+    ids: req.ids
+  }
+  const chained = buildTierWhere('chained', input)
+  const logged = buildTierWhere('logged', input)
+  const rows = db.prepare(`
+    SELECT e.id FROM events e ${chained.where}
+    UNION
+    SELECT e.id FROM events_logged e ${logged.where}
+  `).all(...chained.params, ...logged.params) as Array<{ id: string }>
+  const hit = new Set(rows.map((r) => r.id))
+  return req.ids.filter((id) => hit.has(id))
+}
+
+export function queryScreenshotPage(opts: {
+  limit?: number
+  cursor?: string | null
+  trigger?: string | null
+}): QueryPage<RedLogEvent> {
+  const db = getReadonlyDB()
+  const limit = opts.limit ?? 100
+  const cursor: CursorKey | null = opts.cursor ? decodeCursor(opts.cursor) : null
+
+  const baseConds = ["agent_type = 'screenshot'"]
+  const baseParams: unknown[] = []
+
+  if (opts.trigger) {
+    baseConds.push("json_extract(data, '$.trigger') = ?")
+    baseParams.push(opts.trigger)
+  }
+
+  const chainedConds = [...baseConds]
+  const loggedConds = [...baseConds]
+  const chainedParams = [...baseParams]
+  const loggedParams = [...baseParams]
+
+  if (cursor) {
+    const cc = buildPerArmCursorWhere(cursor, 'chained')
+    chainedConds.push(cc.sql)
+    chainedParams.push(...cc.params)
+
+    const lc = buildPerArmCursorWhere(cursor, 'logged')
+    loggedConds.push(lc.sql)
+    loggedParams.push(...lc.params)
+  }
+
+  const perArmLimit = limit + 1
+
+  const sql = `
+    SELECT * FROM (
+      SELECT * FROM (
+        SELECT rowid AS _row,
+               id, timestamp, engagement_id, session_id, operator_id, agent_type,
+               hostname, source_ip, target_id, data, hash, prev_hash, created_at,
+               monotonic_ns, ntp_offset_ms, signature,
+               'chained' AS tier, ${TIER_RANK_CHAINED}
+        FROM events
+        WHERE ${chainedConds.join(' AND ')}
+        ORDER BY timestamp DESC, rowid DESC
+        LIMIT ?
+      )
+      UNION ALL
+      SELECT * FROM (
+        SELECT rowid AS _row,
+               id, timestamp, engagement_id, session_id, operator_id, agent_type,
+               hostname, source_ip, target_id, data,
+               NULL AS hash, NULL AS prev_hash, created_at,
+               NULL AS monotonic_ns, NULL AS ntp_offset_ms, NULL AS signature,
+               'logged' AS tier, ${TIER_RANK_LOGGED}
+        FROM events_logged
+        WHERE ${loggedConds.join(' AND ')}
+        ORDER BY timestamp DESC, rowid DESC
+        LIMIT ?
+      )
+    ) ${CANONICAL_ORDER}
+    LIMIT ?`
+
+  const bind = [...chainedParams, perArmLimit, ...loggedParams, perArmLimit, limit + 1]
+  const rows = db.prepare(sql).all(...bind) as Array<Record<string, unknown>>
+
+  const page = toQueryPage(rows, limit, (row) => ({
+    ts: row.timestamp as number,
+    row: row._row as number,
+    tier: row.tier as 'chained' | 'logged'
+  }))
+
+  return { ...page, items: page.items.map(rowToEvent) }
+}
+
+// v0.6.96 Bug-2: O(1)-ish lookup by event id. Prior code did
+// `queryEvents({ limit: 5000 }).find(e => e.id === X)` for every replay /
+// slice request — for events older than the newest 5000, the find returned
+// undefined and the caller reported "event not found". The primary-key
+// lookup on `id` is a hash index scan, ~µs regardless of table size.
+//
+// v0.13.0: check chained table first, then logged. Chained wins on the
+// (impossible in practice) UUID collision — auditors get the chained
+// answer when there's ambiguity.
+export function queryEventById(id: string): RedLogEvent | null {
+  const db = getDB()
+  const chained = db.prepare('SELECT * FROM events WHERE id = ? LIMIT 1').get(id) as
+    Record<string, unknown> | undefined
+  if (chained) return rowToEvent({ ...chained, tier: 'chained' })
+  const logged = db.prepare('SELECT * FROM events_logged WHERE id = ? LIMIT 1').get(id) as
+    Record<string, unknown> | undefined
+  return logged ? rowToEvent({ ...logged, tier: 'logged' }) : null
+}
+
+/** A pane can have many recordings in the same project. Resolve the exact
+ * recording identity, never whichever pane start happens to fit a page. */
+export function queryBuiltinTerminalSessionStart(recordingId: string): RedLogEvent | null {
+  const row = getReadonlyDB().prepare(`SELECT * FROM events
+    WHERE agent_type = 'shell' AND subtype = 'session_start'
+      AND json_extract(data, '$.source') = 'builtin-terminal'
+      AND json_extract(data, '$.recordingId') = ?
+    ORDER BY rowid DESC LIMIT 1`).get(recordingId) as Record<string, unknown> | undefined
+  return row ? rowToEvent({ ...row, tier: 'chained' }) : null
+}
+
+export function queryBuiltinTerminalSessions(): RedLogEvent[] {
+  const rows = getReadonlyDB().prepare(`SELECT * FROM events
+    WHERE agent_type = 'shell' AND subtype IN ('session_start', 'session_end')
+      AND json_extract(data, '$.source') = 'builtin-terminal'
+    ORDER BY timestamp DESC, rowid DESC`).all() as Array<Record<string, unknown>>
+  return rows.map(row => rowToEvent({ ...row, tier: 'chained' }))
+}
+
+function eventCauses(event: RedLogEvent): string[] {
+  const raw = (event.data as { _causes?: unknown })._causes
+  return Array.isArray(raw)
+    ? [...new Set(raw.filter((id): id is string => typeof id === 'string' && id.length > 0))]
+    : []
+}
+
+function queryEventsByIds(ids: string[]): RedLogEvent[] {
+  if (ids.length === 0) return []
+  const db = getDB()
+  const json = JSON.stringify(ids)
+  const rows = db.prepare(`
+    SELECT id,timestamp,engagement_id,session_id,operator_id,agent_type,subtype,
+           hostname,source_ip,target_id,data,hash,prev_hash,created_at,
+           monotonic_ns,ntp_offset_ms,signature,'chained' AS tier
+    FROM events WHERE id IN (SELECT value FROM json_each(?))
+    UNION ALL
+    SELECT id,timestamp,engagement_id,session_id,operator_id,agent_type,subtype,
+           hostname,source_ip,target_id,data,NULL AS hash,NULL AS prev_hash,created_at,
+           NULL AS monotonic_ns,NULL AS ntp_offset_ms,NULL AS signature,'logged' AS tier
+    FROM events_logged WHERE id IN (SELECT value FROM json_each(?))
+  `).all(json, json) as Array<Record<string, unknown>>
+  return rows.map(rowToEvent)
+}
+
+function queryEffectsOf(ids: string[], limit: number): { events: RedLogEvent[]; overflow: boolean } {
+  if (ids.length === 0 || limit <= 0) return { events: [], overflow: false }
+  const db = getDB()
+  const json = JSON.stringify(ids)
+  const rows = db.prepare(`
+    SELECT * FROM (
+      SELECT e.id,e.timestamp,e.engagement_id,e.session_id,e.operator_id,e.agent_type,e.subtype,
+             e.hostname,e.source_ip,e.target_id,e.data,e.hash,e.prev_hash,e.created_at,
+             e.monotonic_ns,e.ntp_offset_ms,e.signature,'chained' AS tier
+      FROM events e
+      WHERE EXISTS (
+        SELECT 1 FROM json_each(json_extract(e.data, '$._causes')) c
+        WHERE c.type = 'text' AND c.value IN (SELECT value FROM json_each(?))
+      )
+      UNION ALL
+      SELECT e.id,e.timestamp,e.engagement_id,e.session_id,e.operator_id,e.agent_type,e.subtype,
+             e.hostname,e.source_ip,e.target_id,e.data,NULL AS hash,NULL AS prev_hash,e.created_at,
+             NULL AS monotonic_ns,NULL AS ntp_offset_ms,NULL AS signature,'logged' AS tier
+      FROM events_logged e
+      WHERE EXISTS (
+        SELECT 1 FROM json_each(json_extract(e.data, '$._causes')) c
+        WHERE c.type = 'text' AND c.value IN (SELECT value FROM json_each(?))
+      )
+    ) ORDER BY timestamp, created_at, id LIMIT ?
+  `).all(json, json, limit + 1) as Array<Record<string, unknown>>
+  return { events: rows.slice(0, limit).map(rowToEvent), overflow: rows.length > limit }
+}
+
+function hasUnseenCausalNeighbor(
+  frontier: RedLogEvent[],
+  found: ReadonlyMap<string, RedLogEvent>,
+  unavailable: Set<string>
+): boolean {
+  const parentIds = [...new Set(frontier.flatMap(eventCauses))].filter((id) => !found.has(id))
+  const parents = queryEventsByIds(parentIds)
+  const parentFound = new Set(parents.map((event) => event.id))
+  for (const id of parentIds) if (!parentFound.has(id)) unavailable.add(id)
+  if (parents.length > 0) return true
+
+  // At most `found.size` rows can be already known. Asking for one more means
+  // any reachable unseen effect must appear before the bound is exhausted.
+  const effects = queryEffectsOf(frontier.map((event) => event.id), found.size + 1)
+  return effects.overflow || effects.events.some((event) => !found.has(event.id))
+}
+
+/** Traverse the causal component around one event across both storage tiers.
+ * The result is independent of Timeline pagination and deliberately ignores
+ * list filters: hiding linked evidence would make provenance misleading. */
+export function queryEventCausalChain(
+  anchorId: string,
+  opts: { maxDepth?: number; eventLimit?: number } = {}
+): EventCausalChain {
+  const maxDepth = Math.max(0, Math.min(50, Math.trunc(opts.maxDepth ?? 20)))
+  const eventLimit = Math.max(1, Math.min(500, Math.trunc(opts.eventLimit ?? 200)))
+  const anchor = queryEventById(anchorId)
+  if (!anchor) return { anchorId, anchorFound: false, events: [], edges: [], unavailableCauseIds: [], truncated: false }
+
+  const found = new Map<string, RedLogEvent>([[anchor.id, anchor]])
+  const edgeMap = new Map<string, EventCausalEdge>()
+  const unavailable = new Set<string>()
+  let frontier = [anchor]
+  let truncated = false
+
+  for (let depth = 0; frontier.length > 0; depth++) {
+    if (depth >= maxDepth) {
+      truncated = hasUnseenCausalNeighbor(frontier, found, unavailable)
+      break
+    }
+    const frontierIds = new Set(frontier.map((event) => event.id))
+    const parentIds = new Set<string>()
+    for (const effect of frontier) {
+      for (const causeId of eventCauses(effect)) {
+        edgeMap.set(`${causeId}\0${effect.id}`, { causeId, effectId: effect.id })
+        if (!found.has(causeId)) parentIds.add(causeId)
+      }
+    }
+
+    const remaining = eventLimit - found.size
+    if (remaining <= 0) {
+      truncated = hasUnseenCausalNeighbor(frontier, found, unavailable)
+      break
+    }
+    const parents = queryEventsByIds([...parentIds])
+    const parentFound = new Set(parents.map((event) => event.id))
+    for (const id of parentIds) if (!parentFound.has(id)) unavailable.add(id)
+
+    const roomAfterParents = Math.max(0, remaining - parents.length)
+    const effects = queryEffectsOf([...frontierIds], roomAfterParents)
+    if (parents.length > remaining || effects.overflow) truncated = true
+    const candidates = [...parents, ...effects.events]
+    const next: RedLogEvent[] = []
+    for (const event of candidates) {
+      for (const causeId of eventCauses(event)) {
+        if (frontierIds.has(causeId) || found.has(causeId) || parentIds.has(causeId)) {
+          edgeMap.set(`${causeId}\0${event.id}`, { causeId, effectId: event.id })
+        }
+      }
+      if (found.has(event.id)) continue
+      if (found.size >= eventLimit) { truncated = true; break }
+      found.set(event.id, event)
+      next.push(event)
+    }
+    frontier = next
+    if (truncated && found.size >= eventLimit) break
+  }
+
+  const events = [...found.values()].sort((a, b) => a.timestamp - b.timestamp || a.createdAt - b.createdAt || a.id.localeCompare(b.id))
+  const visibleIds = new Set(events.map((event) => event.id))
+  const edges = [...edgeMap.values()].filter((edge) => visibleIds.has(edge.effectId))
+  return {
+    anchorId,
+    anchorFound: true,
+    events,
+    edges,
+    unavailableCauseIds: [...unavailable].sort(),
+    truncated
+  }
+}
+
+/** Every amendment addressed at any of `markerIds`, oldest first.
+ *
+ *  Both tables are queried even though `marker` is chained and the logged arm is
+ *  expected to come back empty: "which table is this type in" is a fact about
+ *  today's classifier, and a reader that hard-codes it silently returns half an
+ *  answer the day that changes. The union projects its tier literally because
+ *  `rowToEvent` defaults a missing hint to `chained` — a logged row would
+ *  otherwise arrive claiming a hash chain it was never part of.
+ *
+ *  `ORDER BY created_at, _row` is insertion order, not wall clock: the fold's
+ *  "the latest correction wins" must mean the one written last, and wall clock
+ *  regresses on an NTP correction. */
+export function queryMarkerAmendments(markerIds: string[]): RedLogEvent[] {
+  if (markerIds.length === 0) return []
+  const db = getDB()
+  const out: RedLogEvent[] = []
+  // SQLITE_MAX_VARIABLE_NUMBER is 999 by default and the ids bind twice (once
+  // per arm), so chunk well under half of it.
+  for (let i = 0; i < markerIds.length; i += 400) {
+    const chunk = markerIds.slice(i, i + 400)
+    const holes = chunk.map(() => '?').join(',')
+    const where = `WHERE agent_type = 'marker'
+                     AND subtype = 'amended'
+                     AND json_extract(data, '$.markerId') IN (${holes})`
+    const chained = `
+      SELECT rowid AS _row,
+             id, timestamp, engagement_id, session_id, operator_id, agent_type,
+             hostname, source_ip, target_id, data, hash, prev_hash, created_at,
+             monotonic_ns, ntp_offset_ms, signature, 'chained' AS tier
+      FROM events ${where}
+    `
+    const logged = `
+      SELECT rowid AS _row,
+             id, timestamp, engagement_id, session_id, operator_id, agent_type,
+             hostname, source_ip, target_id, data,
+             NULL AS hash, NULL AS prev_hash, created_at,
+             NULL AS monotonic_ns, NULL AS ntp_offset_ms, NULL AS signature,
+             'logged' AS tier
+      FROM events_logged ${where}
+    `
+    const rows = db.prepare(
+      `SELECT * FROM (${chained} UNION ALL ${logged}) ORDER BY created_at ASC, _row ASC`
+    ).all(...chunk, ...chunk) as Array<Record<string, unknown>>
+    for (const r of rows) out.push(rowToEvent(r))
+  }
+  return out
+}
+
+export function queryByFlowId(flowId: string): RedLogEvent[] {
+  const db = getDB()
+  const rows = db.prepare(
+    `SELECT *, 'logged' AS tier FROM events_logged
+     WHERE agent_type = 'scanner' AND json_extract(data, '$.flow_id') = ?
+       AND COALESCE(subtype, '') NOT IN ('http_response_chunk', 'ws_message', 'websocket_end')
+     ORDER BY timestamp ASC LIMIT 10`
+  ).all(flowId) as Array<Record<string, unknown>>
+  return rows.map(rowToEvent)
+}
+
+/** What one streamed flow kept: distinct chunks and messages, so a retried
+ *  row is not counted twice, and its newest close. Both IN lists are the
+ *  partial indexes' own (see db/index.ts). */
+export function queryStreamSegments(flowId: string): StreamSegments {
+  const db = getReadonlyDB()
+  const STREAM = `agent_type = 'scanner' AND subtype IN ('http_response_chunk', 'ws_message', 'websocket_end', 'http_error', 'tcp_message', 'tcp_end')
+    AND json_extract(data, '$.flow_id') = ?`
+  const HTTP = `agent_type = 'scanner' AND subtype IN ('http_request_start', 'http_response')
+    AND json_extract(data, '$.flow_id') = ?`
+  const counts = db.prepare(`SELECT
+      COUNT(DISTINCT CASE WHEN subtype = 'http_response_chunk' THEN json_extract(data, '$.seq') END) AS chunks,
+      COUNT(DISTINCT CASE WHEN subtype IN ('ws_message', 'tcp_message') THEN COALESCE(json_extract(data, '$.message_count'), id) END) AS messages
+    FROM events_logged WHERE ${STREAM}`).get(flowId) as { chunks: number; messages: number }
+  const newest = (where: string, closing: string) => db.prepare(`SELECT data, timestamp FROM events_logged
+    WHERE ${where} AND subtype IN (${closing}) AND json_extract(data, '$.streamed') = 1
+    ORDER BY timestamp DESC, rowid DESC LIMIT 1`).get(flowId) as { data: string; timestamp: number } | undefined
+  const closes = [newest(STREAM, `'websocket_end', 'http_error', 'tcp_end'`), newest(HTTP, `'http_response'`)]
+    .filter((row): row is { data: string; timestamp: number } => !!row)
+    .sort((a, b) => b.timestamp - a.timestamp)
+  let terminal: Record<string, unknown> | null = null
+  if (closes[0]) { try { terminal = JSON.parse(closes[0].data) as Record<string, unknown> } catch { terminal = null } }
+  return { terminal, savedChunks: counts.chunks, savedMessages: counts.messages }
+}
+
+/** The output a command printed after its prompt came back, in the order it was
+ *  sent. These rows are hidden from the Timeline (HOUSEKEEPING_SQL) because they
+ *  belong to the command, not beside it; the command's detail reads them here.
+ *  Both tiers, because a chunk lands wherever its command did. */
+export function queryCommandOutput(commandId: string, limit = 2000, snapshot?: ExportSnapshot): RedLogEvent[] {
+  const db = getReadonlyDB()
+  const where = `agent_type = 'shell' AND subtype = 'command_output'
+     AND json_extract(data, '$.command_id') = ? AND (json_extract(data, '$.late') = 1 OR json_extract(data, '$.streamed') = 1)`
+  // Bound the rows crossing into JS, after deduplicating retries across tiers.
+  // Export passes -1 with its frozen snapshot before retries are deduplicated.
+  const fields = 'id, timestamp, engagement_id, session_id, operator_id, agent_type, hostname, source_ip, target_id, data, created_at'
+  const rows = db.prepare(`WITH chunks AS (
+    SELECT ${fields}, monotonic_ns, ntp_offset_ms, hash, prev_hash, signature, 'chained' AS tier FROM events WHERE ${where} AND rowid <= ?
+    UNION ALL SELECT ${fields}, NULL AS monotonic_ns, NULL AS ntp_offset_ms, NULL AS hash, NULL AS prev_hash, NULL AS signature, 'logged' AS tier FROM events_logged WHERE ${where} AND rowid <= ?
+  ), ranked AS (
+    SELECT *, ROW_NUMBER() OVER (
+      PARTITION BY CASE WHEN json_type(data, '$.seq') IN ('integer', 'real') THEN json_extract(data, '$.seq') ELSE id END
+      ORDER BY timestamp, created_at, id
+    ) AS chunk_rank FROM chunks
+  ) SELECT * FROM ranked WHERE chunk_rank = 1
+    ORDER BY COALESCE(json_extract(data, '$.seq'), 0), timestamp, id LIMIT ?`)
+    .all(commandId, snapshot?.chainedMaxRowId ?? Number.MAX_SAFE_INTEGER, commandId, snapshot?.loggedMaxRowId ?? Number.MAX_SAFE_INTEGER, limit < 0 ? -1 : limit) as Array<Record<string, unknown>>
+  return rows.map(rowToEvent)
+
+}
+
+/** The `command_end` rows of the given commands, either tier. A search hit on a
+ *  command's background output is shown as the command itself, so it needs the
+ *  row the Timeline can open. */
+export function queryCommandEnds(commandIds: string[]): RedLogEvent[] {
+  const ids = [...new Set(commandIds.filter((id) => typeof id === 'string' && id !== ''))].slice(0, 100)
+  if (ids.length === 0) return []
+  const db = getReadonlyDB()
+  const marks = ids.map(() => '?').join(',')
+  const where = `agent_type = 'shell' AND subtype = 'command_end' AND json_extract(data, '$.command_id') IN (${marks})`
+  return [
+    ...(db.prepare(`SELECT *, 'chained' AS tier FROM events WHERE ${where}`).all(...ids) as Array<Record<string, unknown>>),
+    ...(db.prepare(`SELECT *, 'logged' AS tier FROM events_logged WHERE ${where}`).all(...ids) as Array<Record<string, unknown>>)
+  ].map(rowToEvent)
+}
+
+/** Count rows in the chained tier by default. The chain-anchor code path
+ *  MUST see chained-only (that count sizes the head hash). v0.13.0 adds
+ *  the `tier` option for renderer / capture-health callers that want the
+ *  total or the logged-tier row count. */
+export function getEventCount(opts?: { tier?: 'chained' | 'logged' | 'all' }): number {
+  const tier = opts?.tier ?? 'chained'
+  if (tier === 'chained') {
+    const cached = _getCachedEventCount()
+    if (cached !== null) return cached
+    const db = getDB()
+    const row = db.prepare('SELECT COUNT(*) as count FROM events').get() as { count: number }
+    _setCachedEventCount(row.count)
+    return row.count
+  }
+  const db = getDB()
+  if (tier === 'logged') {
+    const row = db.prepare('SELECT COUNT(*) as count FROM events_logged').get() as { count: number }
+    return row.count
+  }
+  // 'all'
+  const cached = _getCachedEventCount()
+  const chained = cached !== null
+    ? cached
+    : (db.prepare('SELECT COUNT(*) as count FROM events').get() as { count: number }).count
+  const logged = (db.prepare('SELECT COUNT(*) as count FROM events_logged').get() as { count: number }).count
+  return chained + logged
+}
+
+export function distinctAgentTypes(): string[] {
+  const db = getReadonlyDB()
+  const rows = db.prepare(
+    `SELECT agent_type FROM (
+       SELECT DISTINCT agent_type FROM events
+       UNION
+       SELECT DISTINCT agent_type FROM events_logged
+     ) ORDER BY agent_type`
+  ).all() as Array<{ agent_type: string }>
+  return rows.map((r) => r.agent_type)
+}
+
+/** Secrets found, not detection events: one detection can hold several, and
+ *  the Loot page counts each one. */
+export function getLootCount(): number {
+  const db = getReadonlyDB()
+  const row = db.prepare(
+    "SELECT COALESCE(SUM(json_array_length(data, '$.matches')), 0) as count FROM events WHERE agent_type = 'loot'"
+  ).get() as { count: number }
+  return row.count
+}
+
+export interface EventQueryRequest {
+  snapshot?: ExportSnapshot
+  parsed: ParsedQuery
+  filter?: EventFilter
+  limit?: number
+  cursor?: string | null
+  /** Drop RedLog's own plumbing rows, as the Timeline's pages do. */
+  excludeHousekeeping?: boolean
+}
+
+/**
+ * A tool-use ID is unique only within a session — `buildBlocks` has always
+ * paired on `${session_id}:${tool_use_id}`. When the operator supplies no
+ * session, one is chosen and reported, together with the sessions that were
+ * not chosen, so the narrowing is visible rather than silent.
+ */
+export interface ToolSessionResolution {
+  toolUseId: string
+  sessionId: string
+  otherSessionIds: string[]
+}
+
+export interface EventQueryResult extends QueryPage<RedLogEvent> {
+  bodyCoverage?: BodySearchCoverage
+  toolSession?: ToolSessionResolution
+}
+
+/**
+ * Condition predicates, per tier. A condition resolves against its stored
+ * field, never against text — `data` is one FTS blob, so an id quoted inside
+ * unrelated output is findable there and would otherwise pass as an exact hit.
+ */
+function appendConditions(
+  conditions: QueryCondition[],
+  sqlParts: string[],
+  params: unknown[],
+  tier: 'chained' | 'logged'
+): void {
+  for (const c of conditions) {
+    switch (c.field) {
+      case 'event':
+        sqlParts.push('e.id = ?')
+        params.push(c.value)
+        break
+      case 'session':
+        sqlParts.push("json_extract(e.data, '$.session_id') = ?")
+        params.push(c.value)
+        break
+      case 'transcript':
+        // `events` carries an indexed column; `events_logged` has no such
+        // column, so the same value is read back out of `data` there.
+        if (tier === 'chained') sqlParts.push('e.transcript_uuid = ?')
+        else sqlParts.push("json_extract(e.data, '$.transcript_uuid') = ?")
+        params.push(c.value)
+        break
+      case 'tool':
+        sqlParts.push("json_extract(e.data, '$.tool_use_id') = ?")
+        params.push(c.value)
+        break
+      case 'provider':
+        sqlParts.push("e.agent_type='agent' AND json_extract(e.data,'$.agent')=?")
+        params.push(c.value)
+        break
+      case 'source': {
+        const tuple=decodeSourceSession(c.value)
+        sqlParts.push(`e.engagement_id=? AND e.session_id=? AND e.agent_type=? AND json_extract(e.data,'$.${tuple[3]==='agent' ? 'agent' : 'shell'}')=? AND json_extract(e.data,'$.${tuple[3]==='agent' ? 'session_id' : 'terminalId'}')=?`)
+        params.push(...tuple.slice(1))
+        break
+      }
+      case 'operator':
+        sqlParts.push('e.operator_id = ?')
+        params.push(c.value)
+        break
+    }
+  }
+}
+
+/** Sessions containing a tool-use id, newest first. Two tiers, one statement. */
+function sessionsForToolUse(db: ReturnType<typeof getReadonlyDB>, toolUseId: string): string[] {
+  const rows = db.prepare(`
+    SELECT session, MAX(ts) AS ts FROM (
+      SELECT json_extract(data, '$.session_id') AS session, timestamp AS ts
+      FROM events WHERE json_extract(data, '$.tool_use_id') = ?
+      UNION ALL
+      SELECT json_extract(data, '$.session_id') AS session, timestamp AS ts
+      FROM events_logged WHERE json_extract(data, '$.tool_use_id') = ?
+    )
+    WHERE session IS NOT NULL
+    GROUP BY session
+    ORDER BY ts DESC`).all(toolUseId, toolUseId) as Array<{ session: string }>
+  return rows.map((r) => r.session)
+}
+
+export function executeEventQuery(request: EventQueryRequest): EventQueryResult {
+  // Nothing asked, nothing answered. A query with neither text nor conditions
+  // would otherwise be an unfiltered read, and a surface that sent one by
+  // accident — `""` parses to empty text — would present the whole dataset as
+  // its results. A conditions-only query is still a query.
+  if (request.parsed.conditions.length === 0 && request.parsed.text.trim() === '') {
+    return { items: [], hasMore: false, nextCursor: null }
+  }
+  const db = getReadonlyDB()
+  if(request.snapshot && 'chainedCount' in request.snapshot)readActivitySnapshot(db,request.snapshot as ActivitySnapshot)
+  const limit = request.limit ?? 100
+  const cursor: CursorKey | null = request.cursor ? decodeCursor(request.cursor) : null
+  if(request.cursor&&!cursor)throw new Error('Unreadable search cursor')
+  const key=searchRequestKey(request)
+  if(cursor?.search&&cursor.search.key!==key)throw new Error('Search query changed; refresh the query')
+  const snapshot=cursor?.search?.snapshot??request.snapshot??readActivitySnapshot(db)
+  if('chainedCount' in snapshot)readActivitySnapshot(db,snapshot as ActivitySnapshot)
+  const parsed=cursor?.search?.parsed??request.parsed
+  const query = prepareQuery(db, parsed, request.filter,snapshot)
+  const resolved={...parsed,conditions:query.conditions}
+  const coverage=request.parsed.text.trim()?bodySearchCoverage(snapshot,undefined,{parsed:resolved,filter:request.filter}):undefined
+  if(cursor?.search&&cursor.search.revision!==coverage?.revision)throw new Error('Search index coverage changed; refresh the query')
+  const input: TierWhereInput = {
+    query, filter: request.filter, cursor, excludeHousekeeping: request.excludeHousekeeping, snapshot
+  }
+  const page = queryTierPage(db, buildTierWhere('chained', input), buildTierWhere('logged', input), limit)
+  const toolSession=cursor?.search?.toolSession??query.toolSession
+  if(page.nextCursor&&coverage&&'chainedCount' in snapshot){
+    page.nextCursor=encodeCursor({...decodeCursor(page.nextCursor)!,search:{key,revision:coverage.revision,snapshot:snapshot as ActivitySnapshot,
+      parsed:resolved,...(toolSession?{toolSession}:{})}})
+  }
+  return { ...page, bodyCoverage:coverage, ...(toolSession ? { toolSession } : {}) }
+}
+
+function searchRequestKey(request:Pick<EventQueryRequest,'parsed'|'filter'|'excludeHousekeeping'>):string {
+  return createHash('sha256').update(JSON.stringify([getProjectDir(),request.parsed.text,request.parsed.conditions,request.filter??{},request.excludeHousekeeping??false])).digest('hex')
+}
+
+/** Identifies one tool exchange. Unique only as a pair; see ToolSessionResolution. */
+export interface ToolPairKey {
+  sessionId: string
+  toolUseId: string
+  provider: string
+  engagementId: string
+  captureSessionId: string
+}
+
+/**
+ * Spec 017: fetch the counterparts for every unpaired tool record on a page in
+ * one pass. A page of the agent bucket holds up to 800 records, so completing
+ * pairs one lookup at a time is N+1 against the store for a single scroll.
+ */
+export function fetchToolCounterparts(keys: ToolPairKey[]): RedLogEvent[] {
+  const fields = ['sessionId', 'toolUseId', 'provider', 'engagementId', 'captureSessionId'] as const
+  if (!Array.isArray(keys) || keys.some(key => !key || fields.some(field => typeof key[field] !== 'string' || !key[field]))) {
+    throw new Error('Invalid tool pair identity')
+  }
+  if (keys.length === 0) return []
+  const db = getReadonlyDB()
+
+  // The keys travel as one JSON array and are joined against, so the statement
+  // count is the same for fifty keys as for five. Matching on the identity fields
+  // separately rather than on a concatenation avoids inventing a separator
+  // that an id could itself contain.
+  const keysJson = JSON.stringify(keys.map((k) => ({ s: k.sessionId, t: k.toolUseId, p: k.provider, g: k.engagementId, b: k.captureSessionId })))
+  const arm = (table: string, extra: string): string => `
+    SELECT e.rowid AS _row,
+           e.id, e.timestamp, e.engagement_id, e.session_id, e.operator_id, e.agent_type,
+           e.hostname, e.source_ip, e.target_id, e.data, ${extra}, e.created_at,
+           '${table === 'events' ? 'chained' : 'logged'}' AS tier,
+           ${table === 'events' ? TIER_RANK_CHAINED : TIER_RANK_LOGGED}
+    FROM ${table} e
+    JOIN json_each(?) k
+      ON json_extract(k.value, '$.s') = json_extract(e.data, '$.session_id')
+     AND json_extract(k.value, '$.t') = json_extract(e.data, '$.tool_use_id')
+     AND json_extract(k.value, '$.p') = json_extract(e.data, '$.agent')
+     AND json_extract(k.value, '$.g') = e.engagement_id
+     AND json_extract(k.value, '$.b') = e.session_id
+    WHERE e.agent_type = 'agent'
+      AND json_extract(e.data, '$.subtype') IN ('tool_call', 'tool_result', 'tool_interrupted')`
+
+  const rows = db.prepare(`
+    SELECT * FROM (
+      ${arm('events', 'e.hash, e.prev_hash, e.monotonic_ns, e.ntp_offset_ms, e.signature')}
+      UNION ALL
+      ${arm('events_logged', 'NULL AS hash, NULL AS prev_hash, NULL AS monotonic_ns, NULL AS ntp_offset_ms, NULL AS signature')}
+    ) ${CANONICAL_ORDER}`).all(keysJson, keysJson) as Array<Record<string, unknown>>
+
+  return rows.map(rowToEvent)
+}

@@ -1,0 +1,199 @@
+import crypto from 'crypto'
+import fs from 'fs'
+import path from 'path'
+import { homedir } from 'os'
+import { restrictToOwner } from './fs-acl'
+
+// v0.6.89: per-event Ed25519 signature closes the ≤59-minute rewrite window
+// left open by hash chain + hourly OTS anchor. Each operator has a keypair;
+// events they insert get signed at write time; verifyChainFullAsync walks each
+// row's signature against the operator's stored public key.
+//
+// Storage:
+//   Private key: ~/.redlog/keys/<operator_id>.key   (raw 32 bytes, base64, 0600)
+//   Public  key: ~/.redlog/keys/<operator_id>.pub   (raw 32 bytes, base64)
+//                also mirrored into operators.signer_pub_key so verify never
+//                needs the disk-side .pub — the DB is authoritative for
+//                history. The disk .pub is a convenience artifact.
+//   Signature:   base64 of raw 64-byte Ed25519 signature (Node's default
+//                output shape for crypto.sign(null, msg, ed25519Key)).
+//
+// Why JWK internally instead of raw import? Node's crypto.createPublicKey /
+// crypto.createPrivateKey rejects { format: 'raw' } (verified on Node 24 —
+// the option is documented but unimplemented for OKP keys). JWK is the
+// portable path: raw bytes go base64url into { crv, kty, x[, d] }, and both
+// key factories accept format: 'jwk'.
+
+// Tests set REDLOG_KEYS_DIR to isolate from the operator's real ~/.redlog/keys
+// directory. Production leaves it unset and lands under homedir().
+function keysDir(): string {
+  return process.env.REDLOG_KEYS_DIR || path.join(homedir(), '.redlog', 'keys')
+}
+
+function ensureKeysDir(): string {
+  const dir = keysDir()
+  // v0.6.96 Sec-2: create with mode 0700 so other local UIDs can't LIST the
+  // keys directory. Private key files inside are already 0600 so their
+  // contents were never readable, but dir enumeration leaked which operators
+  // existed. `recursive: true` respects `mode` only for created leaves — if
+  // dir already exists we chmod to be sure. Windows: no-op (POSIX perms).
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+  if (process.platform === 'win32') {
+    try { restrictToOwner(dir) } catch { /* best-effort */ }
+  } else {
+    try { fs.chmodSync(dir, 0o700) } catch { /* pre-existing, permission denied */ }
+  }
+  return dir
+}
+
+function privateKeyPath(operatorId: string): string {
+  return path.join(keysDir(), `${operatorId}.key`)
+}
+
+function publicKeyPath(operatorId: string): string {
+  return path.join(keysDir(), `${operatorId}.pub`)
+}
+
+// Wrap 32-byte raw public key into a KeyObject via JWK. The Ed25519 SPKI DER
+// prefix is a constant (`302a300506032b6570032100`) so we could hand-splice
+// it, but JWK is boring and future-proof.
+function publicKeyFromRaw(rawB64: string): crypto.KeyObject {
+  const raw = Buffer.from(rawB64, 'base64')
+  if (raw.length !== 32) throw new Error(`ed25519 public key must be 32 bytes, got ${raw.length}`)
+  return crypto.createPublicKey({
+    key: { crv: 'Ed25519', kty: 'OKP', x: raw.toString('base64url') },
+    format: 'jwk'
+  })
+}
+
+function privateKeyFromRaw(rawPrivB64: string, rawPubB64: string): crypto.KeyObject {
+  const priv = Buffer.from(rawPrivB64, 'base64')
+  const pub = Buffer.from(rawPubB64, 'base64')
+  if (priv.length !== 32) throw new Error(`ed25519 private key must be 32 bytes, got ${priv.length}`)
+  if (pub.length !== 32) throw new Error(`ed25519 public key must be 32 bytes, got ${pub.length}`)
+  return crypto.createPrivateKey({
+    key: {
+      crv: 'Ed25519', kty: 'OKP',
+      x: pub.toString('base64url'),
+      d: priv.toString('base64url')
+    },
+    format: 'jwk'
+  })
+}
+
+export interface OperatorKeyPair {
+  publicKey: string        // base64 raw 32 bytes
+  privateKeyPath: string   // absolute path to the .key file
+}
+
+// An operator identity is shared across projects. Creating that operator in
+// another DB must not rotate the key and invalidate the first project's rows.
+// A damaged/partial pair is an error; neither surviving half is overwritten.
+export function generateOperatorKeyPair(operatorId: string): OperatorKeyPair {
+  ensureKeysDir()
+  const privPath = privateKeyPath(operatorId)
+  const pubPath = publicKeyPath(operatorId)
+  const havePrivate = fs.existsSync(privPath), havePublic = fs.existsSync(pubPath)
+  if (havePrivate !== havePublic) throw new Error('Operator signing keypair is incomplete')
+  if (havePrivate) {
+    const pubB64 = fs.readFileSync(pubPath, 'utf8').trim()
+    const key = privateKeyFromRaw(fs.readFileSync(privPath, 'utf8').trim(), pubB64)
+    const probe = Buffer.from('redlog signing identity check')
+    if (!crypto.verify(null, probe, publicKeyFromRaw(pubB64), crypto.sign(null, probe, key))) {
+      throw new Error('Operator signing keypair does not match')
+    }
+    resetSigningCache(operatorId)
+    return { publicKey: pubB64, privateKeyPath: privPath }
+  }
+  const kp = crypto.generateKeyPairSync('ed25519')
+  // Export as JWK to pull the raw 32-byte halves (jwk.d = private, jwk.x = pub).
+  const jwkPriv = kp.privateKey.export({ format: 'jwk' }) as { d: string; x: string }
+  const privRaw = Buffer.from(jwkPriv.d, 'base64url')
+  const pubRaw = Buffer.from(jwkPriv.x, 'base64url')
+  const privB64 = privRaw.toString('base64')
+  const pubB64 = pubRaw.toString('base64')
+
+  fs.writeFileSync(privPath, privB64, { mode: 0o600, flag: 'wx' })
+  try { restrictToOwner(privPath) } catch { /* best-effort on win32 */ }
+  fs.writeFileSync(pubPath, pubB64, { flag: 'wx' })
+  // v0.12.1: a prior loadKeyObject call may have negative-cached this
+  // operator's key as `null` (fresh operator, key not yet written) — drop
+  // that entry so the next signEvent picks up the new key without a stat.
+  resetSigningCache(operatorId)
+  return { publicKey: pubB64, privateKeyPath: privPath }
+}
+
+// v0.12.1: cache the imported KeyObject per operator. Before this, every
+// insertEvent did 2× fs.existsSync + 2× fs.readFileSync + JWK parse of both
+// key halves — at a 200 evt/s mitmproxy burst that's ~800 syscalls/s plus
+// 200 crypto.createPrivateKey calls purely to re-read our own key file. The
+// key on disk is idempotent-on-create (see generateOperatorKeyPair), so the
+// derived KeyObject is safe to hold once per operator id. Callers that
+// rotate keys or wipe the keys dir call resetSigningCache(operatorId?) to
+// invalidate. Missing-key result (null) is cached negatively so we don't
+// re-stat on every write.
+type CacheEntry = { key: crypto.KeyObject } | { key: null }
+const keyCache = new Map<string, CacheEntry>()
+
+function loadKeyObject(operatorId: string): crypto.KeyObject | null {
+  const cached = keyCache.get(operatorId)
+  if (cached !== undefined) return cached.key
+  const privPath = privateKeyPath(operatorId)
+  const pubPath = publicKeyPath(operatorId)
+  if (!fs.existsSync(privPath) || !fs.existsSync(pubPath)) {
+    keyCache.set(operatorId, { key: null })
+    return null
+  }
+  try {
+    const privB64 = fs.readFileSync(privPath, 'utf-8').trim()
+    const pubB64 = fs.readFileSync(pubPath, 'utf-8').trim()
+    const key = privateKeyFromRaw(privB64, pubB64)
+    keyCache.set(operatorId, { key })
+    return key
+  } catch {
+    keyCache.set(operatorId, { key: null })
+    return null
+  }
+}
+
+/** Drop cached KeyObject(s). Called by generateOperatorKeyPair after write
+ *  (the cache would otherwise hold the pre-generation `null`), and available
+ *  to callers that manually rotate a key file. Pass no arg to clear all. */
+export function resetSigningCache(operatorId?: string): void {
+  if (operatorId === undefined) keyCache.clear()
+  else keyCache.delete(operatorId)
+}
+
+// Sign the pre-computed canonical JSON on behalf of `operatorId`. Returns
+// null when the key file is missing — an older operator created before
+// v0.6.89, or a key that got wiped — so insertEvent can proceed with an
+// unsigned row rather than crash. The chain hash still protects that row;
+// verifyChainFullAsync surfaces it as "unsigned" (audit signal), not "broken".
+export function signEvent(canonicalJson: string, operatorId: string): string | null {
+  const key = loadKeyObject(operatorId)
+  if (!key) return null
+  try {
+    // Ed25519 uses PureEdDSA — no digest algorithm; pass null.
+    const sig = crypto.sign(null, Buffer.from(canonicalJson, 'utf-8'), key)
+    return sig.toString('base64')
+  } catch {
+    // Signing itself failed after the key loaded — invalidate the cache so
+    // a rotation lands on the next call, and return unsigned.
+    keyCache.delete(operatorId)
+    return null
+  }
+}
+
+// Constant-time in Node's `crypto.verify`; returns false on any parse error
+// rather than throwing so verifyChainFullAsync can distinguish "tampered / wrong
+// key" (false) from "no signature to check" (skipped upstream).
+export function verifyEventSignature(canonicalJson: string, signatureB64: string, publicKeyB64: string): boolean {
+  try {
+    const key = publicKeyFromRaw(publicKeyB64)
+    const sig = Buffer.from(signatureB64, 'base64')
+    if (sig.length !== 64) return false
+    return crypto.verify(null, Buffer.from(canonicalJson, 'utf-8'), key, sig)
+  } catch {
+    return false
+  }
+}

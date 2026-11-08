@@ -1,0 +1,630 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import fs from 'fs'
+import path from 'path'
+import os from 'os'
+
+// These tests write and load real plugin files from a temp home dir. On Windows
+// CI (Defender scanning every written file) that occasionally exceeds the 5s
+// default; give the whole suite generous headroom so a slow disk isn't a flake.
+vi.setConfig({ testTimeout: 30000, hookTimeout: 30000 })
+
+import { validateManifest, computeContentHash, tierOf, requiresApproval } from '../src/core/plugins/manifest'
+import { loadPlugins } from '../src/core/plugins/loader'
+import { PLUGIN_API_VERSION } from '../src/core/plugins/types'
+import { setDisabled } from '../src/core/plugins/state'
+import { grant, isTrusted, revoke } from '../src/core/plugins/trust'
+import { applyContributions, removeContributions, getContributionReport } from '../src/core/plugins/contributions'
+import { initPlugins, setPluginEnabled, listPlugins, grantPluginTrust, revokePluginTrust } from '../src/core/plugins'
+import { syncTerminalProfiles } from '../src/core/terminal-profiles'
+import { extractTargetWithProvenance, unregisterTargetExtractors } from '../src/core/target-extractor'
+
+const extractedHost = (command: string): string | null => extractTargetWithProvenance(command).host
+import { getRules, unregisterRedactionRules } from '../src/core/redaction'
+import { detectHooks, unregisterCapturePlugins } from '../src/core/hooks-manager'
+
+// Isolate all plugin stores (trust/state) + userRoot under a temp home dir.
+// os.homedir() reads HOME on POSIX but USERPROFILE on Windows — set both.
+let realHome: string | undefined
+let realUserProfile: string | undefined
+let tmp: string
+
+function writePlugin(id: string, manifest: object, files: Record<string, string> = {}): string {
+  const dir = path.join(tmp, '.redlog', 'plugins', id)
+  fs.mkdirSync(dir, { recursive: true })
+  fs.writeFileSync(path.join(dir, 'plugin.json'), JSON.stringify(manifest, null, 2))
+  for (const [rel, body] of Object.entries(files)) {
+    const p = path.join(dir, rel)
+    fs.mkdirSync(path.dirname(p), { recursive: true })
+    fs.writeFileSync(p, body)
+  }
+  return dir
+}
+
+beforeEach(() => {
+  realHome = process.env.HOME
+  realUserProfile = process.env.USERPROFILE
+  tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redlog-plug-'))
+  process.env.HOME = tmp
+  process.env.USERPROFILE = tmp
+})
+afterEach(() => {
+  process.env.HOME = realHome
+  process.env.USERPROFILE = realUserProfile
+  fs.rmSync(tmp, { recursive: true, force: true })
+})
+
+describe('manifest validation', () => {
+  it('rejects unsupported capture platform names', () => {
+    expect(validateManifest({ id: 'pcap-test', name: 'test', version: '1.0.0', redlogApi: 1,
+      contributes: { capture: [{ platforms: ['macOS'] }] } }, tmp)).toMatchObject({ ok: false })
+  })
+
+  // applyContributions maps over each list and calls string methods on each
+  // entry's text, so a value of another shape used to throw out of it, in the
+  // middle of applying every plugin (`c.capture.map is not a function`).
+  it.each([
+    ['capture as text', { capture: 'abc' }],
+    ['capture as an object', { capture: { id: 'x' } }],
+    ['capture entry that is not an object', { capture: [null] }],
+    ['capture hookFile that is not text', { capture: [{ id: 'x', hookFile: 7 }] }],
+    ['capture id that is not text', { capture: [{ id: 7, hookFile: 'h.sh' }] }],
+    ['capture requires that is not a list', { capture: [{ id: 'x', hookFile: 'h.sh', requires: 'git' }] }],
+    ['capture manualSteps that is not a list', { capture: [{ id: 'x', hookFile: 'h.sh', manualSteps: 'run it' }] }],
+    ['capture manualSteps with no label', { capture: [{ id: 'x', hookFile: 'h.sh', manualSteps: [{ command: 'x' }] }] }],
+    ['lootPatterns as text', { lootPatterns: 'abc' }],
+    ['lootPatterns entry that is null', { lootPatterns: [null] }],
+    ['lootPatterns name that is not text', { lootPatterns: [{ type: 't', pattern: 'p', name: 5 }] }],
+    ['commandTags as an object', { commandTags: { name: 'x' } }],
+    ['targetExtractors as a number', { targetExtractors: 3 }],
+    ['targetExtractors name that is not text', { targetExtractors: [{ cmd: 'c', name: {} }] }],
+    ['eventTypes as text', { eventTypes: 'abc' }],
+    ['eventTypes entry that is a list', { eventTypes: [[]] }],
+    ['redaction as a list', { redaction: [] }],
+    ['redaction as text', { redaction: 'abc' }],
+    ['redaction denylist that is not a list', { redaction: { denylist: 'abc' } }],
+    ['redaction allowlist, which a plugin may not have', { redaction: { allowlist: ['b'] } }],
+    ['tailers that is not a path', { tailers: 5 }],
+    ['null for a list', { capture: null }]
+  ])('rejects a contributes of the wrong shape: %s', (_what, contributes) => {
+    const r = validateManifest({ id: 'shape-test', name: 'x', version: '1.0.0', redlogApi: 1, contributes }, tmp)
+    expect(r.ok).toBe(false)
+    expect(r.error).toMatch(/^contributes\./)
+  })
+
+  it('still accepts each key in the shape it is read in', () => {
+    const r = validateManifest({
+      id: 'shape-ok', name: 'x', version: '1.0.0', redlogApi: 1,
+      contributes: {
+        lootPatterns: [{ type: 't', pattern: 'p', name: 'n' }], commandTags: [{ name: 'n', match: 'm', stamp: {} }],
+        targetExtractors: [{ cmd: 'c', name: 'n' }], eventTypes: [{ agentType: 'a', label: 'l' }],
+        redaction: { denylist: ['a'] }, terminalProfiles: []
+      }
+    }, tmp)
+    expect(r).toMatchObject({ ok: true })
+  })
+
+  it('rejects bad id, path traversal, unknown capability', () => {
+    const dir = tmp
+    expect(validateManifest({ id: 'Bad Id', name: 'x', version: '1.0.0', redlogApi: 1, contributes: {} }, dir).ok).toBe(false)
+    expect(validateManifest({ id: 'ok', name: 'x', version: 'nope', redlogApi: 1, contributes: {} }, dir).ok).toBe(false)
+    expect(validateManifest(
+      { id: 'ok', name: 'x', version: '1.0.0', redlogApi: 1, contributes: {}, capabilities: ['do:anything'] }, dir
+    ).ok).toBe(false)
+    expect(validateManifest(
+      { id: 'ok', name: 'x', version: '1.0.0', redlogApi: 1, contributes: { tailers: '../../etc/passwd' } }, dir
+    ).ok).toBe(false)
+  })
+
+  it('§8-2 true removability: disabling the starter-pack removes the built-in producers', () => {
+    // The built-ins (shell-zsh, mitmproxy…) come from the starter-pack; they
+    // show up in detectHooks by default.
+    const withPack = detectHooks().map((h) => h.id)
+    expect(withPack).toContain('mitmproxy')
+    expect(withPack).toContain('shell-zsh')
+
+    // Disable it → the built-in producers actually go away (not just hidden).
+    setDisabled('starter-pack', true)
+    const disabled = detectHooks().map((h) => h.id)
+    expect(disabled).not.toContain('mitmproxy')
+    expect(disabled).not.toContain('shell-zsh')
+
+    // Re-enable → they come back.
+    setDisabled('starter-pack', false)
+    expect(detectHooks().map((h) => h.id)).toContain('mitmproxy')
+  })
+
+  it('§8-4 forward-compat: reads one API version ahead, rejects two ahead', () => {
+    const base = { id: 'ok', name: 'x', version: '1.0.0', contributes: {} }
+    // Current and one-ahead both validate; two-ahead is too far to interpret.
+    expect(validateManifest({ ...base, redlogApi: PLUGIN_API_VERSION }, tmp).ok).toBe(true)
+    expect(validateManifest({ ...base, redlogApi: PLUGIN_API_VERSION + 1 }, tmp).ok).toBe(true)
+    expect(validateManifest({ ...base, redlogApi: PLUGIN_API_VERSION + 2 }, tmp).ok).toBe(false)
+  })
+
+  it('§8-4 forward-compat: a declarative plugin one version ahead loads active + apiAhead', () => {
+    writePlugin('ahead-decl', {
+      id: 'ahead-decl', name: 'Ahead', version: '1.0.0', redlogApi: PLUGIN_API_VERSION + 1,
+      contributes: { lootPatterns: [{ type: 'x', pattern: 'X-[0-9]+', confidence: 'high' }] }
+    })
+    const p = loadPlugins().find((x) => x.manifest.id === 'ahead-decl')!
+    expect(p.status).toBe('active')      // known declarative parts still apply
+    expect(p.apiAhead).toBe(true)        // flagged for the UI
+    expect(p.tier).toBe('declarative')
+  })
+
+  it('§8-4 forward-compat: a CODE plugin one version ahead is refused (its code is not run)', () => {
+    const dir = writePlugin('ahead-code', {
+      id: 'ahead-code', name: 'Ahead Code', version: '1.0.0', redlogApi: PLUGIN_API_VERSION + 1,
+      contributes: { tailers: 'code/tools.js' }
+    }, { 'code/tools.js': 'exports.tools = []\n' })
+    expect(dir).toBeTruthy()
+    const p = loadPlugins().find((x) => x.manifest.id === 'ahead-code')!
+    expect(p.status).toBe('error')       // newer code is not trusted to match this API
+    expect(p.error).toMatch(/will not run its code/)
+  })
+
+  it('classifies tier by whether it contributes code', () => {
+    const declarative = validateManifest(
+      { id: 'pack-a', name: 'A', version: '1.0.0', redlogApi: 1, contributes: { lootPatterns: [] } }, tmp
+    )
+    expect(declarative.ok).toBe(true)
+    expect(tierOf(declarative.manifest!)).toBe('declarative')
+  })
+})
+
+describe('loader + declarative contributions', () => {
+  it('loads a declarative plugin as active and wires its patterns', () => {
+    writePlugin('recon-pack', {
+      id: 'recon-pack', name: 'Recon Pack', version: '1.0.0', redlogApi: 1,
+      contributes: {
+        lootPatterns: [{ type: 'acme_token', pattern: 'ACME-[0-9]{8}', confidence: 'high' }],
+        redaction: { denylist: ['/S*SECRET*/'] },
+        targetExtractors: [{ cmd: '^myscan\\s', extract: '--host\\s+(\\S+)' }]
+      }
+    })
+    const plugins = loadPlugins()
+    const p = plugins.find((x) => x.manifest.id === 'recon-pack')!
+    expect(p.status).toBe('active')
+    expect(p.tier).toBe('declarative')
+
+    applyContributions(p)
+    // target extractor now knows the bespoke tool
+    expect(extractedHost('myscan --host 10.0.0.9')).toBe('10.0.0.9')
+    // redaction denylist merged
+    expect(getRules().denylist).toContain('/S*SECRET*/')
+
+    removeContributions('recon-pack')
+    unregisterTargetExtractors('recon-pack')
+    unregisterRedactionRules('recon-pack')
+  })
+
+  it('exposes a capture contribution through the hooks manager', () => {
+    writePlugin('cap-plugin', {
+      id: 'cap-plugin', name: 'Cap', version: '1.0.0', redlogApi: 1,
+      contributes: {
+        capture: [{
+          id: 'thing', name: 'Thing Capture', description: 'd', agentType: 'shell',
+          hookFile: 'hook.sh', installMethod: 'manual',
+          manualSteps: [{ label: 'run it', command: 'bash {hookFile}' }]
+        }]
+      }
+    }, { 'hook.sh': '#!/bin/bash\n' })
+    const p = loadPlugins().find((x) => x.manifest.id === 'cap-plugin')!
+    applyContributions(p)
+    const hook = detectHooks().find((h) => h.id === 'cap-plugin.thing')
+    expect(hook).toBeTruthy()
+    // {hookFile} placeholder resolved to the absolute path
+    expect(hook!.manualSteps?.[0].command).toContain(path.join(p.dir, 'hook.sh'))
+    unregisterCapturePlugins('cap-plugin')
+  })
+})
+
+describe('privileged trust gate', () => {
+  const priv = {
+    id: 'tool-plugin', name: 'Tool', version: '1.0.0', redlogApi: 1,
+    capabilities: ['read:events'],
+    contributes: { tailers: 'code/tools.js' }
+  }
+
+  it('is needs-consent until granted, and grant pins the content hash', () => {
+    const dir = writePlugin('tool-plugin', priv, { 'code/tools.js': 'exports.tools = []\n' })
+    let p = loadPlugins().find((x) => x.manifest.id === 'tool-plugin')!
+    expect(p.tier).toBe('privileged')
+    expect(p.status).toBe('needs-consent')
+
+    grant('tool-plugin', p.contentHash, ['read:events'])
+    p = loadPlugins().find((x) => x.manifest.id === 'tool-plugin')!
+    expect(p.status).toBe('active')
+
+    // changing the code invalidates the pinned trust → back to needs-consent
+    fs.writeFileSync(path.join(dir, 'code', 'tools.js'), 'exports.tools = [1]\n')
+    p = loadPlugins().find((x) => x.manifest.id === 'tool-plugin')!
+    expect(p.status).toBe('needs-consent')
+    expect(isTrusted('tool-plugin', p.contentHash, ['read:events'])).toBe(false)
+    revoke('tool-plugin')
+  })
+
+  it('does not grant capabilities beyond what was consented', () => {
+    const dir = writePlugin('tool2', { ...priv, id: 'tool2', capabilities: ['read:events'] },
+      { 'code/tools.js': 'exports.tools = []\n' })
+    const hash = computeContentHash(
+      validateManifest(JSON.parse(fs.readFileSync(path.join(dir, 'plugin.json'), 'utf-8')), dir).manifest!, dir
+    )
+    grant('tool2', hash, ['read:events'])
+    // manifest later asks for more than granted
+    expect(isTrusted('tool2', hash, ['read:events', 'write:events'])).toBe(false)
+    revoke('tool2')
+  })
+})
+
+describe('shipped example plugins', () => {
+  const examplesDir = path.join(__dirname, '..', 'examples', 'plugins')
+  for (const id of ['recon-pack']) {
+    it(`example ${id} has a valid manifest`, () => {
+      const dir = path.join(examplesDir, id)
+      const raw = JSON.parse(fs.readFileSync(path.join(dir, 'plugin.json'), 'utf-8'))
+      const parsed = validateManifest(raw, dir)
+      expect(parsed.ok, parsed.error).toBe(true)
+    })
+  }
+})
+
+describe('tailer plugin contribution (v0.8.2)', () => {
+  it('bundled plugin with tailers contribution routes to the registered sink', async () => {
+    const { setTailerContributionSink, _resetTailerSinkForTest } =
+      await import('../src/core/plugins/tailer-registry')
+
+    // Build a plugin dir + code file exporting an `adapter`. Load via
+    // validateManifest → LoadedPlugin so we control `source: 'bundled'`.
+    const dir = writePlugin('e2e-tailer', {
+      id: 'e2e-tailer', name: 'E2E Tailer', version: '1.0.0', redlogApi: 1,
+      contributes: { tailers: 'code/tailer.js' }
+    }, { 'code/tailer.js': `exports.adapter = { agentKind: 'e2e-agent', transcriptGlob: '/tmp/*' }\n` })
+
+    const raw = JSON.parse(fs.readFileSync(path.join(dir, 'plugin.json'), 'utf-8'))
+    const parsed = validateManifest(raw, dir)
+    expect(parsed.ok).toBe(true)
+
+    // Attach a sink that records the registration.
+    const seen: Array<{ pluginId: string; agentKind: string }> = []
+    setTailerContributionSink(
+      (pluginId, adapter) => seen.push({ pluginId, agentKind: adapter.agentKind }),
+      (pluginId) => seen.push({ pluginId, agentKind: '__unregistered__' })
+    )
+    try {
+      applyContributions({
+        manifest: parsed.manifest!,
+        dir, source: 'bundled', tier: 'privileged', status: 'active', contentHash: 'x'
+      })
+      expect(seen).toEqual([{ pluginId: 'e2e-tailer', agentKind: 'e2e-agent' }])
+      removeContributions('e2e-tailer')
+      expect(seen).toEqual([
+        { pluginId: 'e2e-tailer', agentKind: 'e2e-agent' },
+        { pluginId: 'e2e-tailer', agentKind: '__unregistered__' }
+      ])
+    } finally {
+      _resetTailerSinkForTest()
+    }
+  })
+
+  it('user-source plugin with tailers contribution is REJECTED (v0.8.2 restriction)', async () => {
+    const { setTailerContributionSink, _resetTailerSinkForTest } =
+      await import('../src/core/plugins/tailer-registry')
+    const dir = writePlugin('user-tailer', {
+      id: 'user-tailer', name: 'User', version: '1.0.0', redlogApi: 1,
+      contributes: { tailers: 'code/t.js' }
+    }, { 'code/t.js': `exports.adapter = { agentKind: 'nope', transcriptGlob: '/x' }\n` })
+    const raw = JSON.parse(fs.readFileSync(path.join(dir, 'plugin.json'), 'utf-8'))
+    const parsed = validateManifest(raw, dir)!
+
+    const seen: string[] = []
+    setTailerContributionSink((pluginId) => seen.push(pluginId), () => {})
+    try {
+      // Silence the expected console.warn so test output stays clean.
+      const origWarn = console.warn
+      console.warn = () => {}
+      try {
+        applyContributions({
+          manifest: parsed.manifest!, dir, source: 'user',
+          tier: 'privileged', status: 'active', contentHash: 'x'
+        })
+      } finally { console.warn = origWarn }
+      expect(seen).toEqual([])
+    } finally {
+      _resetTailerSinkForTest()
+    }
+  })
+
+  it('marks plugin as privileged when only tailers contribution present', () => {
+    const parsed = validateManifest({
+      id: 'ptl', name: 'P', version: '1.0.0', redlogApi: 1,
+      contributes: { tailers: 'code/t.js' }
+    }, writePlugin('ptl', {
+      id: 'ptl', name: 'P', version: '1.0.0', redlogApi: 1,
+      contributes: { tailers: 'code/t.js' }
+    }, { 'code/t.js': 'exports.adapter = { agentKind: "x" }\n' }))
+    expect(parsed.ok).toBe(true)
+    expect(tierOf(parsed.manifest!)).toBe('privileged')
+  })
+
+  it('changing tailer code invalidates the pinned trust hash', () => {
+    const dir = writePlugin('drift', {
+      id: 'drift', name: 'D', version: '1.0.0', redlogApi: 1,
+      contributes: { tailers: 'code/t.js' }
+    }, { 'code/t.js': 'exports.adapter = { agentKind: "x" }\n' })
+    const raw = JSON.parse(fs.readFileSync(path.join(dir, 'plugin.json'), 'utf-8'))
+    const m = validateManifest(raw, dir).manifest!
+    const h1 = computeContentHash(m, dir)
+    fs.writeFileSync(path.join(dir, 'code', 't.js'), 'exports.adapter = { agentKind: "y" }\n')
+    const h2 = computeContentHash(m, dir)
+    expect(h1).not.toBe(h2)
+  })
+})
+
+
+// v0.11.0 (AUDIT P1-3): `tailers` makes RedLog require() plugin code, so it is
+// in PRIVILEGED_KEYS — but it was applied through applyContributions, which
+// runs for any plugin that is not error/disabled. The trust gate only guarded
+// host.start(), so an unconsented plugin's tailer executed in the main process
+// with no capability limits.
+describe('tailer contributions respect the trust gate', () => {
+  const mk = (status: string): Parameters<typeof applyContributions>[0] => ({
+    manifest: {
+      id: 'tailer-plugin', name: 'T', version: '1.0.0', redlogApi: 1,
+      contributes: { tailers: 'tailer.js' }
+    },
+    dir: '/nonexistent/tailer-plugin',
+    tier: 'privileged',
+    status,
+    source: 'bundled',
+    contentHash: 'x'
+  } as unknown as Parameters<typeof applyContributions>[0])
+
+  it('is classified privileged so the gate applies at all', () => {
+    expect(tierOf({ contributes: { tailers: 'tailer.js' } } as never)).toBe('privileged')
+  })
+
+  it.each(['needs-consent', 'hash-changed'])('does not load a %s plugin', (status) => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {})
+    // A require() of the (nonexistent) module would log through console.error;
+    // the gate should stop before that and warn about the status instead.
+    applyContributions(mk(status))
+    expect(warn.mock.calls.flat().join(' ')).toContain('not "active"')
+    expect(err).not.toHaveBeenCalled()
+    warn.mockRestore(); err.mockRestore()
+  })
+})
+
+const manifestBase = { id: 'sample-plugin', name: 'Sample', version: '1.0.0', redlogApi: 1 }
+
+// #499. A manifest may contribute terminal profiles. The per-profile rules are
+// in test/terminal-profiles.test.ts; what belongs here is the manifest, the
+// report, and the one thing that decides when the snapshot is rewritten.
+describe('terminalProfiles in a manifest', () => {
+  const ligolo = { id: 'ligolo', name: 'Ligolo-ng', mode: 'pty', executables: ['ligolo-proxy'], reason: 'brings its own PTY' }
+  const withProfiles = (terminalProfiles: unknown) => ({ ...manifestBase, contributes: { terminalProfiles } })
+  const snapshotPath = (): string => path.join(tmp, '.redlog', 'terminal-profiles.json')
+  const snapshotIds = (): string[] => JSON.parse(fs.readFileSync(snapshotPath(), 'utf8')).profiles.map((p: { id: string }) => p.id)
+
+  it('is refused when it is not a list, and loads when it is', () => {
+    for (const bad of [{ id: 'x' }, 'x', 7, null]) {
+      expect(validateManifest(withProfiles(bad), '/tmp/x'), JSON.stringify(bad)).toEqual({
+        ok: false, error: 'contributes.terminalProfiles must be a list'
+      })
+    }
+    expect(validateManifest(withProfiles([ligolo]), '/tmp/x').ok).toBe(true)
+    expect(validateManifest(withProfiles([]), '/tmp/x').ok).toBe(true)
+    expect(validateManifest({ ...manifestBase, contributes: {} }, '/tmp/x').ok).toBe(true)
+  })
+
+  // The tier says whether RedLog runs the plugin's code. A profile is data, so
+  // it is not code; what it needs is the operator's approval, below.
+  it('is not code: it never makes a plugin privileged, but it does need approval', () => {
+    const m = validateManifest(withProfiles([ligolo]), '/tmp/x').manifest!
+    expect(tierOf(m)).toBe('declarative')
+    expect(requiresApproval(m)).toBe(true)
+    expect(requiresApproval(validateManifest(withProfiles([]), '/tmp/x').manifest!)).toBe(false)
+    expect(requiresApproval(validateManifest({ ...manifestBase, contributes: {} }, '/tmp/x').manifest!)).toBe(false)
+  })
+
+  // Approval of the plugin at the content it has on disk, as the operator's
+  // consent does it (`grantPluginTrust` pins this same hash).
+  const approve = (id: string, dir: string): void => {
+    const manifest = validateManifest(JSON.parse(fs.readFileSync(path.join(dir, 'plugin.json'), 'utf-8')), dir).manifest!
+    grant(id, computeContentHash(manifest, dir), [])
+  }
+  const statusOf = (id: string): string | undefined => listPlugins().find((x) => x.manifest.id === id)?.status
+
+  // A plugin.json dropped into ~/.redlog/plugins/ with no code in it used to be
+  // active at once, and so wrote its profiles into the shell's snapshot with no
+  // prompt: `nmap` as native stops recording it, a pty name gets a wrapper in
+  // every new shell.
+  it('a plugin with no code that declares profiles waits for approval, as one with code does', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const manifest = { ...manifestBase, id: 'tp-decl', contributes: { terminalProfiles: [ligolo] } }
+    const dir = writePlugin('tp-decl', manifest)
+    try {
+      initPlugins()
+      expect(statusOf('tp-decl')).toBe('needs-consent')
+      expect(fs.existsSync(snapshotPath())).toBe(false)
+      expect(getContributionReport('tp-decl')?.terminalProfiles).toEqual({ accepted: 0, rejected: [], waiting: true })
+
+      // The operator's consent, through the same call the settings panel makes.
+      expect(grantPluginTrust('tp-decl')).toEqual({ ok: true })
+      expect(statusOf('tp-decl')).toBe('active')
+      expect(snapshotIds()).toEqual(['tp-decl/ligolo'])
+
+      // The manifest changes: the approval no longer covers it.
+      fs.writeFileSync(path.join(dir, 'plugin.json'), JSON.stringify({
+        ...manifest, contributes: { terminalProfiles: [{ ...ligolo, mode: 'native' }] }
+      }))
+      initPlugins()
+      expect(statusOf('tp-decl')).toBe('needs-consent')
+      expect(fs.existsSync(snapshotPath())).toBe(false)
+
+      // Approving the new content brings it back; revoking takes it away.
+      expect(grantPluginTrust('tp-decl')).toEqual({ ok: true })
+      expect(snapshotIds()).toEqual(['tp-decl/ligolo'])
+      revokePluginTrust('tp-decl')
+      expect(statusOf('tp-decl')).toBe('needs-consent')
+      expect(fs.existsSync(snapshotPath())).toBe(false)
+    } finally {
+      removeContributions('tp-decl')
+      revoke('tp-decl')
+      warn.mockRestore()
+    }
+  })
+
+  // A user's tailer is refused whatever is agreed, so there is nothing to
+  // approve in it. Its profiles are another matter, and were left with no way to
+  // be approved.
+  it('a third-party tailer that also declares profiles can be approved for the profiles; the tailer still does not run', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    writePlugin('tp-tailer', { ...manifestBase, id: 'tp-tailer', contributes: { tailers: 'tailer.js', terminalProfiles: [ligolo] } },
+      { 'tailer.js': 'throw new Error("must never be loaded")' })
+    writePlugin('tp-tailer-only', { ...manifestBase, id: 'tp-tailer-only', contributes: { tailers: 'tailer.js' } },
+      { 'tailer.js': 'throw new Error("must never be loaded")' })
+    try {
+      initPlugins()
+      expect(grantPluginTrust('tp-tailer-only').error).toMatch(/Third-party tailers are not supported/)
+      expect(grantPluginTrust('tp-tailer')).toEqual({ ok: true })
+      expect(statusOf('tp-tailer')).toBe('active')
+      expect(snapshotIds()).toEqual(['tp-tailer/ligolo'])
+      expect(getContributionReport('tp-tailer')?.tailers?.state).toBe('rejected')
+    } finally {
+      removeContributions('tp-tailer'); removeContributions('tp-tailer-only')
+      revoke('tp-tailer'); warn.mockRestore()
+    }
+  })
+
+  it('a plugin with no code and no profiles is active as before, and has nothing to approve', () => {
+    writePlugin('tp-plain', { ...manifestBase, id: 'tp-plain', contributes: { lootPatterns: [] } })
+    writePlugin('tp-empty', { ...manifestBase, id: 'tp-empty', contributes: { terminalProfiles: [] } })
+    try {
+      initPlugins()
+      expect(statusOf('tp-plain')).toBe('active')
+      expect(statusOf('tp-empty')).toBe('active')
+      expect(grantPluginTrust('tp-plain').ok).toBe(false)
+    } finally {
+      removeContributions('tp-plain'); removeContributions('tp-empty')
+    }
+  })
+
+  it('reports what took effect and what was refused, by name', () => {
+    const dir = writePlugin('tp-report', {
+      ...manifestBase, id: 'tp-report',
+      contributes: { terminalProfiles: [ligolo, { ...ligolo, id: 'bad', mode: 'sideways' }] }
+    })
+    approve('tp-report', dir)
+    const p = loadPlugins().find((x) => x.manifest.id === 'tp-report')!
+    expect(applyContributions(p).terminalProfiles).toEqual({
+      accepted: 1, rejected: [{ name: 'bad', reason: 'mode must be native, pty or relayed' }]
+    })
+    removeContributions('tp-report')
+    revoke('tp-report')
+  })
+
+  it('removeContributions takes the profiles back', () => {
+    const dir = writePlugin('tp-remove', { ...manifestBase, id: 'tp-remove', contributes: { terminalProfiles: [ligolo] } })
+    approve('tp-remove', dir)
+    applyContributions(loadPlugins().find((x) => x.manifest.id === 'tp-remove')!)
+    expect(syncTerminalProfiles(tmp).written).toBe(true)
+    removeContributions('tp-remove')
+    revoke('tp-remove')
+    syncTerminalProfiles(tmp)
+    expect(fs.existsSync(snapshotPath())).toBe(false)
+  })
+
+  it('initPlugins writes the snapshot; disabling the plugin removes it; enabling writes it again', () => {
+    const dir = writePlugin('tp-init', { ...manifestBase, id: 'tp-init', contributes: { terminalProfiles: [ligolo] } })
+    approve('tp-init', dir)
+    try {
+      initPlugins()
+      expect(snapshotIds()).toEqual(['tp-init/ligolo'])
+      setPluginEnabled('tp-init', false)
+      expect(fs.existsSync(snapshotPath())).toBe(false)
+      setPluginEnabled('tp-init', true)
+      expect(snapshotIds()).toEqual(['tp-init/ligolo'])
+    } finally {
+      removeContributions('tp-init')
+      revoke('tp-init')
+    }
+  })
+
+  // The error and disabled cases need a plugin whose status is error while its
+  // manifest still carries profiles, which the loader never produces: they are
+  // in test/plugin-profile-gate.test.ts. This one goes through the real loader
+  // and the real trust store, for the state the loader does produce.
+  it('a plugin that has not been approved at its current content contributes nothing', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const manifest = {
+      ...manifestBase, id: 'tp-trust', capabilities: ['read:events'],
+      contributes: { tailers: 'code/tools.js', terminalProfiles: [ligolo] }
+    }
+    const dir = writePlugin('tp-trust', manifest, { 'code/tools.js': 'exports.tools = []\n' })
+    try {
+      initPlugins()
+      expect(listPlugins().find((x) => x.manifest.id === 'tp-trust')?.status).toBe('needs-consent')
+      expect(fs.existsSync(snapshotPath())).toBe(false)
+
+      // approved: it contributes
+      grant('tp-trust', computeContentHash(validateManifest(manifest, dir).manifest!, dir), ['read:events'])
+      initPlugins()
+      expect(listPlugins().find((x) => x.manifest.id === 'tp-trust')?.status).toBe('active')
+      expect(snapshotIds()).toEqual(['tp-trust/ligolo'])
+
+      // the content changes: the approval no longer covers it, and it stops
+      fs.writeFileSync(path.join(dir, 'code', 'tools.js'), 'exports.tools = [1]\n')
+      initPlugins()
+      expect(listPlugins().find((x) => x.manifest.id === 'tp-trust')?.status).toBe('needs-consent')
+      expect(fs.existsSync(snapshotPath())).toBe(false)
+    } finally {
+      removeContributions('tp-trust')
+      revoke('tp-trust')
+      warn.mockRestore()
+    }
+  })
+
+  it('a refusal to write is logged, and does not stop the plugins loading', () => {
+    const dir = writePlugin('tp-nowrite', { ...manifestBase, id: 'tp-nowrite', contributes: { terminalProfiles: [ligolo] } })
+    approve('tp-nowrite', dir)
+    // `.redlog` exists (the plugin lives in it), so make the target a directory.
+    fs.mkdirSync(snapshotPath(), { recursive: true })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    try {
+      expect(() => initPlugins()).not.toThrow()
+      expect(warn.mock.calls.flat().join(' ')).toMatch(/terminal profiles not written/)
+      expect(listPlugins().some((x) => x.manifest.id === 'tp-nowrite')).toBe(true)
+    } finally {
+      removeContributions('tp-nowrite')
+      revoke('tp-nowrite')
+    }
+  })
+})
+
+describe('retired code contributions are refused, not silently inert', () => {
+  for (const retired of ['exporters', 'monitors']) {
+    it(`rejects a manifest contributing ${retired}, saying why`, () => {
+      const parsed = validateManifest({ ...manifestBase, contributes: { [retired]: './index.js' } }, '/tmp/x')
+      expect(parsed.ok).toBe(false)
+      if (parsed.ok) return
+      expect(parsed.error).toMatch(new RegExp(retired))
+      expect(parsed.error).toMatch(/not supported/)
+    })
+  }
+
+  it('rejects a manifest contributing mappers: nothing applies them (POST /api/ingest was never built)', () => {
+    const parsed = validateManifest({ ...manifestBase, contributes: {
+      mappers: [{ id: 'm', version: '1', agentType: 'scanner', fields: { host: '$.h' } }]
+    } }, '/tmp/x')
+    expect(parsed.ok).toBe(false)
+    if (parsed.ok) return
+    expect(parsed.error).toMatch(/contributes\.mappers is not supported/)
+    expect(parsed.error).toMatch(/api\/events/)
+  })
+
+  it('still treats tailers as privileged, so the trust gate keeps guarding it', () => {
+    expect(tierOf({ ...manifestBase, contributes: { tailers: './tailer.js' } } as Parameters<typeof tierOf>[0])).toBe('privileged')
+  })
+})

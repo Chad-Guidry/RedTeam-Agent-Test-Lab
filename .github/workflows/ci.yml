@@ -1,0 +1,212 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same PR — a fresh push shouldn't queue
+# behind a stale one. Not on main: there each push is a merge, and cancelling
+# left merged commits that never had a complete run (two merges a minute apart
+# cancelled the first one's). Grouping main by commit gives every merge its own
+# run. `cancel-in-progress: false` would not: a group holds one waiting run,
+# and a third push still replaces it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    # Test every supported desktop OS before tagging. macOS PTYs flush queued
+    # output at the final slave close while Linux retains it; a Linux-only
+    # POSIX gate missed that recording defect until the v0.18.1 Release job.
+    # Windows also catches path, profile and shell-install assumptions.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Full history, for the i18n gate's merge base with main. The default
+          # depth-1 checkout leaves ONE commit on this side, so deepening main
+          # alone finds nothing to meet it at — which is how that gate failed
+          # the first time it ran, with main fetched 200 deep beside it.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install
+        # See release.yml — npm install (not npm ci) to tolerate lockfile drift.
+        run: npm install --no-audit --no-fund
+
+      - name: Typecheck
+        # The guard vitest cannot be: a name used but never imported typechecks
+        # as an error and runs as a ReferenceError. One such import went missing
+        # in the scope-recompute work and stopped capture for three commits —
+        # the unit suite never touched that path, and the e2e caught it later.
+        # Before Vitest, because a type error makes every test result suspect.
+        run: npm run typecheck
+
+      - name: Spec Kit contract gates
+        run: npm run verify:specs
+
+      - name: Architecture gate (every export reachable from production)
+        run: npm run verify:architecture
+
+      - name: i18n assertion gate (no test asserts copy this branch deleted)
+        # `fetch-depth: 0` above already brings main, so this only refreshes it.
+        # No `--depth` here: on a complete clone that flag makes the ref shallow
+        # again and takes the merge base back out, which is the opposite of what
+        # the fetch is for.
+        run: |
+          git fetch --no-tags origin main
+          npm run verify:i18n
+
+      - name: Install zsh (Linux)
+        # The terminal auto-capture specs (spec 052) drive a REAL interactive zsh
+        # through a pty, and skip when none is installed. ubuntu-latest does not
+        # ship zsh, so for as long as this step was missing every one of them
+        # reported as skipped — a green run that had checked none of the
+        # adapter. Windows reaches zsh through WSL, which the runner lacks, so
+        # those specs require a native POSIX runner (Linux or macOS).
+        #
+        # `update` first, as the e2e job does: the runner image's package index
+        # can be older than the archive, and a stale one fails the install
+        # instead of installing something older. The version is printed, not
+        # pinned — the pty specs lean on `zstat -F`, `zselect` and `-d -i`, so
+        # when a runner image change moves zsh (ubuntu-latest becomes Ubuntu 26
+        # on 2026-10-19) the log says which zsh a failure ran against.
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zsh
+          zsh --version
+
+      - name: Vitest
+        run: npm test
+
+      - name: Upload the unit report on failure
+        # The suite has an intermittent failure that lands on a different file
+        # each run, passes in isolation, and shows up roughly once in ten. That
+        # is very hard to reproduce by hand — twelve consecutive clean runs was
+        # one attempt — and CI runs the suite far more often than anyone does
+        # locally. The JUnit report carries the failure message and stack, so
+        # the next occurrence is diagnosable from the artifact instead of
+        # needing to happen again on someone's machine.
+        #
+        # Per-leg name: the operating systems would otherwise overwrite each
+        # other, and which platform failed is half the signal.
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: unit-report-${{ matrix.os }}
+          path: test-results/unit-junit.xml
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Build (renderer + main + preload)
+        run: npm run build
+
+  e2e:
+    # No `needs: unit`. It used to wait for all three unit legs and was skipped,
+    # not queued, when any of them failed — so a red unit leg was also a
+    # blindfold: e2e/screenshot-capture.spec.ts was red on main for as long as
+    # the i18n gate was failing every PR, with no completed e2e run to show it.
+    # Run beside the unit legs, e2e always reports, and the run takes the
+    # longer of the two instead of their sum.
+    #
+    # Sharded across three runners, by spec file. One runner had a single
+    # worker (`workers: 1` — one Electron at a time), so ~7 minutes of specs
+    # ran end to end; separate runners need no change to that.
+    name: e2e (${{ matrix.shard }}/3)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install
+        run: npm install --no-audit --no-fund
+
+      - name: Install Electron runtime deps (Linux)
+        # Electron on headless Ubuntu needs a bunch of system libs — playwright
+        # ships install-deps for browsers but not for Electron. Grab the
+        # commonly-missing ones directly.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libxkbcommon0 \
+            libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 \
+            libgtk-3-0 libasound2t64 xvfb zsh fonts-noto-cjk
+
+      - name: Install mitmproxy
+        # The real-source acceptance specs (capture-gap-acceptance,
+        # sse-preservation, uiux-convergence) drive a real mitmdump and skip
+        # when none is on PATH. Until this step existed they skipped on every
+        # run, so the only executions they had ever had were on a developer's
+        # machine. Same install as linux-install-smoke.yml; the version is
+        # printed so a failure says which mitmproxy it ran against — on Python
+        # 3.11 pip resolves the 11.x line, not the 12.x a developer may have.
+        run: |
+          python -m pip install --quiet mitmproxy
+          mitmdump --version
+
+      - name: Build the app the e2e test launches
+        # Electron journeys launch out/main/index.js — build it first.
+        run: npm run build
+
+      - name: Playwright for Electron
+        # xvfb-run gives headless Ubuntu a display server so the Electron
+        # BrowserWindow can create its GPU + WebContents surface.
+        #
+        # mitmdump is installed above, so a real-source spec that cannot find
+        # it is a broken install, not a reason to skip: fail it (see
+        # `requireMitmdump` in e2e/helpers.ts).
+        env:
+          REDLOG_E2E_REQUIRE_MITMDUMP: '1'
+        run: xvfb-run --auto-servernum npm run e2e -- --shard=${{ matrix.shard }}/3
+
+      - name: Upload screenshots + report on failure
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          # Per-shard name: the shards would otherwise overwrite each other.
+          name: e2e-artifacts-${{ matrix.shard }}
+          path: |
+            e2e/screenshots/
+            test-results/
+            playwright-report/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # e2e/visual-reference.spec.ts writes the main pages at desktop, narrow
+      # and large-text sizes for a person to compare with the Stitch
+      # prototypes. Kept on every run: a green run is the one worth looking at.
+      - name: Upload visual reference
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: e2e-visual-${{ matrix.shard }}
+          path: test-results/visual/
+          if-no-files-found: ignore
+          retention-days: 14

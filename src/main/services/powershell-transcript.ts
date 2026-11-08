@@ -1,0 +1,203 @@
+import { readFileSync, readdirSync } from 'fs'
+import path from 'path'
+import { homedir } from 'os'
+import { insertEvent } from '../../core/db/events'
+import { ingest } from '../../core/ingest'
+import { eventBus } from '../../core/event-bus'
+import { noteDbError } from '../../core/capture-health'
+import type { ProjectIdentity } from '../../core/project-runtime'
+import { parseStartTranscript, type TranscriptCommand } from '../../core/start-transcript'
+
+// PowerShell Start-Transcript follower (docs/DESIGN-core-and-capture.md §2.3).
+//
+// The design's decision for thin Windows capture: PowerShell writes a full
+// session transcript (start-transcript-hook.ps1), and RedLog follows it —
+// exactly the agent-tailer shape, something else writes a file and we read it.
+// The parsing risk lives in src/core/start-transcript.ts (unit-tested); this
+// service is the file-follow and the emit.
+//
+// It watches ~/.redlog/transcripts/*.txt and, on each change, re-parses the
+// file and emits shell command events for the commands it has not emitted yet.
+// Re-parsing the whole file each time (rather than byte-tailing) is the simple
+// correct choice: Start-Transcript rewrites cleanly, a transcript is one
+// session's worth of commands, and per-file emit bookkeeping (below) makes the
+// repeat idempotent. The alternative — tracking byte offsets into a file whose
+// last command's output is still growing — is the kind of incremental state
+// that goes subtly wrong and fabricates or drops a command, which §2.2 forbids.
+
+export interface PowershellTranscriptConfig {
+  enabled: boolean
+  /** Held by reference and read when an event is written, so an operator
+   *  change made while the project stays open reaches the next event. */
+  identity?: Readonly<ProjectIdentity>
+}
+
+type ChokidarWatcher = {
+  on: (event: string, cb: (p: string) => void) => ChokidarWatcher
+  close: () => Promise<void>
+}
+type ChokidarNS = { watch: (paths: string | string[], opts: Record<string, unknown>) => ChokidarWatcher }
+let chokidarNS: ChokidarNS | null = null
+async function loadChokidar(): Promise<ChokidarNS | null> {
+  if (chokidarNS) return chokidarNS
+  try { chokidarNS = (await import('chokidar')) as unknown as ChokidarNS } catch { return null }
+  return chokidarNS
+}
+
+let cfg: PowershellTranscriptConfig = { enabled: false }
+let watcher: ChokidarWatcher | null = null
+// Bumped by every restart and stop. The restart awaits the chokidar import
+// before it creates a watcher, and project open configures this twice in one
+// synchronous run (the ids, then applyCapturePacks): without the check, both
+// restarts created a watcher and the first leaked, still following after a
+// switch to a project with the pack off.
+let generation = 0
+/** Per-file count of commands already emitted, so a re-parse emits only the new
+ *  ones. Keyed by absolute transcript path. */
+const emitted = new Map<string, number>()
+/** Files holding a command whose write failed, and the retry that will try it
+ *  again. A failed write must not wait for the next change event: after the
+ *  last command of a session there may never be one. */
+const retries = new Map<string, { timer: ReturnType<typeof setTimeout>; attempt: number }>()
+const RETRY_BASE_MS = 1000
+const RETRY_LIMIT = 5
+
+function clearRetries(): void {
+  for (const r of retries.values()) clearTimeout(r.timer)
+  retries.clear()
+}
+
+function transcriptDir(): string {
+  return path.join(homedir(), '.redlog', 'transcripts')
+}
+
+export function configurePowershellTranscript(next: Partial<PowershellTranscriptConfig>): Promise<void> {
+  cfg = { ...cfg, ...next }
+  return restart()
+}
+
+export function stopPowershellTranscript(): void {
+  generation++
+  if (watcher) { void watcher.close(); watcher = null }
+  emitted.clear()
+  clearRetries()
+}
+
+async function restart(): Promise<void> {
+  const run = ++generation
+  if (watcher) { void watcher.close(); watcher = null }
+  emitted.clear()
+  clearRetries()
+  if (!cfg.enabled) return
+  const chok = await loadChokidar()
+  // A newer restart or a stop ran while chokidar loaded, and it owns the
+  // watcher now — including when it turned the pack off.
+  if (run !== generation || !cfg.enabled) return
+  if (!chok) { console.warn('[powershell-transcript] chokidar not installed; skipping'); return }
+
+  const dir = transcriptDir()
+  // Seed emitted-counts from the transcripts already on disk WITHOUT emitting:
+  // those sessions predate this capture being turned on, the same reasoning
+  // the connection monitor uses for connections open at launch.
+  try {
+    for (const name of readdirSync(dir)) {
+      if (!name.endsWith('.txt')) continue
+      const full = path.join(dir, name)
+      try { emitted.set(full, parseStartTranscript(readFileSync(full, 'utf-8')).commands.length) }
+      catch { /* unreadable — will retry on change */ }
+    }
+  } catch { /* dir absent until the hook runs — chokidar still watches it */ }
+
+  try {
+    watcher = chok.watch(path.join(dir, '*.txt'), {
+      persistent: true,
+      ignoreInitial: true,
+      awaitWriteFinish: { stabilityThreshold: 500, pollInterval: 100 }
+    })
+    watcher.on('add', (p) => follow(p))
+    watcher.on('change', (p) => follow(p))
+    watcher.on('error', () => { /* self-recovers */ })
+  } catch (e) {
+    console.error('[powershell-transcript] failed to start:', e)
+    watcher = null
+  }
+}
+
+function follow(absPath: string): void {
+  // Off is checked here too, so no watcher can record after the pack is off.
+  if (!cfg.enabled) return
+  if (!cfg.identity?.engagementId || !cfg.identity.operatorId) return
+  let text: string
+  try { text = readFileSync(absPath, 'utf-8') } catch { return }
+  const already = emitted.get(absPath) ?? 0
+  const { fresh, newCount, host } = planTranscriptEmit(text, already)
+  if (fresh.length === 0) return
+  // Commands run while recording is paused are consumed, not held back: left
+  // unconsumed, the first change after resume recorded the whole pause.
+  if (eventBus.paused) { emitted.set(absPath, newCount); return }
+  // The count advances past a command only once its row is written. The write
+  // is synchronous, so nothing can land between the two and repeat it.
+  let done = already
+  for (const c of fresh) {
+    if (!emitCommand(absPath, c, host)) break
+    done++
+  }
+  emitted.set(absPath, done)
+  if (done < newCount) scheduleRetry(absPath)
+  else if (retries.has(absPath)) { clearTimeout(retries.get(absPath)!.timer); retries.delete(absPath) }
+}
+
+function scheduleRetry(absPath: string): void {
+  const prev = retries.get(absPath)
+  if (prev) clearTimeout(prev.timer)
+  const attempt = (prev?.attempt ?? 0) + 1
+  // Bounded: a store that stays broken is already reported through
+  // noteDbError, and a later change to the file tries again from here.
+  if (attempt > RETRY_LIMIT) { retries.delete(absPath); return }
+  const run = generation
+  const timer = setTimeout(() => {
+    if (run !== generation) return
+    follow(absPath)
+  }, RETRY_BASE_MS * 2 ** (attempt - 1))
+  retries.set(absPath, { timer, attempt })
+}
+
+const OUTPUT_CAP = 100 * 1024  // parity with the shell hook's per-stream cap
+
+/** False only when the write failed; a command ingest declines on purpose is consumed. */
+function emitCommand(sourcePath: string, cmd: TranscriptCommand, host: string | null): boolean {
+  const identity = cfg.identity
+  if (!identity) return false
+  try {
+    // Through ingest() so a PowerShell transcript command gets the same
+    // target extraction / scope dispatch / companion pipeline a command that
+    // arrived via the shell hook does. ingest() inserts + publishes.
+    ingest({
+      agentType: 'shell',
+      data: {
+        subtype: 'command_end',
+        source: 'start-transcript',
+        command: cmd.command,
+        cwd: cmd.cwd,
+        ...(cmd.output ? { output_preview: cmd.output.slice(0, OUTPUT_CAP) } : {}),
+        ...(host ? { hostname: host } : {}),
+        transcript: path.basename(sourcePath)
+      },
+      engagementId: identity.engagementId,
+      operatorId: identity.operatorId
+    })
+    return true
+  } catch (e) { noteDbError('powershell-transcript', e); return false }
+}
+
+/** The pure incremental decision — given a transcript's full text and how
+ *  many commands were already emitted, which are new and what is the new
+ *  count. follow() is the side effect around it. */
+export function planTranscriptEmit(text: string, alreadyEmitted: number): {
+  fresh: TranscriptCommand[]
+  newCount: number
+  host: string | null
+} {
+  const parsed = parseStartTranscript(text)
+  return { fresh: parsed.commands.slice(alreadyEmitted), newCount: parsed.commands.length, host: parsed.host }
+}

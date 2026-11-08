@@ -1,0 +1,347 @@
+{
+  "_comment": "OpenAI Function Calling / Codex tool definitions for RedLog. Use these with any OpenAI-API-compatible model or agent framework.",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "redlog_session_register",
+        "description": "Register this agent session with RedLog so the transcript tailer captures only explicitly opted-in sessions instead of every Claude Code session on the machine. Call once at session start, before any other RedLog tool. Pass the current session id (from the CLAUDE_SESSION_ID environment variable or session metadata); optionally pass the working directory to add it to the capture watch paths.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "session_id": {
+              "type": "string",
+              "description": "The current agent session id (e.g. the value of CLAUDE_SESSION_ID)"
+            },
+            "cwd": {
+              "type": "string",
+              "description": "Optional working directory to add to RedLog's capture watch paths"
+            }
+          },
+          "required": [
+            "session_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "redlog_mark",
+        "description": "Create a timestamped marker in the RedLog attack timeline. Use when you discover a vulnerability, start a new testing phase, or want to note something important.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "title": {
+              "type": "string",
+              "description": "What happened (e.g. 'Found SQLi in /api/users')"
+            },
+            "notes": {
+              "type": "string",
+              "description": "Additional context, reproduction steps, or technical details"
+            },
+            "severity": {
+              "type": "string",
+              "enum": [
+                "info",
+                "low",
+                "medium",
+                "high",
+                "critical"
+              ],
+              "description": "Finding severity"
+            },
+            "target": {
+              "type": "string",
+              "description": "Target host, IP, or URL this relates to"
+            }
+          },
+          "required": [
+            "title"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "redlog_log_event",
+        "description": "Log a structured event to the RedLog timeline. Prefer standard agent_type (shell, agent, scanner, dns, credential_use, c2_checkin, file_transfer, marker, loot) and standard data keys (subtype, command, tool, dest_ip, dest_host, dest_port, user_context, mitre_ttp, description, sha256, bytes). See docs/event-schema.md.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "agent_type": {
+              "type": "string",
+              "description": "Event source category. Prefer: shell / agent / scanner / dns / credential_use / c2_checkin / file_transfer / marker / loot"
+            },
+            "data": {
+              "type": "object",
+              "description": "Event payload. Populate standard keys when applicable."
+            },
+            "target": {
+              "type": "string",
+              "description": "Target host/IP"
+            }
+          },
+          "required": [
+            "agent_type",
+            "data"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "redlog_search",
+        "description": "Search across all RedLog events (shell commands, targets, clipboard, loot) by keyword.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "Search query (minimum 2 characters)"
+            },
+            "limit": {
+              "type": "number",
+              "description": "Maximum results to return (default 20)"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "redlog_status",
+        "description": "Get the current RedLog status including IP/VPN state, event count, scope violations, and recording state.",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "redlog_scope",
+        "description": "Get the current scope configuration: in-scope targets, exclusions, and any scope violations detected.",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "redlog_loot_scan",
+        "description": "Scan text for credentials, secrets, API keys, JWTs, password hashes, private keys, database URLs, and CTF flags.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string",
+              "description": "Text to scan for embedded secrets or credentials"
+            }
+          },
+          "required": [
+            "text"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "redlog_bookmark",
+        "description": "Create a private bookmark for a URL or point of interest.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "title": {
+              "type": "string",
+              "description": "Bookmark title"
+            },
+            "url": {
+              "type": "string",
+              "description": "URL to bookmark"
+            },
+            "note": {
+              "type": "string",
+              "description": "Notes about why this is interesting"
+            }
+          },
+          "required": [
+            "title"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "redlog_screenshot",
+        "description": "Capture a screenshot of the current desktop state.",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "redlog_whoami",
+        "description": "Return the operator identity this API token resolves to. Call once at session start to confirm your events are being attributed correctly.",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "redlog_operators_list",
+        "description": "List every operator token registered on this RedLog instance.",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "redlog_chain_status",
+        "description": "Return evidence-chain length plus the latest OpenTimestamps anchor status (complete/partial/failed/pending).",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "redlog_chain_anchor_now",
+        "description": "Submit the current chain head to public OpenTimestamps calendars immediately. Use before ending a session or right after a critical finding to lock its timestamp into the Bitcoin blockchain via OTS.",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "redlog_chain_verify",
+        "description": "Fast integrity check: confirm the latest anchor still describes a prefix of the current event chain.",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "redlog_chain_upgrade",
+        "description": "Fetch upgraded OpenTimestamps proofs from calendars for pending anchors. Wait at least a few hours after anchoring; the calendar has to fold your digest into a Bitcoin-anchored Merkle tree first. Omit anchor_id to upgrade all pending anchors.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "anchor_id": {
+              "type": "string",
+              "description": "Specific anchor id. Omit to upgrade all pending."
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "redlog_config",
+        "description": "Get the current RedLog project configuration (engagement, operator, network, scope).",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "redlog_events",
+        "description": "Query recent timeline events, optionally filtered by type or target.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "agent_type": {
+              "type": "string",
+              "description": "Filter by type: shell, agent, dns, pivot, screenshot, marker, loot, cleanup, file_transfer, http_navigation, clipboard, credential_use, c2_checkin, system"
+            },
+            "target": {
+              "type": "string",
+              "description": "Filter by target host/IP"
+            },
+            "limit": {
+              "type": "number",
+              "description": "Max results (default 50, max 500)"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "redlog_bookmarks_list",
+        "description": "List all private bookmarks in the current project.",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "redlog_recording",
+        "description": "Control recording state: check, pause, resume, or toggle. Pauses/resumes are logged as system.recording_paused/resumed events so timeline gaps stay explainable.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "status",
+                "pause",
+                "resume",
+                "toggle"
+              ],
+              "description": "Action to perform"
+            }
+          },
+          "required": [
+            "action"
+          ]
+        }
+      }
+    }
+  ]
+}

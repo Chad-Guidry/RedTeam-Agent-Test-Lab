@@ -1,0 +1,947 @@
+import http from 'http'
+import fs from 'fs'
+import path from 'path'
+import os from 'os'
+import { restrictToOwner } from './fs-acl'
+import { mkdirPrivate } from './private-fs'
+import { queryEvents, queryEventById, queryBuiltinTerminalSessionStart, getEventCount, executeEventQuery, PAUSE_EXEMPT_AGENT_TYPES } from './db/events'
+import { parseQuery } from './query/contract'
+import { decodeCursor } from './query-page'
+import { createBookmark, listBookmarks } from './db/bookmarks'
+import {
+  ensurePrimaryOperator,
+  resolveOperatorByToken,
+  listOperators,
+  generateToken,
+  getPrimaryOperator,
+  type Operator
+} from './db/operators'
+import { eventBus } from './event-bus'
+import { scopeSignalFor } from './alert/scope-signal'
+import { detectCredentialUse } from './credential-detector'
+import { extractTargetWithProvenance } from './target-extractor'
+import { detectPivot } from './pivot-detector'
+import { detectCleanup, detectFileTransfer } from './technique-tagger'
+import { tagCommand } from './command-tagger'
+import { anchorNow, listAnchors, verifyLatestAnchor, verifyChainFullAsync, getAnchorById, buildOtsBundle, upgradeAnchor, upgradeAllPending } from './chain-anchor'
+import { getChainLength } from './evidence-chain'
+import { readCastSlice, readCastRange } from './cast-slice'
+import { getNtpOffsetMs, getLastNtpQuery } from './clock'
+import { redact, getRules } from './redaction'
+import { sanitize } from './sanitize'
+import { exportBundle } from './bundle-export'
+import { parseVerifyReport, type HttpVerifyReport } from './http-verify'
+import { exportHar, bodyDeliverableUnderScope } from './har-export'
+import { getCaptureHealth, getCaptureError, noteDbError } from './capture-health'
+import { resolveIncomingCauses, noteStartEvent } from './causes-resolver'
+import { ingest, type LootDetectorLike } from './ingest'
+import { isInsideDir } from './paths'
+import { getProjectDir } from './db/index'
+import { extractBodyToSidecar, readBody as readHttpBody, type BodyRef } from './http-body-store'
+
+let appVersion = 'dev'
+export function setAppVersion(v: string): void { appVersion = v }
+
+const TOKEN_PATH = path.join(os.homedir(), '.redlog', 'api-token')
+const PORT_PATH = path.join(os.homedir(), '.redlog', 'api-port')
+
+let server: http.Server | null = null
+let primaryToken = ''
+let listeningPort = 6660
+let engagementId = 'default'
+let projectOpen = false
+
+let primaryOperatorId = ''
+let primaryOperatorName = ''
+
+let configLoaderRef: { getConfig: () => unknown; getTargets: () => string[]; getExcludeTargets?: () => string[] } | null = null
+
+// The loot scan endpoint is the only use here.
+let lootDetectorRef: Pick<LootDetectorLike, 'scan'> | null = null
+let screenshotAgentRef: { captureNow: (trigger: string) => Promise<string | null> } | null = null
+
+/** Hybrid D Phase 1: session registration callbacks from tailer-host.
+ *  Kept as a duck-typed ref so core doesn't import main/services. */
+let sessionRegistryRef: {
+  register: (sessionId: string) => void
+  list: () => string[]
+} | null = null
+
+/** Duck-typed slice of AlertRuntime the api-server needs. Kept minimal so
+ *  core doesn't have to import the runtime class (which would drag main
+ *  services into core). main/index.ts hands the real runtime in via
+ *  configureApi; from here it's just an object with these three methods. */
+interface AlertRuntimeSlice {
+  ipStatus(): unknown
+  scopeObservations(): unknown[]
+  scopeObservationCount(): number
+  dispatchTargetHit(input: {
+    target: string
+    source: 'shell' | 'dns' | 'http' | 'scanner' | 'agent_tool'
+    action: string
+    sourceEventId?: string | null
+  }): void
+}
+let alertRuntimeRef: AlertRuntimeSlice | null = null
+
+/** Where the mitmproxy addon's capture checks go (#220). Main forwards them
+ *  to the renderer; nothing here writes them to the record. */
+let httpVerifySinkRef: ((report: HttpVerifyReport) => void) | null = null
+
+/** Shape a scope-check signal from an incoming event by (agentType, subtype).
+ *  Returns null when the event doesn't carry a checkable target — most
+ *  agent types don't (marker, session_start, capture_health, …), and even
+ *  within a checkable type only certain subtypes matter (dns_query but not
+ *  dns_response; command_start but not command_end). Keeping the mapping
+ *  in one function means adding a new source is a one-line edit here, not
+ *  a hunt through the dispatch site. */
+/** v0.9.6 (T2): lets main wire terminal-manager's live cast position in
+ *  without core importing main. Same shape as setPluginHost / the tailer
+ *  contribution sink. */
+type CastProbe = (terminalId: string) => { castPath: string; offset: number; truncated: boolean } | null
+let castProbe: CastProbe | null = null
+export function setCastProbe(fn: CastProbe | null): void { castProbe = fn }
+
+// Byte offset in the session cast at each command_start, keyed by terminalId.
+// Bounded by the number of live terminals, and overwritten per command, so it
+// needs no eviction beyond dropping the key when the pair completes.
+const castOffsetAtStart = new Map<string, number>()
+
+export function configureApi(opts: {
+  engagementId: string
+  operatorId: string
+  operatorName?: string
+  configLoader?: typeof configLoaderRef
+  lootDetector?: typeof lootDetectorRef
+  screenshotAgent?: typeof screenshotAgentRef
+  alertRuntime?: AlertRuntimeSlice
+  sessionRegistry?: typeof sessionRegistryRef
+  httpVerifySink?: typeof httpVerifySinkRef
+}): void {
+  engagementId = opts.engagementId
+  primaryOperatorId = opts.operatorId
+  if (opts.operatorName) primaryOperatorName = opts.operatorName
+  if (opts.configLoader) configLoaderRef = opts.configLoader
+  if (opts.lootDetector) lootDetectorRef = opts.lootDetector
+  if (opts.screenshotAgent) screenshotAgentRef = opts.screenshotAgent
+  if (opts.alertRuntime) alertRuntimeRef = opts.alertRuntime
+  if (opts.sessionRegistry) sessionRegistryRef = opts.sessionRegistry
+  if (opts.httpVerifySink) httpVerifySinkRef = opts.httpVerifySink
+}
+
+/** Settings changed the operator while the project stays open. The token is
+ *  the project's and keeps working; what arrives with it is the new
+ *  operator's from now on. With no project open, the next open applies it.
+ *  False, with nothing changed, when the id is another live operator's. */
+export function setPrimaryOperator(id: string, name: string): boolean {
+  if (projectOpen) {
+    try { ensurePrimaryOperator(id, name || primaryOperatorName, primaryToken) } catch (error) {
+      console.error('[api] operator not changed:', (error as Error).message)
+      return false
+    }
+  }
+  primaryOperatorId = id
+  if (name) primaryOperatorName = name
+  return true
+}
+
+function writePrimaryToken(): string {
+  const token = generateToken()
+  mkdirPrivate(path.dirname(TOKEN_PATH))
+  fs.writeFileSync(TOKEN_PATH, token, { mode: 0o600 })
+  try { restrictToOwner(TOKEN_PATH) } catch { /* best-effort on win32 */ }
+  primaryToken = token
+  return token
+}
+
+function writePort(port: number): void {
+  fs.writeFileSync(PORT_PATH, String(port), { mode: 0o600 })
+  try { restrictToOwner(PORT_PATH) } catch { /* best-effort on win32 */ }
+}
+
+function extractBearerToken(req: http.IncomingMessage): string | null {
+  const header = req.headers.authorization
+  if (!header) return null
+  const parts = header.split(' ')
+  if (parts.length !== 2 || parts[0] !== 'Bearer') return null
+  return parts[1]
+}
+
+function authenticate(req: http.IncomingMessage): Operator | null {
+  const token = extractBearerToken(req)
+  if (!token) return null
+  return resolveOperatorByToken(token)
+}
+
+function json(res: http.ServerResponse, status: number, data: unknown): void {
+  res.writeHead(status, { 'Content-Type': 'application/json' })
+  res.end(JSON.stringify(data))
+}
+
+const MAX_REQUEST_BYTES = 20 * 1024 * 1024
+
+function readBody(req: http.IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = []
+    let total = 0
+    req.on('data', (c: Buffer) => {
+      total += c.length
+      if (total > MAX_REQUEST_BYTES) {
+        req.destroy()
+        reject(new Error('request body too large'))
+        return
+      }
+      chunks.push(c)
+    })
+    req.on('end', () => resolve(Buffer.concat(chunks).toString()))
+    req.on('error', reject)
+  })
+}
+
+function publicOperator(op: Operator): Record<string, unknown> {
+  return {
+    id: op.id,
+    name: op.name,
+    isPrimary: op.isPrimary,
+    createdAt: op.createdAt,
+    revokedAt: op.revokedAt
+  }
+}
+
+async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  // A dropped sidecar file (see selfHealSidecarFiles for why) would leave
+  // `redlog-cli` unable to authenticate even though the server is happily
+  // handling requests. Rewrite on every request — no-op when both files
+  // exist.
+  selfHealSidecarFiles()
+
+  const url = new URL(req.url || '/', `http://localhost`)
+  const route = url.pathname
+
+  // v0.6.93 P0-E: strict Host allowlist. The server binds to 127.0.0.1 but
+  // a browser can be tricked into DNS-rebinding a hostile hostname to
+  // 127.0.0.1, then talking to us with the attacker's Origin. Reject any
+  // Host header that isn't a known local name.
+  const hostHeader = (req.headers.host || '').toLowerCase().split(':')[0]
+  const HOST_ALLOWLIST = new Set(['localhost', '127.0.0.1', '[::1]', '::1', ''])
+  if (!HOST_ALLOWLIST.has(hostHeader)) {
+    res.writeHead(400)
+    res.end('bad host')
+    return
+  }
+  // v0.6.93 P0-E: was `Access-Control-Allow-Origin: *` — RedLog is a local-
+  // only server, no browser should be reading responses from it. Reflect
+  // the Origin (still allows the packaged Electron renderer, which uses
+  // its own file:// or app:// scheme) but never wildcard. Downstream
+  // clients (hooks, CLI) don't preflight and are unaffected.
+  const origin = req.headers.origin
+  if (origin && /^(app|file|http):\/\/(localhost|127\.0\.0\.1|\[::1\])(:|$|\/)/.test(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin)
+    res.setHeader('Vary', 'Origin')
+  }
+  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type')
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204)
+    res.end()
+    return
+  }
+
+  if (route === '/api/health' && req.method === 'GET') {
+    json(res, 200, { ok: true, version: typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : 'dev', projectOpen })
+    return
+  }
+
+  if (!projectOpen) {
+    json(res, 503, { error: 'No project open. Open a project in the RedLog UI first.' })
+    return
+  }
+
+  const operator = authenticate(req)
+  if (!operator) {
+    json(res, 401, { error: 'Unauthorized. Set Authorization: Bearer <token>' })
+    return
+  }
+
+  try {
+
+    if (route === '/api/whoami' && req.method === 'GET') {
+      json(res, 200, { operator: publicOperator(operator), engagementId })
+      return
+    }
+
+    // `/api/events/seed` is the E2E fixture door: same handler, allowlist
+    // skipped, and it does not exist unless REDLOG_E2E=1. Specs need to plant
+    // derived rows (pivot, cleanup, a scope violation, eighteen lanes' worth
+    // of types) that in production only RedLog's own analysis writes.
+    //
+    // A flag on `/api/events` would have been fewer lines and wrong: the
+    // production route's refusal is itself under test
+    // (e2e/recording-pause.spec.ts, "a forged system event is refused"), and a
+    // bypass reachable on the same route would have made that test pass while
+    // the door stood open.
+    const e2eSeed = route === '/api/events/seed' && req.method === 'POST'
+    if (e2eSeed && process.env.REDLOG_E2E !== '1') { json(res, 404, { error: 'not found' }); return }
+    if ((route === '/api/events' || e2eSeed) && req.method === 'POST') {
+      const pinnedEngagement = req.headers['x-redlog-engagement']
+      if (pinnedEngagement != null && pinnedEngagement !== engagementId) {
+        json(res, 409, { error: 'engagement changed; session capture refused' })
+        return
+      }
+      const requestEngagement = engagementId
+      let body: Record<string, unknown>
+      try { body = JSON.parse(await readBody(req)) } catch { json(res, 400, { error: 'invalid or empty JSON body' }); return }
+      // Reading a streamed body yields to project switching. Recheck at the
+      // write boundary, not only when the authenticated headers arrived.
+      if (!projectOpen || requestEngagement !== engagementId || (pinnedEngagement != null && pinnedEngagement !== engagementId)) {
+        json(res, 409, { error: 'engagement changed; session capture refused' })
+        return
+      }
+      const capturedIdentity = body._identity as { engagementId?: unknown } | undefined
+      if (capturedIdentity?.engagementId != null && capturedIdentity.engagementId !== engagementId) {
+        json(res, 409, { error: 'engagement changed; captured event refused' })
+        return
+      }
+      const agentType = String(body.agent_type || body.agentType || 'external')
+      // Types an outside tool may report. The ones deliberately absent are
+      // derived — `system`, `pivot`, `cleanup`, `loot`, `scope_violation` are
+      // written by RedLog's own analysis, and letting a caller forge them
+      // means forging RedLog's conclusions about the engagement.
+      //
+      // `terminal` is here because it is the type in redlog-cli's own help
+      // text (`redlog-cli log terminal --data ...`). Leaving it out 403'd the
+      // documented path; e2e/cli-smoke.spec.ts caught it.
+      const EXTERNAL_ALLOWED_AGENT_TYPES = new Set([
+        'scanner', 'shell', 'terminal', 'dns', 'external', 'agent', 'marker',
+        'process', 'credential_use', 'file_transfer', 'clipboard', 'screenshot',
+        'browser', 'http_navigation',
+        // v0.15: out-of-process pcap producer (hooks/pcap-agent.py) — connection
+        // attempts / SYN scans / non-proxied flow metadata the app-layer proxy
+        // and the established-only connection monitor can't see.
+        'pcap'
+      ])
+      if (!e2eSeed && !EXTERNAL_ALLOWED_AGENT_TYPES.has(agentType)) {
+        // A 403 an integration ignores is capture silently stopping, which is
+        // the one failure §1 does not allow. Record it so a tool posting a
+        // blocked type shows up as a capture problem rather than as nothing.
+        noteDbError('api-external-rejected', new Error(`agent_type "${agentType}" rejected`))
+        json(res, 403, { error: `agent_type "${agentType}" is not allowed via external API` })
+        return
+      }
+      // `data` holds everything the readers index on — subtype, command,
+      // output, url, tool. An assertion here is not a check: a caller that
+      // posts `"data": "str"` used to be stored, and the Activity projection
+      // computed its key by throwing, which failed the page for every row in
+      // the project. Refuse the shape where the caller can still see why.
+      const rawData: unknown = body.data ?? {}
+      if (rawData === null || typeof rawData !== 'object' || Array.isArray(rawData)) {
+        json(res, 400, { error: 'data must be a JSON object' })
+        return
+      }
+      const data = rawData as Record<string, unknown>
+      // A marker is the one operator-authored, authoritative type an outside
+      // tool may report — and an amendment claims to be an operator changing
+      // what a finding says. Validating a forged one would only make it
+      // well-formed; any token holder could still re-title someone else's
+      // finding, and the chain would record it as the operator's own words.
+      // Amendments are written from the Inspector or not at all. The E2E seed
+      // door stays open so specs can plant amendment history.
+      if (!e2eSeed && agentType === 'marker' && (data as Record<string, unknown>).subtype === 'amended') {
+        noteDbError('api-external-rejected', new Error('marker amendment rejected via external API'))
+        json(res, 403, { error: 'marker amendments are written only from the app' })
+        return
+      }
+      let targetId = (body.target_id || body.targetId || undefined) as string | undefined
+
+      // Causal links, enrichment, redaction, insert, publish, scope and
+      // companions all run inside ingest() below (docs/DESIGN-plugin-kernel.md
+      // §3) — the same pipeline the in-process producers use.
+      // v0.6.88 P0-B: strip any caller-supplied operator id from body/data.
+      // The operator was already resolved from the Bearer token above
+      // (`operator.id`) — accepting a body field would let any token holder
+      // forge attribution. Warn once per stripped payload for audit trail.
+      const forgedFields = ['operator_id', 'operatorId'].filter((k) => body[k] != null || data[k] != null)
+      if (forgedFields.length > 0) {
+        console.warn(`[api] stripped forged operator field from ${req.socket.remoteAddress || 'unknown'}: ${forgedFields.join(',')}`)
+        for (const k of forgedFields) { delete body[k]; delete data[k] }
+      }
+
+      // One pipeline for every producer. What was ~300 lines inline here —
+      // shell tagging / pivot / cleanup / file-transfer / target extraction /
+      // loot scan / scanner body sidecar / HTTP-cred detection / redaction /
+      // insert / publish / scope dispatch / companion events — now lives in
+      // ingest(), so a command means the same thing whether it arrives here or
+      // from an in-process producer. `identity` mapper: the posted body IS the
+      // envelope's {agent_type, data}.
+      const result = ingest({
+        agentType, data, operatorId: operator.id, engagementId, targetId,
+        envelope: { source: 'api', mapper: { id: 'identity', version: '1' } }
+      })
+      if (!result.event) {
+        // A deliberate pause/unrecorded interval is acknowledged so the hook
+        // never spools it. Ingest still settles runtime pairs before its gate.
+        if (result.skipped === 'paused') {
+          json(res, 200, { ok: true, recording: false, skipped: 'recording paused' })
+          return
+        }
+        if (result.skipped === 'unrecorded') {
+          json(res, 200, { ok: true, recording: false, skipped: 'terminal not recording' })
+          return
+        }
+        // A paused recording is already answered 200 above; the only way to
+        // reach here with no event is the 2 s dedup window.
+        json(res, 409, { error: 'Duplicate event (dedup window)' })
+        return
+      }
+      json(res, 201, result.event)
+      return
+    }
+    if (route === '/api/events' && req.method === 'GET') {
+      const agentType = url.searchParams.get('agent_type') || undefined
+      const limit = parseInt(url.searchParams.get('limit') || '100')
+      const since = url.searchParams.get('since') ? parseInt(url.searchParams.get('since')!) : undefined
+      const before = url.searchParams.get('before') ? parseInt(url.searchParams.get('before')!) : undefined
+      const targetId = url.searchParams.get('target_id') || undefined
+      const events = queryEvents({ agentType, limit, since, before, targetId })
+      json(res, 200, { count: events.length, events })
+      return
+    }
+
+    if (route === '/api/events/search' && req.method === 'GET') {
+      const q = url.searchParams.get('q') || ''
+      const limit = parseInt(url.searchParams.get('limit') || '100')
+      if (q.length < 2) {
+        json(res, 400, { error: 'Query must be at least 2 characters' })
+        return
+      }
+      // Spec 026: the same query language the app uses. A half-typed
+      // condition is refused rather than searched for as text, and a query
+      // that fails reports the failure — `searchEvents` returned an empty list
+      // for both, which a script cannot tell from "no events matched".
+      const outcome = parseQuery(q)
+      if (!outcome.ok) {
+        json(res, 400, { error: 'Query could not be parsed', reason: outcome.reason, token: outcome.token })
+        return
+      }
+      // Constitution IV: a page says whether it is the whole answer. A cursor
+      // the store cannot read is refused rather than read as "first page",
+      // which would hand a paging script the same page forever.
+      const cursor = url.searchParams.get('cursor')
+      if (cursor && !decodeCursor(cursor)) {
+        json(res, 400, { error: 'Invalid cursor' })
+        return
+      }
+      try {
+        const page = executeEventQuery({ parsed: outcome.parsed, limit, cursor })
+        json(res, 200, {
+          count: page.items.length,
+          events: page.items,
+          hasMore: page.hasMore,
+          nextCursor: page.nextCursor,
+          ...(page.toolSession ? { toolSession: page.toolSession } : {})
+        })
+      } catch (e) {
+        json(res, 500, { error: 'Search failed', detail: (e as Error).message })
+      }
+      return
+    }
+
+    if (route === '/api/events/count' && req.method === 'GET') {
+      json(res, 200, { count: getEventCount() })
+      return
+    }
+
+    if (route === '/api/export/har' && req.method === 'GET') {
+      const since = url.searchParams.get('since') ? parseInt(url.searchParams.get('since')!) : undefined
+      const before = url.searchParams.get('before') ? parseInt(url.searchParams.get('before')!) : undefined
+      const targetId = url.searchParams.get('target_id') || undefined
+      const limit = url.searchParams.get('limit') ? parseInt(url.searchParams.get('limit')!) : undefined
+      // Redaction: the layer-4 sanitize swap always applies inside exportHar;
+      // pass scope so an API token holder can't pull out-of-scope bodies either.
+      const scope = { targets: configLoaderRef?.getTargets?.() ?? [] }
+      const harJson = exportHar({ since, before, targetId, limit, scope })
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Disposition': 'attachment; filename="redlog-export.har"' })
+      res.end(harJson)
+      return
+    }
+
+    const bodyMatch = route.match(/^\/api\/http-body\/([a-f0-9]{64})$/)
+    if (bodyMatch && req.method === 'GET') {
+      const file = `${bodyMatch[1]}.body`
+      const encoding = (url.searchParams.get('encoding') || 'text') as 'text' | 'base64'
+      // The scope the HAR export applies, so a hash read from an event cannot
+      // fetch what the export masks. Same answer as a missing body.
+      const scope = { targets: configLoaderRef?.getTargets?.() ?? [] }
+      const content = bodyDeliverableUnderScope(bodyMatch[1], scope)
+        ? readHttpBody({ sha256: '', size: 0, file, encoding }) : null
+      if (content === null) { json(res, 404, { error: 'body not found' }); return }
+      json(res, 200, { data: content, encoding, file })
+      return
+    }
+
+    if (route === '/api/marker' && req.method === 'POST') {
+      let body: Record<string, unknown>
+      const requestEngagement = engagementId
+      try { body = JSON.parse(await readBody(req)) } catch { json(res, 400, { error: 'invalid or empty JSON body' }); return }
+      // Same recheck as /api/events: the body read yields to a project switch,
+      // and the token that authorised this belonged to the project open then.
+      if (!projectOpen || requestEngagement !== engagementId) { json(res, 409, { error: 'engagement changed; marker refused' }); return }
+      const event = ingest({ agentType: 'marker', data: {
+        title: body.title || 'Untitled',
+        notes: body.notes || '',
+        severity: body.severity || 'info',
+        category: body.category || 'external'
+      }, engagementId, operatorId: operator.id,
+      targetId: (body.target_id || body.targetId) as string | undefined,
+      envelope: { source: 'api', mapper: { id: 'identity', version: '1' } } }).event
+      json(res, 201, event)
+      return
+    }
+
+    if (route === '/api/loot/scan' && req.method === 'POST') {
+      let body: Record<string, unknown>
+      try { body = JSON.parse(await readBody(req)) } catch { json(res, 400, { error: 'invalid or empty JSON body' }); return }
+      if (!lootDetectorRef) {
+        json(res, 503, { error: 'Loot detector not available' })
+        return
+      }
+      const findings = lootDetectorRef.scan(String(body.text ?? ''), body.targetId as string | undefined, body.source as string | undefined)
+      json(res, 200, { findings })
+      return
+    }
+
+    // A capture check from the mitmproxy addon. It is a report about the
+    // proxy path, not engagement traffic, so it is validated and handed on
+    // and never ingested.
+    if (route === '/api/http-verify' && req.method === 'POST') {
+      let body: unknown
+      try { body = JSON.parse(await readBody(req)) } catch { json(res, 400, { error: 'invalid or empty JSON body' }); return }
+      const report = parseVerifyReport(body)
+      if (!report) { json(res, 400, { error: 'Not a verification report' }); return }
+      // Same answer as an ingest while paused. A check is evidence that the
+      // path records; with recording paused it would show "verified" for
+      // traffic that is being dropped.
+      if (eventBus.paused) { json(res, 200, { ok: true, skipped: 'recording paused' }); return }
+      httpVerifySinkRef?.(report)
+      json(res, 200, { ok: true })
+      return
+    }
+
+    if (route === '/api/screenshot' && req.method === 'POST') {
+      if (!screenshotAgentRef) {
+        json(res, 503, { error: 'Screenshot agent not available' })
+        return
+      }
+      const filePath = await screenshotAgentRef.captureNow('api')
+      if (filePath) { json(res, 200, { captured: true, filePath }); return }
+      // A bare `captured: false` told the caller nothing — on Windows this
+      // endpoint returned it for weeks while every screen thumbnail came back
+      // empty, and no caller could tell that from "the screen had not changed".
+      const why = getCaptureError('screenshot')
+      json(res, 200, { captured: false, filePath: null, error: why?.message ?? 'screenshot not captured' })
+      return
+    }
+
+    if (route === '/api/status' && req.method === 'GET') {
+      json(res, 200, {
+        ip: alertRuntimeRef?.ipStatus() || null,
+        eventCount: getEventCount(),
+        // Public response field: keeps its spelling (see scope-vocabulary.ts).
+        scopeViolations: alertRuntimeRef?.scopeObservationCount() || 0,
+        capture: getCaptureHealth()
+      })
+      return
+    }
+
+    if (route === '/api/capture' && req.method === 'GET') {
+      json(res, 200, getCaptureHealth())
+      return
+    }
+
+    if (route === '/api/config' && req.method === 'GET') {
+      json(res, 200, configLoaderRef?.getConfig() || {})
+      return
+    }
+
+    if (route === '/api/scope' && req.method === 'GET') {
+      json(res, 200, {
+        configured: !!alertRuntimeRef,
+        targets: configLoaderRef?.getTargets() || [],
+        // Public response fields: keep their spelling (see scope-vocabulary.ts).
+        violations: alertRuntimeRef?.scopeObservations() || [],
+        violationCount: alertRuntimeRef?.scopeObservationCount() || 0
+      })
+      return
+    }
+
+    if (route === '/api/bookmarks' && req.method === 'GET') {
+      const list = listBookmarks()
+      json(res, 200, { bookmarks: list })
+      return
+    }
+
+    if (route === '/api/bookmarks' && req.method === 'POST') {
+      let body: Record<string, unknown>
+      const requestEngagement = engagementId
+      try { body = JSON.parse(await readBody(req)) } catch { json(res, 400, { error: 'invalid or empty JSON body' }); return }
+      // Same recheck as /api/events: the body read yields to a project switch,
+      // and the token that authorised this belonged to the project open then.
+      if (!projectOpen || requestEngagement !== engagementId) { json(res, 409, { error: 'engagement changed; bookmark refused' }); return }
+      const mark = createBookmark({
+        title: String(body.title ?? 'Untitled'),
+        url: body.url as string | undefined,
+        note: String(body.note ?? ''),
+        // Deliberately NOT `body.context`. The detail pane renders that object
+        // under a heading reading 「自動擷取的情境」, so accepting a caller-supplied
+        // one lets any token holder put chosen `browserUrl` / `externalIP`
+        // strings on screen labelled as provenance. Externally created
+        // bookmarks get none.
+        context: {}
+      })
+      json(res, 201, mark)
+      return
+    }
+
+    if (route === '/api/recording' && req.method === 'GET') {
+      json(res, 200, { recording: !eventBus.paused })
+      return
+    }
+
+    if (route === '/api/recording' && req.method === 'POST') {
+      let body: Record<string, unknown> = {}
+      try { body = JSON.parse(await readBody(req)) } catch { /* empty body → default to toggle */ }
+      const action = body.action ?? 'toggle'
+      if (action === 'pause') eventBus.pause('api')
+      else if (action === 'resume') eventBus.resume('api')
+      else {
+        if (eventBus.paused) eventBus.resume('api'); else eventBus.pause('api')
+      }
+      json(res, 200, { recording: !eventBus.paused })
+      return
+    }
+
+    if (route === '/api/operators' && req.method === 'GET') {
+      json(res, 200, { operators: listOperators().map(publicOperator) })
+      return
+    }
+
+    // Replay a builtin-terminal command by pulling its stdout out of the
+    // asciinema .cast on disk instead of storing it in the chain. Given a
+    // command_end event id, we find the matching session_start (same
+    // terminalId) to get its castPath, then slice the .cast from the
+    // preceding command_start to command_end.
+    if (route === '/api/terminal/replay' && req.method === 'POST') {
+      let body: Record<string, unknown>
+      try { body = JSON.parse(await readBody(req)) } catch { json(res, 400, { error: 'invalid or empty JSON body' }); return }
+      const eventId = body.eventId as string | undefined
+      if (!eventId) { json(res, 400, { error: 'eventId required' }); return }
+      const target = queryEventById(eventId)
+      if (!target) { json(res, 404, { error: 'event not found' }); return }
+      const td = target.data as Record<string, unknown>
+      const tid = td.terminalId as string | undefined
+      if (target.agentType !== 'shell' || td.subtype !== 'command_end' || td.source !== 'builtin-terminal' || !tid) {
+        json(res, 400, { error: 'not a builtin-terminal command_end event' }); return
+      }
+      const sess = typeof td.recordingId === 'string' ? queryBuiltinTerminalSessionStart(td.recordingId) : null
+      const castPath = sess?.data?.castPath as string | undefined
+      if (!castPath) { json(res, 404, { error: 'no cast file for this recording' }); return }
+      // v0.6.93 P0-D: castPath comes from an event whose `data` was written
+      // by an attacker with a valid token — verify the resolved path is
+      // inside the project's casts/ directory before reading. Was:
+      // arbitrary-file-read via forged session_start `{castPath:"/…/.ssh/id_ed25519"}`.
+      let castsDir: string
+      try { castsDir = path.join(getProjectDir(), 'casts') } catch { json(res, 500, { error: 'no active project' }); return }
+      const resolvedCast = path.resolve(castPath)
+      if (!isInsideDir(castsDir, resolvedCast)) {
+        json(res, 403, { error: 'castPath outside project casts directory' })
+        return
+      }
+      const duration = Number(td.duration_sec ?? 0) * 1000
+      // Guard against zero-duration events (instantaneous commands still get
+      // a small window so echoed prompt/output isn't lost to rounding).
+      const startMs = target.timestamp - Math.max(duration, 100)
+      // v0.9.6 (T2): prefer the byte range stamped at capture time — O(len)
+      // instead of streaming the file from 0. Unbracketed pairs use the time window.
+      const io = td.io as { off?: number; len?: number } | undefined
+      const bracketed = typeof io?.off === 'number' && typeof io.len === 'number' && io.len > 0
+        ? await readCastRange(resolvedCast, io.off, io.len)
+        : null
+      // Defence in depth for a bad bracket. `readCastRange` returns a valid
+      // slice containing zero complete cast events when the range lands
+      // mid-line, and `?? fallback` does not fire on that — so replay answered
+      // "0 bytes" rather than dropping to the time window that exists for
+      // exactly this case. An empty bracket is a failed bracket.
+      //
+      // The bracket that made this reachable (offsets short by the cast
+      // header's length) is fixed in terminal-manager; this stays because a
+      // range can also be invalidated by a truncated or rotated cast, and
+      // silently returning nothing is the worst available answer.
+      const slice = bracketed && bracketed.bytes > 0
+        ? bracketed
+        : await readCastSlice(resolvedCast, startMs, target.timestamp)
+      if (!slice) { json(res, 500, { error: 'failed to read cast file' }); return }
+      json(res, 200, {
+        command: td.command,
+        exitCode: td.exit_code,
+        durationSec: td.duration_sec,
+        castPath,
+        startMs,
+        endMs: target.timestamp,
+        bytes: slice.bytes,
+        text: slice.text,
+        truncated: slice.truncated
+      })
+      return
+    }
+
+    if (route === '/api/chain' && req.method === 'GET') {
+      const last = listAnchors(1)[0] ?? null
+      json(res, 200, { length: getChainLength(), lastAnchor: last })
+      return
+    }
+
+    if (route === '/api/anchors' && req.method === 'GET') {
+      const limit = parseInt(url.searchParams.get('limit') || '50')
+      json(res, 200, { anchors: listAnchors(limit) })
+      return
+    }
+
+    if (route === '/api/anchors' && req.method === 'POST') {
+      const anchor = await anchorNow()
+      json(res, anchor ? 201 : 400, { anchor })
+      return
+    }
+
+    if (route === '/api/export/bundle' && req.method === 'POST') {
+      try {
+        // PRD A2: mask out-of-scope events in the bundle when scope is known.
+        const scopeTargets = configLoaderRef?.getTargets?.() ?? []
+        const excludeTargets = configLoaderRef?.getExcludeTargets?.() ?? []
+        const bundle = exportBundle(engagementId, { scope: { targets: scopeTargets, excludeTargets } })
+        json(res, 201, { outDir: bundle.outDir, manifest: bundle.manifest })
+      } catch (e) {
+        const err = e as Error
+        // Log stack to main-process stderr so the failure is diagnosable
+        // from an installed .app (`Console.app` or CLI). The JSON body still
+        // gets only the message so tokens/paths don't leak to logs the caller
+        // may forward.
+        // v0.6.96 Sec-1: don't return err.stack in the HTTP response — leaks
+        // absolute paths + module layout to any token holder. Stack stays in
+        // console.error for local debugging.
+        console.error('[export/bundle] failed:', err.stack || err.message)
+        json(res, 500, { error: err.message })
+      }
+      return
+    }
+
+    // Four-layer redaction, layer 4 — sanitize event bytes for pre-delivery.
+    // POST /api/sanitize { event_ids, fields, reason?, dry_run? }
+    if (route === '/api/sanitize' && req.method === 'POST') {
+      let body: Record<string, unknown>
+      const requestEngagement = engagementId
+      try { body = JSON.parse(await readBody(req)) } catch { json(res, 400, { error: 'invalid or empty JSON body' }); return }
+      // Same recheck as /api/events: the body read yields to a project switch,
+      // and the token that authorised this belonged to the project open then.
+      if (!projectOpen || requestEngagement !== engagementId) { json(res, 409, { error: 'engagement changed; sanitize refused' }); return }
+      try {
+        const result = sanitize({
+          eventIds: Array.isArray(body.event_ids) ? body.event_ids : [],
+          fields: Array.isArray(body.fields) && body.fields.length ? body.fields : ['output', 'output_preview', 'command'],
+          engagementId, operatorId: operator.id,
+          reason: typeof body.reason === 'string' ? body.reason : undefined,
+          dryRun: body.dry_run === true
+        })
+        json(res, result.dryRun ? 200 : 201, result)
+      } catch (e) {
+        json(res, 500, { error: (e as Error).message })
+      }
+      return
+    }
+
+
+
+    if (route === '/api/clock' && req.method === 'GET') {
+      json(res, 200, {
+        ntpOffsetMs: getNtpOffsetMs(),
+        lastQueryAt: getLastNtpQuery(),
+        hostWallMs: Date.now()
+      })
+      return
+    }
+
+    if (route === '/api/anchors/verify' && req.method === 'GET') {
+      const full = url.searchParams.get('full') === '1'
+      // v0.6.95 P0-4a: full walk goes through the async, chunked variant so
+      // the main loop keeps servicing other HTTP requests while it runs.
+      json(res, 200, full ? await verifyChainFullAsync() : verifyLatestAnchor())
+      return
+    }
+
+    if (route === '/api/anchors/upgrade-all' && req.method === 'POST') {
+      const result = await upgradeAllPending()
+      json(res, 200, result)
+      return
+    }
+
+    const upgradeMatch = route.match(/^\/api\/anchors\/([^/]+)\/upgrade$/)
+    if (upgradeMatch && req.method === 'POST') {
+      const result = await upgradeAnchor(decodeURIComponent(upgradeMatch[1]))
+      json(res, result ? 200 : 404, { anchor: result })
+      return
+    }
+
+    const otsMatch = route.match(/^\/api\/anchors\/([^/]+)\/ots$/)
+    if (otsMatch && req.method === 'GET') {
+      const anchor = getAnchorById(decodeURIComponent(otsMatch[1]))
+      if (!anchor) { json(res, 404, { error: 'Anchor not found' }); return }
+      const calendarFilter = url.searchParams.get('calendar')
+      const receipt = anchor.calendarReceipts.find((r) =>
+        r.ok && r.receiptB64 && (!calendarFilter || r.calendar === calendarFilter)
+      )
+      if (!receipt || !receipt.receiptB64) {
+        json(res, 404, { error: 'No successful calendar receipt available for this anchor' })
+        return
+      }
+      const bundle = buildOtsBundle(anchor.headHash, receipt.receiptB64)
+      res.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'Content-Disposition': `attachment; filename="redlog-anchor-${anchor.id}.ots"`,
+        'Content-Length': String(bundle.length),
+        'X-Redlog-Head-Hash': anchor.headHash,
+        'X-Redlog-Calendar': receipt.calendar
+      })
+      res.end(bundle)
+      return
+    }
+
+
+    // ── Hybrid D Phase 1: session registration ──────────────────────────
+    if (route === '/api/session/register' && req.method === 'POST') {
+      let body: Record<string, unknown>
+      try { body = JSON.parse(await readBody(req)) } catch { json(res, 400, { error: 'invalid or empty JSON body' }); return }
+      const sid = (body.session_id || '').toString().trim()
+      if (!sid) { json(res, 400, { error: 'session_id is required' }); return }
+      if (sessionRegistryRef) sessionRegistryRef.register(sid)
+      const cwd = typeof body.cwd === 'string' ? body.cwd.trim() : ''
+      json(res, 200, { registered: true, session_id: sid, ...(cwd ? { cwd } : {}) })
+      return
+    }
+
+    if (route === '/api/session/registered' && req.method === 'GET') {
+      json(res, 200, { sessions: sessionRegistryRef ? sessionRegistryRef.list() : [] })
+      return
+    }
+
+    json(res, 404, { error: `Unknown route: ${req.method} ${route}` })
+  } catch (err) {
+    json(res, 500, { error: (err as Error).message })
+  }
+}
+
+export function startApiServer(port = 6660): Promise<number> {
+  return new Promise((resolve, reject) => {
+    writePrimaryToken()
+
+    server = http.createServer((req, res) => {
+      handleRequest(req, res).catch((err) => {
+        json(res, 500, { error: (err as Error).message })
+      })
+    })
+
+    server.listen(port, '127.0.0.1', () => {
+      const addr = server!.address()
+      const actualPort = typeof addr === 'object' && addr ? addr.port : port
+      listeningPort = actualPort
+      writePort(actualPort)
+      resolve(actualPort)
+    })
+
+    server.on('error', (err: NodeJS.ErrnoException) => {
+      if (err.code === 'EADDRINUSE') {
+        server!.listen(0, '127.0.0.1')
+      } else {
+        reject(err)
+      }
+    })
+  })
+}
+
+export function onApiProjectOpen(): void {
+  // Per-project token isolation (docs/DESIGN-OPEN-ITEMS.md §2). Each engagement
+  // carries its own API secret under its project dir; it is mirrored to the
+  // global ~/.redlog/api-token so the shell hook and CLI — which read that path
+  // on every call — pick up the current project's token on a switch. A token
+  // from one engagement therefore does not authenticate against another, and a
+  // finished engagement's token can be revoked without touching the others.
+  // Only one project is served at a time, so this is secret hygiene, not
+  // concurrent isolation. Falls back to the bootstrap token if the project dir
+  // is unavailable.
+  try {
+    const projTokenPath = path.join(getProjectDir(), 'api-token')
+    let token = ''
+    if (fs.existsSync(projTokenPath)) {
+      token = fs.readFileSync(projTokenPath, 'utf-8').trim()
+    }
+    if (!token) {
+      token = generateToken()
+      fs.writeFileSync(projTokenPath, token, { mode: 0o600 })
+      try { restrictToOwner(projTokenPath) } catch { /* best-effort on win32 */ }
+    }
+    primaryToken = token
+    mkdirPrivate(path.dirname(TOKEN_PATH))
+    fs.writeFileSync(TOKEN_PATH, token, { mode: 0o600 })
+    try { restrictToOwner(TOKEN_PATH) } catch { /* best-effort on win32 */ }
+  } catch { /* keep the bootstrap token from startApiServer */ }
+  ensurePrimaryOperator(primaryOperatorId, primaryOperatorName, primaryToken)
+  projectOpen = true
+}
+
+export function onApiProjectClose(): void {
+  projectOpen = false
+}
+
+export function stopApiServer(): void {
+  server?.close()
+  server = null
+  projectOpen = false
+  // Deliberately NOT deleting TOKEN_PATH / PORT_PATH here anymore. Rationale:
+  // the previous behaviour caused a class of hard-to-diagnose CLI failures
+  // where the operator saw a live API on 6660 (via `lsof` / curl `/api/health`)
+  // but `redlog-cli` bailed with "no api-token found". Root cause: on this box
+  // the app process outlived what looked like a normal shutdown handshake, then
+  // something (macOS session restore, a Finder move, an operator cleanup)
+  // dropped the files while the port was still bound — and `stopApiServer`'s
+  // eager delete matched that same shape. The files are mode 0600 anyway, so
+  // leaving them around across restarts costs nothing; a future startApiServer
+  // rewrites them unconditionally. Self-heal below rewrites on demand too.
+}
+
+/**
+ * Idempotent — writes the token/port files if either is missing. Called from
+ * the request handler so a live server always has matching sidecar files even
+ * if the operator deleted them (or macOS did). Cheap: two `fs.existsSync`
+ * calls per request; only writes when actually missing.
+ */
+function selfHealSidecarFiles(): void {
+  if (!primaryToken) return
+  try {
+    if (!fs.existsSync(TOKEN_PATH)) {
+      mkdirPrivate(path.dirname(TOKEN_PATH))
+      fs.writeFileSync(TOKEN_PATH, primaryToken, { mode: 0o600 })
+    }
+    if (listeningPort && !fs.existsSync(PORT_PATH)) {
+      fs.writeFileSync(PORT_PATH, String(listeningPort), { mode: 0o600 })
+    }
+  } catch { /* best effort */ }
+}
+
+export function getApiToken(): string {
+  return primaryToken
+}
+
+export function getApiPort(): number {
+  return listeningPort
+}
+
+// v0.6.96 Clean-2: removed getPrimaryOperatorSnapshot() — was never called.
+// Callers that want the primary operator import getPrimaryOperator from
+// './db/operators' directly.

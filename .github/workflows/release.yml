@@ -1,0 +1,187 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.2.0)'
+        required: true
+        type: string
+
+# Build each platform in parallel and only PACKAGE (never publish) here.
+# Two concurrent `electron-builder --publish always` jobs race to create the
+# GitHub release and end up with two release objects for one tag — which is
+# exactly how v0.2.1 first shipped mac-only. Collect the artifacts and let a
+# single downstream job create one release.
+jobs:
+  # A tag is only built if its commit is on main and CI passed on exactly that
+  # commit (see scripts/verify-release-ci.mjs). The build below then does not
+  # repeat typecheck or the verify:* gates: CI already ran them on this sha.
+  gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      # The commit the tag pointed at when this gate ran. build and release
+      # check out this sha, never the tag name again, so a tag moved (or a
+      # branch of the same name pushed) after the gate is not built unchecked.
+      sha: ${{ steps.verify.outputs.sha }}
+    steps:
+      - name: Checkout (full history, to judge reachability from main)
+        uses: actions/checkout@v5
+        with:
+          # Fully qualified: a bare name is looked up as a branch before a tag.
+          ref: ${{ github.ref_type == 'tag' && github.ref || format('refs/tags/{0}', inputs.tag) }}
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Require green CI on the tagged commit, on main
+        id: verify
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/verify-release-ci.mjs
+
+  build:
+    needs: gate
+    # npm install runs dependency install scripts here; keep the token that a
+    # compromised dependency would get read-only.
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Setup Python (for node-gyp)
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        # `npm ci` is strict about lockfile↔node/npm version parity and the
+        # solo-dev workflow here doesn't pin a node runtime, so lock drift
+        # blocks releases. `npm install --no-audit --no-fund` is one step
+        # looser and reconciles at install time — dep resolution still deterministic
+        # via the lock, just tolerant of the optional-platform-entry drift
+        # between different npm majors.
+        run: npm install --no-audit --no-fund
+
+      - name: Run tests (Node ABI)
+        run: npm test
+
+      - name: Build renderer + main
+        run: npm run build
+
+      - name: Package macOS (dmg + zip, arm64)
+        if: matrix.os == 'macos-latest'
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+        run: npx electron-builder --mac --publish never
+
+      - name: Package Windows (NSIS, x64)
+        if: matrix.os == 'windows-latest'
+        run: npx electron-builder --win nsis --x64 --publish never
+
+      - name: Package Linux (DEB, x64)
+        if: matrix.os == 'ubuntu-latest'
+        run: npx electron-builder --linux deb --x64 --publish never
+
+      - name: Verify packaged capture resources
+        run: npm run verify:package-resources
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v5
+        with:
+          name: redlog-${{ matrix.os }}
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            dist/*.exe
+            dist/*.deb
+            dist/*.blockmap
+            dist/latest*.yml
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    needs: [gate, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout release verification and notes
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Install release verification dependency
+        run: npm install --ignore-scripts --no-audit --no-fund
+
+      - name: Download all installers
+        uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+
+      - name: Require complete matching release assets
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+        run: node scripts/verify-release-assets.mjs artifacts
+
+      # One checksum file over the installers themselves (not blockmaps or the
+      # auto-update latest*.yml), keyed by the asset name an operator downloads
+      # so `sha256sum -c SHA256SUMS.txt --ignore-missing` works next to it.
+      # GitHub renames spaces in uploaded asset names to dots
+      # ("RedLog Setup 0.16.1.exe" → "RedLog.Setup.0.16.1.exe"); list them that way.
+      - name: Generate SHA256SUMS.txt
+        run: |
+          set -euo pipefail
+          sums=artifacts/SHA256SUMS.txt
+          : > "$sums.tmp"
+          find artifacts -type f \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' -o -name '*.deb' \) -print0 |
+            while IFS= read -r -d '' f; do
+              name=$(basename "$f")
+              printf '%s  %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "${name// /.}" >> "$sums.tmp"
+            done
+          if [ ! -s "$sums.tmp" ]; then
+            echo "::error::no installer artifacts to checksum"
+            exit 1
+          fi
+          sort -k2 "$sums.tmp" > "$sums"
+          rm "$sums.tmp"
+          cat "$sums"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+          name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+          body_path: docs/RELEASE-${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}.md
+          fail_on_unmatched_files: true
+          files: artifacts/**/*

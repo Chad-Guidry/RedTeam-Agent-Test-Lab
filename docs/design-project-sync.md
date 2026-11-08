@@ -1,0 +1,346 @@
+# Design project ↔ repo sync
+
+Mirror of `github.md` in the Claude Design project "RedLog 設計規範". That
+project is where `UIUX-STANDARD.md` and the phase PR templates are authored;
+this file records which repo files each design screen was drawn from, so a
+change to a component tells you which screen went stale.
+
+---
+
+repo: guan4tou2/REDLOG
+branch: main
+path: src/renderer
+
+## Last sync
+
+date: 2026-09-09T00:00:00Z
+
+### 2026-09-09 · 後端完成 → design 待接 UI（交接清單）
+
+以「後端我做、UIUX 交給 design」的分工,本輪把數個設計缺口的**後端**落地(IPC/preload/core
+函式 + 測試),UI 留給設計端。契約如下,design 端接 UI 時對照此表。
+
+| 缺口 | 後端契約(已就緒) | design 端要做的 UI |
+|---|---|---|
+| **7a 範圍外標示** | `lib/scope.ts` `hostOutOfScope()`;HttpHistoryPanel 已上 badge | (已含基本 UI)可再精修樣式 |
+| **截圖差異靈敏度** | `config.screenshot.diffThreshold`;設定組已有按鈕 | (已含基本 UI) |
+| **command-linked 截圖** | `config.screenshot.captureOnCommand`;command_end 觸發、trigger=`command`、`_causes` 連結;設定組已有勾選框 | **是 2d 觸發原因軸多一個值**「隨指令」(design 已加 chip,非新功能);截「哪個視窗」精修留後續 |
+| **3c 需要注意互動層** | `dismissIssue`/`dismissAllPending`(下層〈忽略/全部忽略〉,session-only、不寫稽核);上層〈修復〉的動作 IPC 已在(`chain:anchorNow` 重試錨定、`chain:verify` 驗鏈);導航用 Issue 的 `view` | 兩層互動彈出層、每列〈修復〉/〈診斷〉鈕(上層無關閉、下層可忽略) |
+| **NDJSON(ELK)匯出** | IPC `data:exportNdjson({scopeOnly?,scrubPii?})` → 檔案路徑;匯出選單已有「NDJSON」項 | `scopeOnly`/`scrubPii` 做成選單勾選(現為全部+內容遮蔽) |
+| **walkthrough(逐字稿依主機分段)** | IPC `data:exportWalkthrough` → `.md` 就緒 | **不是第四種格式**(design 2026-09-09 裁定):逐字稿 Markdown 匯出的〈依主機分段〉開關,預設關。已移除獨立選單項,後端待接該開關 |
+| **pcap 擷取** | `hooks/pcap-agent.py`(CLI producer,同 mitmproxy);API 白名單 + LOGGED_TIER 已接 | 時間軸 pcap = 流量組多一列;設定裡的擷取來源啟動器/狀態 |
+| **10a 因果鏈** | ~~IPC `events:hostChain(host)`~~ 已移除(2026-09-23):面板一直沒做,Spec 014 的 `events:causalChain` 已涵蓋 | **Inspector〈相關〉面板**:表頭 + 策展鏈清單、command 對摺(`collapseCommandPairs`)、範圍徽章(`lib/scope.ts`)、當前事件釘選、〈在目標頁開啟〉/⌘↩ |
+| **5a 更新前錨定** | `core/update-anchor.ts` `anchorBeforeRestart()`;(IPC `app:anchorForRestart` 已移除,無呼叫者);updater「前往下載」已自動觸發 | 狀態列青點、不彈視窗的更新卡、「約 8 秒不記錄」確認框 |
+| **5c 操作員金鑰管理** | ~~IPC `operators:create`/`rotateToken`/`revoke`/`rename`/`pubKey`~~ 已移除(2026-09-23:無 UI 卻能建立 API token);`operators:list` 已補 `signerPubKey`;token 寫 `~/.redlog/tokens/<id>.token`(0600、專案樹外),IPC 只回**檔案路徑**不回 raw token(§10) | 5c 操作員頁:清單(名稱/主要/建立時間/公鑰)、〈新增〉、〈輪替金鑰〉、〈撤銷〉、〈改名〉;金鑰檔用 `data:revealPath` 揭示,不在畫面顯示 token |
+| **2b 終端機 per-pane 記錄狀態** | `terminal:list` 每列回 `recording`/`castBytes`/`castTruncated`/`paused`/`castStartedAt` | **三種 chip,不可都寫「未記錄」**(§28.7):`recording=true`→綠「記錄中」;`recording=false && castTruncated`→**琥珀「已停錄」**(撞 50 MB 上限,操作員最易漏、以為還在錄);`recording=false && !castTruncated && castStartedAt==null`→灰(cast 開不了,附〈診斷〉)。互動式工作階段的灰點既有 pane 已正確處理 |
+| **2d 截圖批次刪除分級** | ~~IPC `screenshot:markerReferenced(ids[])`~~ 已移除(2026-09-23:沒有批次刪除 UI);刪除仍走既有 `screenshot:deleteFile`(每檔寫 `system.screenshot_deleted` + `sha256_pre_delete`,鏈見證) | 依回傳挑確認層級:空→第二級(勾選框);非空→第三級(輸入確認)。刪除本身逐檔呼叫 deleteFile |
+
+**仍未動(多為 UI 為主,後端多已具備)**:3c 需要注意互動彈出層(`dismissIssue` 後端在)、2b 終端機
+per-pane chip(**後端已就緒,見上表——UI 須拆三態,勿都寫「未記錄」**)、5b 終端機設定頁(config 後端在)、4d 逐字稿首行/自動展開、4b 違規展開 +
+inline 加入允許清單、5c 操作員金鑰管理 UI(後端 IPC 已移除,要做時再加回)、4e 標記圓點嚴重度 + 截圖圖示、2c 標記對話框〈將一併記錄〉、
+2d 截圖 ×N/SHA-256/批次刪除升級(**分級查詢後端已就緒,見上表**)、時間軸 Inspector 分頁/事件流 >50 折疊/鏈警示/在逐字稿上顯示/圖例中文。
+**刻意不做**(2026-09-09 裁定):flag/proof 偵測、MITRE 技術欄(非通用工具定位);2a PDF 報告(改純資料匯出);
+at-rest 加密(維持「信任本機」假設,暫不)。
+（**修正 2026-09-09 §28.7**:2d 批次刪除先前誤記為「涉永久刪除、依安全約束不做」——實為分級問題,非安全問題:§12 的
+`screenshot:deleteFile` 已寫鏈見證 tombstone,證據性質未破壞,缺的只是「批內哪些被標記引用」的查詢。已補。）
+
+**設計端回寫(2026-09-09)**:八項後端交回,設計端確認六項本就有對應畫面(7a/截圖差異/NDJSON/pcap=
+流量組一列/10a/5a);兩項改為既有軸的延伸而非新增——walkthrough 收為逐字稿匯出的〈依主機分段〉開關
+(已移除獨立匯出項),command 截圖收為 2d 觸發原因軸的第四個值「隨指令」(設計稿已補 chip)。全稿 30 板
+無溢出/壞連結、§0–§28 與設計稿一致,設計端無待辦,UI 由 repo 端接。
+
+### 2026-09-09 · turn 10 鏡像（設計稿新增，鏡像原止於 turn 9）
+
+設計專案新增 **turn 10「解開搜尋頁那條鏈」（10a–10b）**，本地鏡像（2026-09-04 取回，止於 turn 9 /
+§22）尚未含它。已鏡像進 `docs/UIUX-STANDARD.md` §24 並附實作狀態：
+
+- **10a Inspector ▸〈相關〉**（host 因果鏈策展面板：DNS 首解→指令→戰利品→標記→違規，大白點釘當前
+  事件，只列理解轉折事件）—— 🔴 **未實作**。repo 有時間軸 `focusChain` 因果高亮與底部面板的
+  `_causes`／效應 chip，但沒有這個以 host 為範圍、策展成清單、釘住當前事件的〈相關〉面板。turn 10
+  相對鏡像的主要程式缺口。§6「Inspector 底部面板、無分頁」分歧維持，但〈相關〉的內容仍待補。
+- **10b ⌘K ▸ host**（Host 分組排在事件之前，每列帶事件數／範圍狀態／↩ 目標頁）—— ✓ **已實作**
+  （#78，`distinctHosts()` 兩層聚合 + ⌘K「主機」段）。小分歧待 UI 目視：host 是否恆排在事件之上、
+  以及從 host 列直跳〈↩ 目標頁〉（現為跳時間軸）。
+- **刪搜尋頁**（turn 10 收尾主張 10a／10b 上線後即可刪）—— ▲ 分歧，repo 已領先其立論：§23
+  （2026-09-08）保留搜尋頁，理由是 turn 10 前提沒算到 `.cast` 錄影全文搜尋（FTS5、`readCastRange`）
+  這第三個用途，⌘K 承載不了。
+
+**同時啟動一次以 design 為準的逐畫面（turn 2–10）全面對照**，找出鏡像可能漏記的缺口；結果另記。
+
+### 2026-09-04 · 書籤裁決：標記只指一件事
+
+8b 留下的那一項已裁決。結論不是「把 `quickmarks` 也改成附加式」，而是**它本來就不是紀錄**，
+而產品一直在宣稱它是。
+
+**證據由程式碼決定，不是由側欄上那兩個字決定。** 那張表六個欄位，沒有 `operator_id`、沒有
+`engagement_id`、沒有 `hash`。頁面上每一個功能都是書籤功能:每 3 秒輪詢 CDP 抓當前分頁、
+標題與網址自動帶入、「用外部瀏覽器開啟」、一顆由標題雜湊決定顏色（不編碼任何語意）的圓點。
+它自己的文案就這麼寫:「Click + Capture to **bookmark** the current browser state」。
+`docs/ARCHITECTURE.md` 早就把它分類為「Bookmarks. Not chained.」
+
+**所以假的不是「這張表可以改」——可以改對書籤是正確的。假的是這三件事，本次全部拆掉：**
+
+1. **側欄叫它「標記」**，但每一個操作員會稱為「落標記」的手勢——⌘⇧M、標題列的〈+ 標記〉、
+   系統列、兩個 HUD 按鈕、時間軸右鍵——寫的都是鏈上 `marker` 事件，從不碰這張表。那頁的空狀態
+   甚至叫人按 ⌘⇧M，而那個鍵在它上面產生不了任何一列。
+2. **它以證據的身分出貨。** `quickmarks.json` 無條件、未過濾地寫進證據包,躺在 `events.jsonl`
+   旁邊,而證據包 README 只分類兩個檔案、從未提到它,隨附的 `redlog-verify.py` 也從來沒打開過
+   它。更尖銳的是「範圍過濾匯出」:事件走了 `queryScopeFilteredEvents`,書籤沒有——所以一份
+   宣稱按範圍過濾的檔案，會夾帶操作員刻意排除的主機網址。
+3. **8b 已出貨的裁決說 `url` 是標記的不可改欄位**,而 marker 事件根本沒有 `url`。
+
+**為何不做成附加式（方案 A）**:在一張沒有 hash／簽章、不在鏈上也不在錨定裡、驗證器從不打開
+的表上加 trigger,只買到不可變的**感覺**而沒有任何驗證能力——`sqlite3 ... DELETE FROM
+quickmarks` 照樣有效。同時它會拿掉唯一的移除途徑:`createQuickMark` 不跑 redaction,`sanitize`
+只讀 `events`,所以貼進備註的密碼**兩個方向都遮不掉**,操作員唯一的辦法就是硬刪。做成附加式
+之後,那筆憑證會連同它的「更正」一起留著——而在此之前它還會進證據包。
+
+**本次做了什麼**
+- `marker` 事件補上 `url`（開啟對話框時由 CDP 帶入一次、可改），**不可修訂**——它是指向,是
+  `atTimestamp` 的網頁類比。這讓 8b 已出貨的那句話變成真的,8b 也因此從「部分」轉為完成。
+- `quickmarks.json` 移出證據包（bundleVersion 2 → 3）、移出 `data:exportJson`、移出範圍過濾
+  匯出。頁面自己的匯出改寫到 `<專案>/bookmarks/`,並在檔案裡寫明它不是證據。
+- 使用者可見的部分全面正名為「書籤」（側欄、圖示、37 個 i18n 鍵、視圖 id、揭露訊號、釘選的
+  localStorage 鍵含一次性搬移）。空狀態重寫——它原本描述的是 marker 事件。
+- REST 不再接受呼叫端給的 `context`:UI 把那個物件標成「自動擷取」,等於讓任何持 token 者把
+  自選的來源資訊放到畫面上。
+
+**未做,已記錄**:內部識別字（`findings.ts`／`FindingsView.tsx`／`quickmarks:*` IPC／REST 路由／
+CLI 動詞／外掛能力字串 `read:findings`）仍是舊名。那批要連同別名一起改才不會弄壞第三方外掛
+manifest 與已安裝的整合,屬於另一次純改名的 PR。SQL 表名也維持 `quickmarks`——改名要考慮舊版本
+開啟已遷移專案的情形。
+
+**其他開放項**:書籤沒有任何保存期限清理（`retention.ts` 完全沒提到它），而一個存著貼上憑證與
+擷取到的外部 IP 的私人便條本永久留存,在「它只是便條本」的裁決之後只會更站不住腳,不是更站得住。
+
+### 2026-09-04 · 回寫設計專案（單向鏡像首次雙向）
+
+操作員登入 `/design-login` 後，本次把 `github.md` 寫回設計專案（8a／8b／9a／9b／5c 的落地
+狀態、命名裁決、收緊後的解鎖條件、以及順手修掉的既有缺陷）。
+
+**方向是單向的，兩邊各取所長。** 設計專案的 `docs/UIUX-STANDARD.md` 沒有被覆寫——那份有
+22 節，整份寫回會蓋掉設計側的內容，規範本體仍以設計專案為著作處。反過來，repo 這份鏡像則
+**改為設計稿全文**（22 節，2026-09-04 取回），原本只有 11 節的部分鏡像作廢。
+
+鏡像加上、也只加上**實作狀態註記**：`✓ 已實作` 與 `▲ 分歧`（附原因與 commit）。敘述本身
+一字不改。這樣 repo 端讀到的是完整規範，而不會重新宣稱程式碼裡沒有的東西——§6 的三種檢視
+模式已 revert、搜尋頁保留、雲端分享／webhook／市集已移除，這四處若照抄設計稿就會是假的。
+
+順帶修掉設計稿在傳輸中混進的簡體字與一處錯字（单一／实際／琳璀色／「進定要表在 9b」），
+repo 全庫是繁體。
+
+**裁決（2026-09-04）**：那張表是**書籤**，不是紀錄——見下方同日條目。
+### 2026-09-04 · 9a／9b／5c 漸進揭露落地
+
+§22 上線。第一天側欄四格，其餘頁面在自己的資料出現後才列出；隱藏不等於不可達（⌘K
+一律列全部、快捷鍵照舊、外觀頁有總開關）。首次執行改為單一路徑：內建終端機加一條會亮
+起來的時間軸長條，十個擷取來源降為折疊區。
+
+**每個「更寬鬆的版本」都會壞掉，這是本次真正的工作內容：**
+- **證據**不能定義成「非 housekeeping」。alert runtime 每次開專案都啟動，IP policy 無條件
+  送第一筆判定，所以幾秒內就有一筆非 housekeeping 的上鏈列——首次執行畫面會自己消失。
+  改用正面述詞 `EVIDENCE_SQL`；`HOUSEKEEPING_SQL` 刻意不擴大（時間軸鏡像它，那筆判定
+  該留在時間軸上）。
+- **目標／範圍**只算指令推導出的目標。proxy 對每筆 HTTP／DNS、連線監控對每個 socket 都會
+  蓋 `target_id`，跨型別去算的話一次瀏覽器開頁就解鎖兩頁。
+- **HTTP** 等 logged 層的流量，因為那頁只查 logged 層；上鏈的 `scanner:connection` 會解鎖
+  一張永遠空的頁。**標記**等 `quickmarks` 列，不是 `marker` 事件（兩個儲存區，且後者可由
+  外部 POST）。
+- **層級字符**在 logged 層被清空後仍在，靠的是活得比資料久的稽核列。
+- **首次執行畫面用閂鎖**：直接讀 `firstRun` 的話，第一列進來的瞬間畫面就被卸載——而那正是
+  它要讓人看到的一刻。e2e 抓到的。
+
+**順手修掉兩個既有缺陷**：側欄印的是渲染位置而非視圖編號（所以一直有兩列印著 9,還有三個
+開不了東西的 9／10／11）；⌘K 與快捷鍵面板用 `sidebar.http_history` 這個兩本語言檔都沒有的
+鍵，直接把鍵名印給操作員。後者的守衛本來抓不到——字面鍵掃描器看不到動態鍵，而
+`shortcuts.test.ts` 的 fixture 是手抄的舊清單。
+
+**還修了一個 pty 洩漏**：TerminalView 的分頁清單在元件本地 state，離開再回來會拿空清單再
+spawn 一個 pty，把前一個孤兒化——每次進出漏一個 shell。改成先接管既有工作階段，順帶也是
+操作員要的（回到原本那個 session，帶著 scrollback）。
+
+**取捨記錄**：`複數 e2e` 因為側欄會隱藏而需要重新檢視;本次全套 90 個 spec 重跑通過，
+未改動任何既有 spec 的斷言——`openView` 走的 `data-view-btn` 在解鎖後才存在，而需要它的
+spec 都已經先種了對應資料。
+
+### 2026-09-04 · 8a 範圍回溯落地
+
+允許清單存檔後會重算既有事件：不動任何既有列，另寫鏈上 `system.scope_recomputed`
+（摘要與錨點）、回溯 `system.scope_violation`（帶 `judged:'retroactive'`）與
+`system.scope_cleared`（撤回既有違規）。範圍頁有三數橫幅（重算／新標／解除），回溯列
+帶琥珀「事後判定」chip，時間軸上也有對應徽章。
+
+**命名裁決：** 設計稿寫 `scope.recomputed`，實際存的 subtype 是 `scope_recomputed`
+（snake_case）。所有 `system` subtype 都是 snake_case,`classifyTier` 以
+`agent_type:subtype` 為鍵。設計稿散文維持原寫法。
+
+**幾個必須寫下來的判斷：**
+- **撤回由「違規紀錄」算，不是重掃語料。** 語料大半在 logged tier,30 天後被清；
+  重掃式的撤回會讓那些違規永遠掛著。
+- **候選目標用 SQL 從 `data` 推導，不是 `target_id`。** DNS producer 存的是帶結尾點的
+  FQDN，當初判定的是去點形式，而網域比對是精確比對——用 `target_id` 分組會去判定
+  live 路徑從來沒看過的目標。實測分歧已寫成測試。
+- **`unrelated` 不在任何出貨中的 alert floor。** 否則第一次存檔就會替操作員碰過的每個
+  主機寫一筆違規。
+- **不 hash alert floor。** 關掉通知只是縮小回報範圍，不是移動邊界。
+- **三道閘：** 未設定範圍時跳過（`ListField` 的「刪掉唯一目標再重打」會經過該狀態兩次，
+  否則每次要寫約一千筆永久簽章列）、2 秒尾端去抖動（Settings 每 350ms 自動存檔）、
+  專案切換時放棄排程中的工作。
+
+**同時修掉：** 範圍頁本來讀的是記憶體中的違規紀錄（上限 500 筆、切專案歸零、從未由 DB
+補種），所以回溯列根本不可能顯示，已撤回的違規也會一直被計入。現已改由鏈供應，計數
+做快取、只在三種 scope subtype 落地時失效——StatusBar 與側欄每筆事件都會問一次。
+
+**已知取捨：** retention 的 body pinning 仍用 `matchTarget`（子字串比對，`evil` 會命中
+`a.evil.example`），與 policy matcher 不同。回溯必須用 policy matcher（與當初判定一致才
+有意義）；兩者的分歧已寫成測試記錄，不在本次統一。
+
+### 2026-09-03 · 8b 標記修訂落地（部分）
+
+`marker` 事件已上修訂模型：鏈上 `marker` + `data.subtype='amended'`（帶 `markerId` 與
+`_causes`，只夾帶變更欄位）、Inspector 內編輯標題／嚴重度／備註、時間軸與搜尋顯示
+「已修訂 N 次」、匯出與鏈驗證都涵蓋。原列一個位元組都沒動——`events` 的
+append-only trigger 本來就不允許，這正是把修訂做成新事件而非 UPDATE 的理由。
+
+**與設計稿的三處落差，都是設計稿描述的欄位在 repo 不存在：**
+- **沒有 `url` 欄位**。`marker` 事件只有 title/notes/severity/category（+ 選填
+  `atTimestamp`）。`url` 屬於 `quickmarks` 表。
+- **截圖不是 marker 的欄位**。截圖是另一筆鏈上事件，由它以 `_causes` 指回標記；
+  Inspector 讀反向關係。
+- **「來源事件」目前沒有產生者會設**。marker 自己的 `_causes` 是空的，所以那一列
+  只在真的有值時出現，不做假的「無」。
+
+**為何記為部分完成：** 設計稿的「標記」畫面對應的是側欄 `marks` 頁
+（`FindingsView.tsx` → `quickmarks` 表），那張表至今仍是可覆寫的書籤表
+（`findings.ts` 的 UPDATE / DELETE），也是設計稿那個 `url` 欄位真正的所在，而且原樣
+倒進證據包。若標成「已完成」，等於告訴設計專案「紀錄可修、不可篡改」對「標記」成立
+——但目前只對兩個叫這名字的東西之一成立。quickmarks 那一半仍留在「設計新增、repo
+未做」，是本次之後最該裁決的一項。
+
+**順手修掉三個既有缺陷**（都不是本功能造成的）：`marker:create` 丟掉
+`atTimestamp`、標記事件發布時未 `bypassPause`（暫停中寫的標記進了鏈卻不顯示）、
+標記文字沒有 redaction spans（第四層因此永遠遮不掉標記備註裡的密碼）。
+
+**留待處理：** Timeline `eventCompare` 的 BigInt tiebreak 是死碼（`padMonoNs` 會寫出
+帶連字號的前綴，`BigInt()` 直接丟例外），同毫秒事件實際上以 UUID 排序；
+`marker.atTimestamp` 的 i18n 用單大括號，對每位操作員都是字面渲染。兩者都不在 8b
+的渲染路徑上，另案處理。
+
+### 2026-08-24 · 設計專案 turn 7–9 對帳（22 節 vs 鏡像 11 節）
+
+設計專案自 08-20 後獨立成長到 **22 節、25+ 區塊**，repo 鏡像停在 11 節；同期 repo 實作跑完三期並做了核心修訂
+（`DESIGN-core-and-capture.md`），**兩邊互不知道對方動了**。本次以 repo 為準記錄三類差異：
+
+**設計新增、repo 已有（設計稿不知道）**
+- **§21 七條 CI 規則測試** — 六條早已是 repo 守衛：對比度與 3:1（`design-tokens.test.ts`）、填色配深字與「白字必不過 AA」反向斷言（`buttons.test.ts:117`）、13px 下限（`design-tokens.test.ts:94`）、泳道單色（`lane-colours.test.ts`）、ConfirmDialog（`confirm-dialog.test.tsx`）。只缺 #6「危險紅不上數值」，本次補上 `test/danger-not-on-numbers.test.ts`。
+- **7a 流量歷史** — 已實作，且按 `DESIGN-core` §3 收成活動視圖（點/線），非設計稿的逐連線表格。
+- **7c 錄影內搜尋** — 已實作（`cast-index.ts`，FTS5）。
+
+**設計與 repo 分歧（repo 依核心修訂走了另一條路）**
+- **§6 三檢視模式（作業中／稽核／除錯）** — repo 曾實作後 **revert**（`59ff5fc`：它把人設硬套在旗標組合上，預設落在「除錯」）。改為按作用分組 + 罕用項 overflow（`48713ba`）。
+- **7b 四閘模型 / 2a 證據包上傳** — 雲端分享整個移除（散佈基礎設施，非核心）；證據包留在單一匯出控制項。
+- **§10 側欄搜尋頁刪除** — repo **復原**了搜尋頁（事後找證據是核心用途，下拉不是對的形狀）。
+- **§10 外掛信任 / registry 發行者** — 市集整個移除；設計稿 §0 也已把 2f 市集面板標為移除，方向一致。
+- **§10 藍隊 webhook redaction** — deconfliction webhook 已移除。
+- **18 泳道** — 設計稿只做單色化；repo 進一步按擷取組分帶（`183b9ac`）。
+
+**設計新增、repo 未做（待裁決）**
+- **8a 範圍回溯**：~~待做~~ → **已完成**（見下方 2026-09-04 條目）。
+- **8b 標記修訂**：~~待做~~ → **部分完成**（見下方 2026-09-03 條目）。
+- **9a 首次執行單一路徑**：~~待做~~ → **已完成**（見下方 2026-09-04 條目）。
+- **9b 漸進揭露（§22）**：~~待做~~ → **已完成**（同上）。
+- **5c「一次顯示所有頁面」開關**：~~待做~~ → **已完成**（同上，按專案存）。
+
+**設計專案該被告知的**（2026-09-04 已回寫 `github.md`，見該檔 2026-09-04 條目）
+核心修訂（防竄改 → 可知性）、三期已全部完成、上述五處分歧。設計稿最後一則建議「實作第一期 tokens」已過時——三期皆併入 `main`。
+
+抽取方式備註：DesignSync 無授權、沙盒瀏覽器撞登入牆、Chrome 擴充套件對 design SPA 的分頁反覆 park；最終以設計專案的對話紀錄 + 編輯器前 47 行（§0、§1 逐字）為據，其餘章節為敘述層級對帳。
+
+### 2026-08-20 · §10 裁決後同步
+
+- §10 新增兩條規則，把「為什麼」寫進規範本身，避免下次重新裁決一次：
+  移除 hook 屬第一級（非第二級），以及暫停錄製的文案不得聲稱「不會擷取任何東西」。
+- 1c 的第二級範例由「移除 Shell hook」換成「信任外掛發行者」——前者是可復原的，
+  真正的風險（悄悄停止擷取）由常駐的〈需要注意 N〉指示器承接，而不是一次性的對話框文字。
+- 兩條規則在 `main` 上都已成立：hook 移除走 `toastDeferred`，暫停文案已修正。
+
+### Updated in this project
+- 對照 main（v0.14.3 + 未發布 commit）確認設計 tokens 未變：`tailwind.config.js`、`lib/hud.ts` 逐字節相同。
+- `styles/index.css` 已變動（新增殼層 `user-select: none`），規範的 index.css 建議片段已同步保留該段。
+- 新增原生右鍵選單子系統（`src/main/context-menu.ts`），規範新增右鍵互動規則，並標記它與時間軸「右鍵落標記」的衝突。
+- 產出 `docs/UIUX-STANDARD.md`（規範摘要 + 三期檢查表）與三張分期 PR 模板。
+
+### 2026-09-04 · 標誌原稿取回，並且真的換上去
+
+`assets/redlog-mark.svg` 與 `assets/redlog-mark-small.svg` 從設計專案取回，放在 repo 的
+[`design/assets/`](../design/assets/)，並且已經套用：`.icns`、`.ico`、七張 app PNG、系統列三態
+各 1x／2x 全部重新產生，`resources/logo.svg`（手排的向量字標，§16 說不該存在）刪除。
+產生器是 `tools/make-icons.py`，守衛是 `test/mark-assets.test.ts`。
+
+設計稿本體（`RedLog 設計規範.dc.html`，畫板 1a–9b）**沒有**複製進 repo。它在設計專案裡著作與編輯，
+複製一份只會多出一個會漂的真相；repo 這邊有的是從它萃取的文字規範全文（22 節）。要看畫面就開設計專案。
+
+**要回寫設計專案的七件事**（都已寫進 `UIUX-STANDARD.md` §16 的分歧清單）：
+
+1. **環收成點的門檻**：§4 寫「16px 以下」、§16 寫「256 以下」，同一份文件兩個數字。
+   量過之後兩個都不對——環寬在 16px 是 1.15px、22px 是 1.58px、32px 是 2.30px，只有 32 讀得出環。
+   實作採 32，設計端請把那兩句改成一個數字
+2. **系統列不能用本標誌**。§4 把「系統列」列在切角符號的使用場合，但 macOS 的 Template 圖只讀 alpha，
+   而新標的底板全不透明——環與點會被整個丟掉，選單列上只會出現一塊純黑切角方塊。
+   實作改用只有環與點、沒有底板的另一組圖
+3. **系統列的比例對齊像素**：16×16 畫布上環外徑 12、環寬 2、內點 4（16.7%／33.3%），
+   而不是 16%／30%。差 0.67pt 與 3.3pt，換 1x 選單列還讀得出來
+4. **`setTemplateImage` 只有 macOS 有作用**，所以「單色場合用 `#ececf0` 或純黑」在 Windows／Linux
+   不成立——純黑在深色工作列上等於看不見。那兩個平台的系統列圖改用 `#d75f63`
+5. **環與點的顏色沒有被授權過**。原稿用 `#16090a`，但 §4 說標誌永遠 `#d75f63`，而 `#16090a` 在規範裡
+   只被定義為「實心 accent 按鈕上的深色字」。請補一條規則
+6. **系統列的錄製狀態仍然閃爍**，§4 說標誌不動畫。實作沒有動它——那是狀態指示的行為，該由設計端裁決
+7. **第三期檢查表的「單一字標」打勾是錯的**。標題列與 Project Picker 兩處都還是「圖片 + 純文字 REDLOG」，
+   而且那串字用的是 `text-red-500`（`#cf5459`），不是 `#d75f63`。已改回未勾，並記為 §16 分歧
+
+## Screen map
+
+| 專案畫面 | 依據的 repo 檔案 |
+|---|---|
+| 1a 規範 · 色彩 tokens | `tailwind.config.js`, `src/renderer/src/lib/hud.ts`, `src/renderer/src/styles/index.css` |
+| 1a 規範 · 泳道配色 | `src/renderer/src/components/Timeline.tsx`（LANES / LANE_COLORS）, `test/lane-colours.test.ts` |
+| 1a 規範 · 快捷鍵表 | `src/renderer/src/App.tsx`, `src/renderer/src/components/Sidebar.tsx`, `src/renderer/src/lib/sidebarOrder.ts` |
+| 1a 規範 · 術語與譯名 | `src/renderer/src/i18n/zh-TW.json` |
+| 1b 儀表板 | `src/renderer/src/App.tsx`（DashboardView / CaptureHealthCard / StatCard）, `src/renderer/src/components/IPStatusCard.tsx` |
+| 1b 時間軸 | `src/renderer/src/components/Timeline.tsx` |
+| 1b 逐字稿 | `src/renderer/src/components/TranscriptView.tsx` |
+| 1b 目標 | `src/renderer/src/components/TargetView.tsx` |
+| 1b 範圍 | `src/renderer/src/components/ScopeStatus.tsx` |
+| 1b 戰利品 | `src/renderer/src/components/LootPanel.tsx` |
+| 1b 標記 | `src/renderer/src/components/BookmarksView.tsx` |
+| 1b 設定 | `src/renderer/src/components/Settings.tsx` |
+| 1b 狀態列 | `src/renderer/src/components/StatusBar.tsx` |
+| 1b 側欄／標題列 | `src/renderer/src/components/Sidebar.tsx`, `src/renderer/src/App.tsx` |
+| 1b Project Picker | `src/renderer/src/components/ProjectPicker.tsx` |
+| 1b / 1c HUD Overlay | `src/renderer/src/OverlayApp.tsx`, `src/renderer/src/lib/hud.ts` |
+| 1c 全部改良畫面 | 以上各檔為基準，套用 1a 規範 |
+
+### 2026-09-06 · repo→設計回寫(第二次雙向)
+
+repo 端把 code 與 `UIUX-STANDARD.md` 逐節對照後,經 claude-in-chrome 在設計專案「UI/UX統一標準建立」
+的對話送出三點對帳,設計側全部反映並寫回其 `UIUX-STANDARD.md` 與設計稿 `.dc.html`:
+
+- **§4 單一字標**:repo 已實作(F2,`Wordmark` 元件),設計稿 §16／§22 狀態註記從「未實作」翻成已實作。
+- **§2 13px 下限**:repo 已把 HttpHistoryPanel(12 處)與 Timeline(6 處)從 10–11px 拉到 13px。
+- **§23 分歧裁定**:設計側新增 §23,對五處既存分歧各給裁定。**一項反向指令回到 repo**——搜尋頁不作為
+  最終狀態,列為第三期末項,待 ⌘K 涵蓋 host 聚合後刪除(見下方 backlog)。
+
+repo 這份鏡像同步加了 §23。**方向仍是各取所長**:規範本體以設計專案為著作處,repo 加實作狀態註記。
+
+**新增 backlog(設計指令)**:⌘K 加上 host 聚合後,移除獨立的搜尋頁(§10 / §23 的裁定)。
+
+
+### 2026-09-07 · 讀設計專案 UIUX-STANDARD.md 的落差盤點
+
+透過 DesignSync 讀設計專案（834552e9）的 `docs/UIUX-STANDARD.md` 與 `github.md`，對照 repo 現況：
+
+- **設計端已反映 2026-09-07 的三面對帳**：設計稿新增 **§24**，對三個新 UI 面各給裁定——(1) 磁碟壓力預算欄 `0` 必須顯示「全留」而非 0、淘汰邏輯一句寫在欄旁、寫 `system.artifact_rotated`、用量進度條;(2) plugin producer 唯讀列、閒置不算 problem、側欄徽章不計 idle、只有「該 emit 卻心跳斷」才進〈需要注意〉;(3) 匯出遮蔽覆寫用「將原樣輸出範圍外內容（N 筆）」、琥珀非危險紅、N=0 整條隱藏、寫 `evidence.exported`。**這些是設計端對已出貨 UI 的細化裁定，屬未來調整項，非阻擋項。**
+- **設計端的 Phase-1 狀態已過時**：設計稿 §22 仍寫「第一期 tokens 尚未実作」，但 repo 的 `tailwind.config.js` 早已落地整張 §1 token 表（`bg #121214`、`text-dim #9a9aa4`、`lane #6e6e78`、`danger #ff4d4f`、`on-accent/on-danger`、Noto Sans TC/JetBrains Mono 家族）、fontSize 下限 13/15/17、`index.css` 密度變數與捲軸、`Timeline` LANE_COLORS 統一。**待回寫設計端：Phase-1 token/density/fontSize 實際上已做，只差字型「打包」（.woff2 檔）與 Lucide 圖示替換兩項。**
+- **§21 規則測試補上**：設計稿 §21 要求的 `test/design-rules.test.ts`（對比度、無 <13px、無 text-white、危險紅不上數字，全由原始碼解析）repo 先前沒有，本次補上並綠。順帶抓到並修掉一處自造違規——擷取卡 plugin 標記用了 `text-[10px]`（#49 加的），改回 `text-xs`。
+
+**待回寫設計端（下次溝通）**：Phase-1 token/density/fontSize 已實作(設計 §22 請更新)、§21 測試已存在。字型打包與 Lucide 替換仍為 Phase-1 殘留。

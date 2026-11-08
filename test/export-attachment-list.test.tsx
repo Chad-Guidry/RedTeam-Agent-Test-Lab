@@ -1,0 +1,106 @@
+// @vitest-environment jsdom
+//
+// #222: the evidence-bundle preview lists each file with the targets it is
+// tied to, and unticking one resolves the plan again without it — so what is
+// confirmed is exactly what was previewed.
+import { Profiler } from 'react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { ExportMenu } from '../src/renderer/src/components/ExportMenu'
+import { I18nProvider } from '../src/renderer/src/i18n'
+
+const rows = (excluded: string[]): ExportAttachmentRow[] => [
+  { id: 'casts/term-1.cast', kind: 'cast', bytes: 2048, targets: ['a.test', 'b.test'], attribution: 'cross-target', status: 'included', source: 't1' },
+  { id: 'casts/term-2.cast', kind: 'cast', bytes: 10, targets: ['a.test'], attribution: 'target', status: 'included' },
+  { id: 'screenshots/x.jpg', kind: 'screenshot', bytes: null, targets: ['a.test'], attribution: 'target', status: 'missing' }
+].map((r) => (excluded.includes(r.id) ? { ...r, status: 'excluded-by-operator' as const } : r)) as ExportAttachmentRow[]
+
+function plan(excluded: string[]): ResolvedExportPlan {
+  return {
+    id: `plan-${excluded.length}`, fingerprint: `fp${excluded.length}567890abcdef`, expiresAt: Date.now() + 1000,
+    snapshot: { chainedMaxRowId: 1, loggedMaxRowId: 1, takenAt: 1_700_000_000_000 },
+    scopeSnapshot: { targets: ['a.test'], excludeTargets: [], personalDomains: [] },
+    capabilities: { snapshot: true, boundedSubset: false, scopeMasking: true, piiScrubbing: false, attachments: true },
+    request: { format: 'bundle', subset: { kind: 'all' }, maskOutOfScope: true, scopeOnly: false, scrubPii: false, excludeAttachments: excluded },
+    counts: {
+      examined: 3, included: 3, excludedDoNotExport: 0, excludedPersonal: 0, maskedOutOfScope: 0, sanitized: 0,
+      attachmentsIncluded: 2 - excluded.length, attachmentsMissing: 1, attachmentsUnattributed: 0,
+      attachmentsExcludedByOperator: excluded.length, unsupported: 0
+    },
+    attachments: rows(excluded)
+  }
+}
+
+afterEach(() => { cleanup(); vi.restoreAllMocks() })
+
+describe('bundle preview: per-attachment selection (#222)', () => {
+  it('lists each file with its targets, flags a cross-target cast, and re-resolves without an unticked one', async () => {
+    const resolve = vi.fn(async (req: ExportRequest) => ({ ok: true as const, plan: plan(req.excludeAttachments ?? []) }))
+    ;(window as unknown as { redlog: unknown }).redlog = { data: { recentExport: vi.fn(async () => ({ ok: true, delivery: null })), resolveExportPlan: resolve, executeExportPlan: vi.fn() } }
+    const unfocusedCommits: string[] = []
+    render(<Profiler id="attachment-focus" onRender={() => {
+      const row = screen.queryByTestId('export-attachment-casts/term-1.cast')
+      const checkbox = row?.querySelector<HTMLInputElement>('input')
+      if (row?.getAttribute('data-status') === 'excluded-by-operator' && checkbox && !checkbox.disabled && document.activeElement === document.body) {
+        unfocusedCommits.push('excluded attachment committed without keyboard focus')
+      }
+    }}><I18nProvider><ExportMenu totalCount={3} /></I18nProvider></Profiler>)
+    fireEvent.click(screen.getByLabelText('Export'))
+    fireEvent.change(screen.getByLabelText('Export format'), { target: { value: 'bundle' } })
+
+    const list = await screen.findByTestId('export-attachments')
+    const cross = within(list).getByTestId('export-attachment-casts/term-1.cast')
+    expect(cross.textContent).toContain('several targets: a.test, b.test')
+    expect(list.textContent).toContain('approved byte prefix')
+    expect(list.textContent).toContain('operator-PII scrubbing')
+    expect(screen.getByText('Attachments')).toBeTruthy()
+    expect(screen.queryByText('HTTP bodies')).toBeNull()
+    // A missing file cannot be chosen.
+    expect((within(list).getByLabelText('screenshots/x.jpg') as HTMLInputElement).disabled).toBe(true)
+
+    const checkbox = within(list).getByLabelText('casts/term-1.cast')
+    checkbox.focus()
+    fireEvent.click(checkbox)
+    await waitFor(() => expect(resolve).toHaveBeenLastCalledWith(expect.objectContaining({ excludeAttachments: ['casts/term-1.cast'] })))
+    const after = await screen.findByTestId('export-attachment-casts/term-1.cast')
+    expect(after.getAttribute('data-status')).toBe('excluded-by-operator')
+    const excluded = within(after).getByLabelText('casts/term-1.cast') as HTMLInputElement
+    expect(excluded.checked).toBe(false)
+    expect(unfocusedCommits).toEqual([])
+    expect(document.activeElement).toBe(excluded)
+
+    // Ticking it again puts it back.
+    fireEvent.click(within(after).getByLabelText('casts/term-1.cast'))
+    await waitFor(() => expect(resolve).toHaveBeenLastCalledWith(expect.objectContaining({ excludeAttachments: [] })))
+  })
+})
+
+it('warns that screenshot pixels are raw attachments too', async () => {
+  const preview = plan([])
+  preview.attachments = [{ id: 'screenshots/one.jpg', kind: 'screenshot', bytes: 10, targets: ['a.test'], attribution: 'target', status: 'included' }]
+  preview.counts.attachmentsIncluded = 1
+  ;(window as unknown as { redlog: unknown }).redlog = { data: {
+    resolveExportPlan: vi.fn(async () => ({ ok: true, plan: preview })), executeExportPlan: vi.fn()
+  } }
+  render(<I18nProvider><ExportMenu totalCount={3} /></I18nProvider>)
+  fireEvent.click(screen.getByLabelText('Export'))
+  fireEvent.change(screen.getByLabelText('Export format'), { target: { value: 'bundle' } })
+  const list = await screen.findByTestId('export-attachments')
+  expect(list.textContent).toContain('Raw attachments do not apply content-level scope filtering')
+})
+
+it('allows explicitly adding a recording excluded by the bounded-selection policy', async()=>{
+ const resolve=vi.fn(async(req:ExportRequest)=>{
+   const preview=plan([])
+   preview.attachments=[{...rows([])[0],status:req.includeAttachments?.includes('casts/term-1.cast') ? 'included' : 'excluded-by-policy'}]
+   return {ok:true as const,plan:preview}
+ })
+ ;(window as unknown as {redlog:unknown}).redlog={data:{recentExport:vi.fn(async()=>({ok:true,delivery:null})),resolveExportPlan:resolve,executeExportPlan:vi.fn()}}
+ render(<I18nProvider><ExportMenu /></I18nProvider>)
+ fireEvent.click(screen.getByLabelText('Export'))
+ const checkbox=await screen.findByLabelText('casts/term-1.cast') as HTMLInputElement
+ expect(checkbox.checked).toBe(false); expect(checkbox.disabled).toBe(false)
+ fireEvent.click(checkbox)
+ await waitFor(()=>expect(resolve).toHaveBeenLastCalledWith(expect.objectContaining({includeAttachments:['casts/term-1.cast'],excludeAttachments:[]})))
+ await waitFor(()=>expect((screen.getByLabelText('casts/term-1.cast') as HTMLInputElement).checked).toBe(true))
+})

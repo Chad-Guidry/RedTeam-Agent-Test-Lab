@@ -1,0 +1,2010 @@
+"""
+RedLog × mitmproxy Addon
+Captures HTTP requests + DNS queries flowing through mitmproxy and sends
+them to RedLog's timeline.
+
+Usage — HTTP capture (default proxy mode):
+    mitmproxy -s /path/to/redlog/hooks/mitmproxy-addon.py
+    mitmweb  -s /path/to/redlog/hooks/mitmproxy-addon.py
+    mitmdump -s /path/to/redlog/hooks/mitmproxy-addon.py
+
+Usage — DNS capture (mitmproxy's DNS mode, v0.6.92):
+    mitmproxy --mode dns@53 -s /path/to/redlog/hooks/mitmproxy-addon.py
+    mitmdump  --mode dns@5353 -s /path/to/redlog/hooks/mitmproxy-addon.py
+
+    Port 53 requires root/sudo on Unix. Non-privileged ports (e.g. 5353) work
+    for lab traffic — point the target at 127.0.0.1:5353 with `dig @127.0.0.1
+    -p 5353 example.com` or configure a system resolver override.
+
+    The HTTP `request/response/error` handlers and the DNS `dns_message`
+    handler coexist in the same addon; mitmproxy dispatches whichever fires
+    for the active mode. Running two mitmproxy instances (one HTTP, one DNS)
+    with the same addon is the recommended setup for full coverage.
+
+What gets logged:
+    - HTTP request:   method, URL, ALL headers, query params, FULL body,
+                      timing breakdown (dns/connect/tls/ttfb), cookies,
+                      HTTP version, HTTP/2 stream_id
+    - HTTP response:  status code, ALL headers, FULL body, content type, size,
+                      duration_ms, TLS version, server cert subject/issuer/SAN,
+                      JA3 fingerprint, Set-Cookie details, HTTP/2 stream_id
+    - WebSocket:      per-frame direction, text/binary, full payload
+    - TCP stream:     raw bytes per message (text/binary), direction
+    - TLS handshake:  SNI, TLS version, cipher, ALPN, cert subject/issuer/SAN,
+                      JA3 hash + raw string
+    - Cookie change:  session cookie rotation detection per domain
+    - DNS query:      question name/type/id, transport, source_addr
+    - Every flow event carries source_addr (the client's ip:port on its
+      connection to the proxy), which is what ties a request to the command
+      that made it.
+    - DNS response:   response_code, answers, duration_ms, _causes ← query event
+
+Environment variables:
+    REDLOG_MAX_BODY       Max body bytes to capture (default 10485760 = 10 MB;
+                          0 = unlimited). Bodies exceeding this are truncated
+                          on the addon side. The API server may further extract
+                          large bodies to sidecar files on disk.
+    REDLOG_PREVIEW_BODY   Max body bytes for the inline preview field kept in
+                          the event JSON for timeline display (default 4096).
+    REDLOG_MAX_HEADERS    Max number of headers to capture per request/response
+                          (default 200). Prevents pathological header sets from
+                          bloating event JSON.
+    REDLOG_SKIP_STATIC    Skip static assets like .css/.js/.png/.woff
+                          (default false — Burp-like full capture by default)
+    REDLOG_VERBOSE        Log every request/DNS message to stderr (default false)
+    REDLOG_PENDING_TTL_SEC  Seconds a request may wait for its response before
+                          it is recorded as dropped (default 300).
+
+Capture verification (#220):
+    Requests to http(s)://redlog.verify.invalid/<nonce> are answered by this
+    addon and never leave the machine (`.invalid` is reserved and does not
+    resolve). Each one is reported to RedLog as a verification, not recorded
+    as traffic, so a check never lands in the engagement's evidence. An HTTPS
+    request only arrives here if the client completed the TLS handshake with
+    RedLog's CA; a client that refuses the certificate is reported as a
+    rejection instead.
+"""
+
+import base64
+import hashlib
+import hmac
+import json
+import os
+import sys
+import time
+import threading
+import queue
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs
+
+try:
+    import urllib.request
+    import urllib.error
+except ImportError:
+    pass
+
+from mitmproxy import http, tcp, tls, ctx
+
+
+REDLOG_PORT_FILE = Path.home() / ".redlog" / "api-port"
+REDLOG_TOKEN_FILE = Path.home() / ".redlog" / "api-token"
+SPOOL_DIR = Path.home() / ".redlog" / "pending"
+INFLIGHT_DIR = Path.home() / ".redlog" / "inflight"
+
+# Which listener produced an HTTP event. The transparent-proxy producer launches
+# mitmdump with REDLOG_PROXY_MODE=transparent; anything else is a regular proxy.
+# Both emit the same subtypes, so without this stamp a request through the
+# regular proxy would read as proof that the transparent one works (Spec 060 FR-011).
+PROXY_MODE = "transparent" if os.environ.get("REDLOG_PROXY_MODE") == "transparent" else "regular"
+MAX_BODY = int(os.environ.get("REDLOG_MAX_BODY", "10485760"))
+PREVIEW_BODY = int(os.environ.get("REDLOG_PREVIEW_BODY", "4096"))
+MAX_HEADERS = int(os.environ.get("REDLOG_MAX_HEADERS", "200"))
+SKIP_STATIC = os.environ.get("REDLOG_SKIP_STATIC", "false").lower() in ("true", "1", "yes")
+VERBOSE = os.environ.get("REDLOG_VERBOSE", "false").lower() in ("true", "1", "yes")
+
+STATIC_EXTENSIONS = {
+    ".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
+    ".woff", ".woff2", ".ttf", ".eot", ".map", ".webp", ".avif",
+}
+
+TEXT_CONTENT_TYPES = (
+    "json", "html", "text", "xml", "javascript", "css", "csv",
+    "yaml", "yml", "svg", "urlencoded", "form-data",
+    "application/x-www-form-urlencoded",
+)
+
+
+def _get_redlog_connection():
+    if not REDLOG_PORT_FILE.exists() or not REDLOG_TOKEN_FILE.exists():
+        return None, None
+    try:
+        port = REDLOG_PORT_FILE.read_text().strip()
+        token = REDLOG_TOKEN_FILE.read_text().strip()
+        return port, token
+    except OSError:
+        return None, None
+
+
+_IDENTITY_PATH = Path.home() / ".redlog" / "active-identity.json"
+
+
+def _embed_identity(payload: dict):
+    """Embed the active project identity into a payload for spool attribution."""
+    if "_identity" in payload:
+        return
+    try:
+        ident = json.loads(_IDENTITY_PATH.read_text(encoding="utf-8"))
+        if "engagementId" in ident:
+            payload["_identity"] = ident
+    except Exception:
+        pass
+
+
+def _identity_matches_active(payload):
+    # Same project is the test, not same operator: Settings can change the
+    # operator while the project stays open, and that is not a switch.
+    try:
+        active = json.loads(_IDENTITY_PATH.read_text(encoding="utf-8"))
+        captured = payload.get("_identity")
+        return bool(captured and captured.get("engagementId") and captured.get("operatorId")
+                    and captured.get("engagementId") == active.get("engagementId"))
+    except Exception:
+        return False
+
+
+_SPOOL_LOCK = threading.Lock()
+
+
+def _write_spool_record(record: dict) -> bool:
+    """Write one record to the spool directory for later replay. False when it
+    could not be written, including when the spool is at its cap.
+
+    The app's drain unlinks a record once it has replayed it, with no lock in
+    common with this one (#507). A file that is gone by the time it is measured
+    is one fewer in the spool, not a reason to refuse the write. A record is
+    written under a `.tmp` name and renamed, so the drain, which reads only
+    `.json`, never sees half of one."""
+    with _SPOOL_LOCK:
+        try:
+            SPOOL_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+            encoded = json.dumps(record).encode("utf-8")
+            count = 0
+            total = len(encoded)
+            for existing in SPOOL_DIR.glob("*.json"):
+                try:
+                    total += existing.stat().st_size
+                except FileNotFoundError:
+                    continue
+                count += 1
+            if count >= 5000 or total > 64 * 1024 * 1024:
+                return False
+            # A name no earlier record of this process has had. The clock alone
+            # is not that: Python before 3.13 reads it from a ~15 ms tick on
+            # Windows, and `id(record)` is reused once the last record is freed,
+            # so two records could share a name. `replace` then overwrote the
+            # first one (a lost gap) or, with the drain unlinking it, was
+            # refused with PermissionError (a write read as failed). Stamps
+            # only rise, so names still sort in write order, which the drain's
+            # sorted listing relies on. Held on the function, under the lock.
+            stamp = max(time.time_ns(), getattr(_write_spool_record, "last_ns", 0) + 1)
+            _write_spool_record.last_ns = stamp
+            filename = f"{stamp}-{os.getpid()}.json"
+            temporary = SPOOL_DIR / (filename + ".tmp")
+            try:
+                # Owner-only whatever the umask: a record holds the project identity.
+                with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as output:
+                    output.write(encoded)
+                temporary.replace(SPOOL_DIR / filename)
+            finally:
+                temporary.unlink(missing_ok=True)
+            return True
+        except Exception:
+            return False
+
+
+def _spool_payload(payload: dict):
+    """Write a payload to the spool directory for later replay."""
+    if not payload.get("_identity"):
+        return
+    # An unacknowledged POST cannot authorize raw offline capture:
+    # the app may have paused while the API was unreachable. Preserve
+    # only a project-bound delivery gap, never bodies, headers or URL.
+    # A record that cannot be written is said so in the log, like any gap (#507).
+    _save_gaps([{"agent_type": "scanner", "_identity": payload["_identity"], "data": {
+        "subtype": "capture_gap", "source": "mitmproxy",
+        "reason": "delivery-unconfirmed", "capture_delivery": "unknown",
+        "reported_at": int(time.time() * 1000),
+        "description": "Proxy delivery was not confirmed; this spool contains no raw content."
+    }}])
+
+
+# #460 and #459: an event refused at a full send queue, or because its project
+# is no longer the one open. Each refusal used to leave a log line at most.
+# Each project's refusals are counted per reason, and written to the spool —
+# never to the send queue — as a capture_gap with no URL, header or body: the
+# first refusal at once, then at most one record a window, each counting only
+# its own refusals. A queue-full window still open when the queue recovers, a
+# project-switched one whose window has run by the next send, and any window
+# open when the proxy stops is written then; one open when the process is
+# killed is lost, at most _GAP_FLUSH_MS of counts. The app's spool drain keeps
+# a project's records until that project is open.
+_GAP_FLUSH_MS = 1000
+_GAP_WINDOWS: dict = {}
+_GAP_LOCK = threading.Lock()
+
+_GAP_TEXT = {
+    "queue-full": ("not-queued", "The proxy's send queue was full, so these events were not recorded."),
+    "project-switched": ("not-sent", "These events arrived after another project was opened, so they were not recorded."),
+    # #291: the proxy stopped holding events it had admitted.
+    "proxy-stopped": ("not-sent", "The proxy stopped before sending these events, so they were not recorded."),
+    "delivery-interrupted": ("unknown", "The proxy stopped while these events were being sent; some or all of them may not have been recorded."),
+}
+
+
+def _declared_body_bytes(data: dict) -> int:
+    """Body bytes a refused event said it carried. Headers and metadata are
+    not counted, so this is a known lower bound, not the event's size."""
+    total = 0
+    for key in ("request_body", "response_body", "ws_body"):
+        body = data.get(key)
+        if isinstance(body, dict) and isinstance(body.get("size"), int):
+            total += body["size"]
+    return total
+
+
+def _gap_record(window: dict, now_ms: int) -> dict:
+    delivery, cause = _GAP_TEXT[window["reason"]]
+    count = "an upper bound on what was lost" if delivery == "unknown" else "exact for this window"
+    return {"agent_type": "scanner", "_identity": window["identity"], "data": {
+        "subtype": "capture_gap", "source": "mitmproxy",
+        "reason": window["reason"], "capture_delivery": delivery,
+        "gap_started_at": window["started"], "gap_ended_at": window["last"],
+        "skipped_units": window["units"], "skipped_body_bytes": window["bytes"],
+        "reported_at": now_ms,
+        "description": f"{cause} The count is {count}; body bytes are those the events declared.",
+    }}
+
+
+def _save_gaps(records: list):
+    """Write each gap record to the spool. One that cannot be written leaves a
+    line in this form, whatever the gap, for the app to read (#460, #507):
+
+        [redlog] capture gap not saved: N event(s) reason=R started=MS ended=MS engagement=ID nonce=HEX
+
+    The window is the one the record carries (a delivery-unconfirmed record has
+    only the time it was reported). The engagement is the project that owns the
+    gap, which is not necessarily the one open when the app reads the line; "-"
+    when the record names none, which the app will not place in any project.
+    The nonce is the app's per-start secret from the environment: mitmproxy
+    echoes text a remote server sent it into the same output, so the app
+    accepts only a line that carries it. It is written nowhere else.
+    Never a URL, header or body."""
+    nonce = os.environ.get("REDLOG_PROXY_GAP_NONCE", "")
+    for record in records:
+        if _write_spool_record(record):
+            continue
+        data = record["data"]
+        now_ms = int(time.time() * 1000)
+        started = data.get("gap_started_at", data.get("reported_at", now_ms))
+        ended = data.get("gap_ended_at", data.get("reported_at", now_ms))
+        engagement = "".join(str(record["_identity"].get("engagementId") or "-").split()) or "-"
+        ctx.log.warn(f"[redlog] capture gap not saved: {data.get('skipped_units', 1)} event(s) "
+                     f"reason={data['reason']} started={started} ended={ended} engagement={engagement}"
+                     + (f" nonce={nonce}" if nonce else ""))
+
+
+def _note_refusal(payload: dict, reason: str):
+    ident = payload["_identity"]
+    key = (reason, ident.get("engagementId"), ident.get("operatorId"))
+    now_ms = int(time.time() * 1000)
+    record = None
+    with _GAP_LOCK:
+        window = _GAP_WINDOWS.setdefault(key, {"reason": reason, "identity": ident, "units": 0, "bytes": 0, "flushed_at": None})
+        if not window["units"]:
+            window["started"] = now_ms
+        window["units"] += 1
+        window["bytes"] += _declared_body_bytes(payload.get("data") or {})
+        window["last"] = now_ms
+        if window["flushed_at"] is None or now_ms - window["flushed_at"] >= _GAP_FLUSH_MS:
+            record = _gap_record(window, now_ms)
+            window.update(units=0, bytes=0, flushed_at=now_ms)
+    if record:
+        _save_gaps([record])
+
+
+def _note_switch_refusal(payload: dict):
+    """A refusal by identity is a gap only for an event that has an owner."""
+    ident = payload.get("_identity")
+    if ident and ident.get("engagementId") and ident.get("operatorId"):
+        # No identity file at all is a project that closed with none opened in
+        # its place. The app clears it as it shuts the proxy down, and on quit
+        # the proxy can still answer for a moment after (#507): that is the
+        # proxy stopping, not a switch to another project.
+        _note_refusal(payload, "project-switched" if _IDENTITY_PATH.exists() else "proxy-stopped")
+
+
+def _flush_gaps(sent: bool = False):
+    """Write every window that still holds refusals. After a send (`sent`),
+    the queue has recovered but the switch has not: a project-switched window
+    is left to run, so a project still sending does not cut it short."""
+    now_ms = int(time.time() * 1000)
+    with _GAP_LOCK:
+        records = []
+        for key, window in list(_GAP_WINDOWS.items()):
+            if sent and window["reason"] == "project-switched" and now_ms - window["flushed_at"] < _GAP_FLUSH_MS:
+                continue
+            if window["units"]:
+                records.append(_gap_record(window, now_ms))
+            del _GAP_WINDOWS[key]
+    _save_gaps(records)
+
+
+# #291: an event admitted to the send queue and not yet delivered was lost
+# with no record when the proxy stopped. While anything is in flight, a marker
+# under INFLIGHT_DIR holds an upper bound per project — when and how many,
+# never content — written before the event is queued, so a kill at any later
+# point leaves a bound that covers it. The app turns the marker of a proxy that
+# is gone into a capture_gap. The bound is rounded up to _INFLIGHT_STEP, so a
+# busy queue does not write a file per event, and a heartbeat lowers it to what
+# is really in flight each second and removes the marker once nothing is. A
+# stop the addon is told about (its shutdown hook, or the owner's stop request)
+# records the exact count instead, and removes the marker.
+_INFLIGHT: dict = {}
+_INFLIGHT_LOCK = threading.Lock()
+_INFLIGHT_STATE = {"stopping": False, "marker": False}
+_INFLIGHT_STEP = 8
+_INFLIGHT_INSTANCE = f"{os.getpid()}-{time.time_ns()}"
+_INFLIGHT_STARTED_MS = int(time.time() * 1000)
+
+
+def _inflight_key(payload: dict) -> tuple:
+    ident = payload["_identity"]
+    return (ident.get("engagementId"), ident.get("operatorId"))
+
+
+def _write_inflight_marker() -> bool:
+    """Write the bounds, or remove the marker when none is left. False when
+    the disk does not hold what memory does. Called with _INFLIGHT_LOCK held."""
+    path = INFLIGHT_DIR / f"{_INFLIGHT_INSTANCE}.json"
+    live = [entry for entry in _INFLIGHT.values() if entry["bound"]]
+    try:
+        if not live:
+            if _INFLIGHT_STATE["marker"]:
+                path.unlink(missing_ok=True)
+                _INFLIGHT_STATE["marker"] = False
+            return True
+        INFLIGHT_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        marker = {"version": 1, "instance": _INFLIGHT_INSTANCE, "pid": os.getpid(),
+                  "started_at": _INFLIGHT_STARTED_MS, "heartbeat_at": int(time.time() * 1000),
+                  "identities": [{"identity": entry["identity"], "upper_bound": entry["bound"],
+                                  "since": entry["since"], "last": entry["last"]} for entry in live]}
+        temporary = path.with_name(path.name + ".tmp")
+        with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as output:
+            output.write(json.dumps(marker))
+        temporary.replace(path)
+        _INFLIGHT_STATE["marker"] = True
+        return True
+    except Exception:
+        return False  # Capture must not wait on, or fail for, its own bookkeeping.
+
+
+def _inflight_admit(payload: dict) -> bool:
+    """Count an event into the queue. False once the proxy is stopping."""
+    key = _inflight_key(payload)
+    now_ms = int(time.time() * 1000)
+    with _INFLIGHT_LOCK:
+        if _INFLIGHT_STATE["stopping"]:
+            return False
+        entry = _INFLIGHT.setdefault(key, {"identity": payload["_identity"], "queued": 0, "queued_bytes": 0,
+                                           "sending": 0, "bound": 0, "since": now_ms})
+        entry["queued"] += 1
+        entry["queued_bytes"] += _declared_body_bytes(payload.get("data") or {})
+        entry["last"] = now_ms
+        held = entry["queued"] + entry["sending"]
+        if held > entry["bound"]:
+            # Only a bound on disk counts: one that failed to write (a reader
+            # holding the file on Windows) is tried again by the next event.
+            written = entry["bound"]
+            entry["bound"] = -(-held // _INFLIGHT_STEP) * _INFLIGHT_STEP
+            if not _write_inflight_marker():
+                entry["bound"] = written
+    return True
+
+
+def _inflight_begin(key: tuple, size: int) -> bool:
+    """A worker takes an event. False when a stop has already counted it as
+    not sent: it must not be sent after being recorded as lost."""
+    with _INFLIGHT_LOCK:
+        entry = _INFLIGHT.get(key)
+        if _INFLIGHT_STATE["stopping"] or entry is None:
+            return False
+        entry["queued"] -= 1
+        entry["queued_bytes"] -= size
+        entry["sending"] += 1
+    return True
+
+
+def _inflight_end(key: tuple):
+    with _INFLIGHT_LOCK:
+        entry = _INFLIGHT.get(key)
+        if entry is not None:
+            entry["sending"] -= 1
+
+
+def _inflight_beat():
+    """Lower each bound to what is still in flight and refresh the marker's
+    heartbeat, so the app can tell a live proxy's marker from a dead one's."""
+    with _INFLIGHT_LOCK:
+        if _INFLIGHT_STATE["stopping"] or not (_INFLIGHT or _INFLIGHT_STATE["marker"]):
+            return
+        for key, entry in list(_INFLIGHT.items()):
+            entry["bound"] = entry["queued"] + entry["sending"]
+            if not entry["bound"]:
+                del _INFLIGHT[key]
+        _write_inflight_marker()
+
+
+def _inflight_loop():
+    while True:
+        time.sleep(1)
+        _inflight_beat()
+
+
+def _stop_sending(wait_s: float):
+    """Stop admitting, and record what will now never be delivered: the events
+    still queued exactly, as not sent, and those a worker is still sending after
+    `wait_s` as unconfirmed — they may have arrived. Then remove the marker,
+    which these records replace. Only the first call does anything."""
+    now_ms = int(time.time() * 1000)
+    records = []
+    with _INFLIGHT_LOCK:
+        if _INFLIGHT_STATE["stopping"]:
+            return
+        _INFLIGHT_STATE["stopping"] = True
+        for entry in _INFLIGHT.values():
+            if entry["queued"]:
+                records.append(_gap_record({"reason": "proxy-stopped", "identity": entry["identity"],
+                                            "started": entry["since"], "last": entry["last"],
+                                            "units": entry["queued"], "bytes": entry["queued_bytes"]}, now_ms))
+                entry["queued"] = entry["queued_bytes"] = 0
+            # What is recorded exactly leaves the bound at once: a kill during
+            # the wait below must not count it a second time.
+            entry["bound"] = entry["sending"]
+        _write_inflight_marker()
+    _save_gaps(records)
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline:
+        with _INFLIGHT_LOCK:
+            if not any(entry["sending"] for entry in _INFLIGHT.values()):
+                break
+        time.sleep(0.05)
+    now_ms = int(time.time() * 1000)
+    with _INFLIGHT_LOCK:
+        records = [_gap_record({"reason": "delivery-interrupted", "identity": entry["identity"],
+                                "started": entry["since"], "last": entry["last"],
+                                "units": entry["sending"], "bytes": 0}, now_ms)
+                   for entry in _INFLIGHT.values() if entry["sending"]]
+        _INFLIGHT.clear()
+        _write_inflight_marker()
+    _save_gaps(records)
+
+
+def _stop_and_exit():
+    """The owner's stop request: record, then shut down as a signal would."""
+    _stop_sending(2.0)
+    _flush_gaps()
+    ctx.master.shutdown()
+
+
+_SEND_SLOTS = threading.BoundedSemaphore(64)
+_SEND_QUEUE = queue.SimpleQueue()
+
+
+def _send_worker():
+    while True:
+        deliver = _SEND_QUEUE.get()
+        try:
+            deliver()
+        except Exception:
+            pass  # One logging or transport failure must not stop the worker.
+
+
+for _worker_number in range(4):
+    threading.Thread(target=_send_worker, daemon=True).start()
+threading.Thread(target=_inflight_loop, daemon=True).start()
+
+
+def _send_to_redlog(payload: dict):
+    _embed_identity(payload)
+    payload.setdefault("data", {}).setdefault("source_timestamp", int(time.time() * 1000))
+    if not _identity_matches_active(payload):
+        _note_switch_refusal(payload)
+        return False
+    port, token = _get_redlog_connection()
+    if not port or not payload.get("_identity"):
+        return False
+    if not _SEND_SLOTS.acquire(blocking=False):
+        ctx.log.warn("[redlog] capture queue full; event not retained")
+        _note_refusal(payload, "queue-full")
+        return False
+    if not _inflight_admit(payload):
+        _SEND_SLOTS.release()
+        _note_refusal(payload, "proxy-stopped")
+        return False
+    if _GAP_WINDOWS:
+        _flush_gaps(sent=True)
+    key, size = _inflight_key(payload), _declared_body_bytes(payload.get("data") or {})
+
+    def _do_send():
+        if not _inflight_begin(key, size):
+            _SEND_SLOTS.release()
+            return
+        try:
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/events",
+                data=data,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=5)
+        except urllib.error.HTTPError as exc:
+            # A refusal (pause, identity, policy, malformed input or capacity)
+            # is not an outage and must never be replayed after recovery.
+            if exc.code >= 500:
+                _spool_payload(payload)
+        except Exception as exc:
+            if VERBOSE:
+                ctx.log.warn(f"[redlog] send failed: {exc}")
+            _spool_payload(payload)
+
+        finally:
+            _inflight_end(key)
+            _SEND_SLOTS.release()
+
+    try:
+        _SEND_QUEUE.put(_do_send)
+    except Exception:
+        if _inflight_begin(key, size):
+            _inflight_end(key)
+        _SEND_SLOTS.release()
+        return False
+    return True
+
+
+VERIFY_HOST = "redlog.verify.invalid"
+_NONCE_OK = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-")
+
+
+def _verify_nonce(path: str) -> str | None:
+    """The first path segment, if it looks like a nonce RedLog issued."""
+    first = path.lstrip("/").split("/", 1)[0].split("?", 1)[0]
+    if 8 <= len(first) <= 64 and set(first) <= _NONCE_OK:
+        return first
+    return None
+
+
+def _report_verification(report: dict):
+    """Tell RedLog a verification request arrived. Not spooled: a check that
+    cannot reach RedLog right now has nothing to prove later."""
+    port, token = _get_redlog_connection()
+    if not port:
+        return
+
+    def _do_send():
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/http-verify",
+                data=json.dumps(report).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=5)
+        except Exception as exc:
+            if VERBOSE:
+                ctx.log.warn(f"[redlog] verification report failed: {exc}")
+
+    threading.Thread(target=_do_send, daemon=True).start()
+
+
+def _verify_page(scheme: str, nonce: str, wants_html: bool) -> tuple[bytes, str]:
+    if not wants_html:
+        return (f"RedLog: {scheme.upper()} capture verified ({nonce})\n".encode("utf-8"), "text/plain; charset=utf-8")
+    # From the HTTP page, the browser also asks for the HTTPS one, so a single
+    # navigation checks both paths.
+    follow = (
+        f'<img alt="" width="1" height="1" src="https://{VERIFY_HOST}/{nonce}/tls">'
+        if scheme == "http" else ""
+    )
+    body = (
+        "<!doctype html><meta charset=utf-8><title>RedLog capture check</title>"
+        "<body style=\"font:14px system-ui;padding:2em\">"
+        f"<p>RedLog received this {scheme.upper()} request through its capture proxy.</p>"
+        "<p>Return to RedLog to see the result. You can close this tab.</p>"
+        f"{follow}</body>"
+    )
+    return body.encode("utf-8"), "text/html; charset=utf-8"
+
+
+def _send_to_redlog_and_get_id(payload: dict):
+    """Synchronous variant returning the inserted event id.
+
+    Used by the DNS-query path so the response event can point its `_causes`
+    at the exact query event. Blocks briefly (≤5s) on the RedLog API — the
+    DNS response typically arrives 10-100ms later so we still want the id.
+    Returns None on any error; the response then emits an empty _causes list
+    rather than dropping the row.
+    """
+    _embed_identity(payload)
+    if not _identity_matches_active(payload):
+        _note_switch_refusal(payload)
+        return None
+    port, token = _get_redlog_connection()
+    if not port or not payload.get("_identity"):
+        return None
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/events",
+            data=data,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+        obj = json.loads(body)
+        return obj.get("id") or (obj.get("event") or {}).get("id")
+    except urllib.error.HTTPError as exc:
+        if exc.code >= 500:
+            _spool_payload(payload)
+        return None
+    except Exception:
+        _spool_payload(payload)
+        return None
+
+
+# Numeric ↔ mnemonic maps for the DNS handler. Covers the codes any modern
+# resolver actually returns; anything exotic falls through to str(n) so the
+# event is still filterable in the Timeline instead of silently going blank.
+_DNS_TYPES = {
+    1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 13: "HINFO",
+    15: "MX", 16: "TXT", 17: "RP", 18: "AFSDB", 24: "SIG", 25: "KEY",
+    28: "AAAA", 29: "LOC", 33: "SRV", 35: "NAPTR", 36: "KX", 37: "CERT",
+    39: "DNAME", 41: "OPT", 43: "DS", 44: "SSHFP", 45: "IPSECKEY",
+    46: "RRSIG", 47: "NSEC", 48: "DNSKEY", 49: "DHCID", 50: "NSEC3",
+    51: "NSEC3PARAM", 52: "TLSA", 53: "SMIMEA", 55: "HIP", 59: "CDS",
+    60: "CDNSKEY", 61: "OPENPGPKEY", 62: "CSYNC", 63: "ZONEMD",
+    64: "SVCB", 65: "HTTPS", 99: "SPF", 108: "EUI48", 109: "EUI64",
+    249: "TKEY", 250: "TSIG", 251: "IXFR", 252: "AXFR",
+    255: "ANY", 256: "URI", 257: "CAA",
+}
+
+_DNS_RCODES = {
+    0: "NOERROR", 1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN",
+    4: "NOTIMP", 5: "REFUSED", 6: "YXDOMAIN", 7: "YXRRSET",
+    8: "NXRRSET", 9: "NOTAUTH", 10: "NOTZONE", 11: "DSOTYPENI",
+    16: "BADVERS", 17: "BADKEY", 18: "BADTIME", 19: "BADMODE",
+    20: "BADNAME", 21: "BADALG", 22: "BADTRUNC", 23: "BADCOOKIE",
+}
+
+
+def _dns_type_name(n) -> str:
+    """Map a numeric DNS RR type to its mnemonic (A / AAAA / …). Also accepts
+    already-mnemonic strings + enum-like objects with a `.name`."""
+    if isinstance(n, str) and n:
+        return n
+    name = getattr(n, "name", None)
+    if isinstance(name, str) and name:
+        return name
+    try:
+        return _DNS_TYPES.get(int(n), str(n))
+    except Exception:
+        return str(n) if n is not None else ""
+
+
+def _dns_rcode_name(n) -> str:
+    """Map a numeric DNS response code (rcode) to its mnemonic."""
+    if isinstance(n, str) and n:
+        return n
+    name = getattr(n, "name", None)
+    if isinstance(name, str) and name:
+        return name
+    try:
+        return _DNS_RCODES.get(int(n), str(n))
+    except Exception:
+        return str(n) if n is not None else ""
+
+
+def _truncate(s: str, max_len: int) -> str:
+    if len(s) <= max_len:
+        return s
+    return s[:max_len] + f"...[truncated, {len(s)} total]"
+
+
+def _next_message_seq(flow, key: str, messages: list) -> int:
+    """Number the newest WebSocket/TCP message and let mitmproxy forget the
+    ones before it (#290). mitmproxy appends every relayed message to the flow
+    and drops none, so an hours-long stream held all of them in memory; each
+    one has already been sent here when its hook ran. The newest stays, since
+    mitmproxy's own dumper and any other addon read it as messages[-1]. The
+    sequence is per flow and counts every message once, so it no longer comes
+    from the list's length."""
+    seq = flow.metadata.get(key, 0) + 1
+    flow.metadata[key] = seq
+    del messages[:-1]
+    return seq
+
+
+def _tcp_peer(flow) -> tuple[str, int]:
+    """The server end of a TCP flow as (host, port); ("", 0) when unknown."""
+    try:
+        addr = flow.server_conn.peername or flow.server_conn.address
+        if addr:
+            return (addr[0] if isinstance(addr, tuple) else str(addr),
+                    addr[1] if isinstance(addr, tuple) and len(addr) > 1 else 0)
+    except Exception:
+        pass
+    return "", 0
+
+
+def _is_text_content(content_type: str) -> bool:
+    ct = content_type.lower()
+    return any(t in ct for t in TEXT_CONTENT_TYPES)
+
+
+def _capture_body(content: bytes | None, content_type: str, max_bytes: int) -> dict | None:
+    """Capture a request or response body. Returns a dict with the body data,
+    encoding info, and sha256, or None if no body.
+
+    Shape: {
+        "data": str,           # text content or base64-encoded binary
+        "encoding": str,       # "text" or "base64"
+        "size": int,           # original byte count
+        "sha256": str,         # hex digest of the stored bytes (post-truncation)
+        "truncated": bool,     # whether data was cut short
+        "content_type": str,   # as reported by the server/client
+    }
+    """
+    if not content or len(content) == 0:
+        return None
+
+    raw_size = len(content)
+    truncated = False
+
+    if max_bytes > 0 and raw_size > max_bytes:
+        content = content[:max_bytes]
+        truncated = True
+
+    sha256 = hashlib.sha256(content).hexdigest()
+
+    is_text = _is_text_content(content_type)
+
+    if is_text:
+        try:
+            text = content.decode("utf-8", errors="strict")
+            return {
+                "data": text,
+                "encoding": "text",
+                "size": raw_size,
+                "sha256": sha256,
+                "truncated": truncated,
+                "content_type": content_type,
+            }
+        except Exception:
+            pass
+
+    b64 = base64.b64encode(content).decode("ascii")
+    return {
+        "data": b64,
+        "encoding": "base64",
+        "size": raw_size,
+        "sha256": sha256,
+        "truncated": truncated,
+        "content_type": content_type,
+    }
+
+
+def _extract_all_headers(headers) -> list[list[str]]:
+    """Capture ALL headers as an ordered list of [name, value] pairs.
+    Preserves duplicate headers (e.g. multiple Set-Cookie) and original
+    casing — exactly what Burp shows. Capped at MAX_HEADERS."""
+    result = []
+    for name, value in headers.items(multi=True):
+        if len(result) >= MAX_HEADERS:
+            result.append(["X-RedLog-Truncated", f"{len(list(headers.items(multi=True)))} total, showing {MAX_HEADERS}"])
+            break
+        result.append([name, value])
+    return result
+
+
+def _extract_params(flow: http.HTTPFlow) -> dict:
+    params = {}
+    parsed = urlparse(flow.request.pretty_url)
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    if query:
+        params["query"] = {k: v[0] if len(v) == 1 else v for k, v in query.items()}
+
+    content_type = flow.request.headers.get("content-type", "")
+
+    if flow.request.content:
+        body_text = flow.request.get_text(strict=False) or ""
+        if "application/json" in content_type:
+            try:
+                params["body_json"] = json.loads(body_text)
+            except (json.JSONDecodeError, ValueError):
+                params["body_raw"] = _truncate(body_text, PREVIEW_BODY)
+        elif "application/x-www-form-urlencoded" in content_type:
+            form_data = parse_qs(body_text, keep_blank_values=True)
+            params["body_form"] = {
+                k: v[0] if len(v) == 1 else v for k, v in form_data.items()
+            }
+        elif "multipart/form-data" in content_type:
+            multipart = flow.request.multipart_form
+            if multipart:
+                params["body_multipart"] = {
+                    k.decode("utf-8", errors="replace"): (
+                        f"[file, {len(v)} bytes]" if len(v) > 256
+                        else v.decode("utf-8", errors="replace")
+                    )
+                    for k, v in multipart.items()
+                }
+        else:
+            if len(body_text) > 0:
+                params["body_raw"] = _truncate(body_text, PREVIEW_BODY)
+
+    return params
+
+
+def _is_static(url: str) -> bool:
+    parsed = urlparse(url)
+    path = parsed.path.lower()
+    return any(path.endswith(ext) for ext in STATIC_EXTENSIONS)
+
+
+# ── Socket owner: which local process opened this connection ─────────────
+#
+# The port half of the command -> traffic join. `_client_addr` gives the
+# client's ip:port; RedLog then needs the pid that owns that port, and walks
+# that pid's ancestry to the shell command_start that forked it
+# (src/core/socket-attribution.ts).
+#
+# That port -> pid step used to be the connection monitor's job, and it could
+# not do it: it ships off by default, inside an opt-in pack, and polls every
+# two seconds. A dirb connection lives fifty milliseconds. So the join was
+# fed by a watcher that structurally could not see the thing it was watching
+# for, and the design shipped looking connected.
+#
+# Done here instead, because this process is holding the socket while it asks.
+#
+# NEVER ON THE HOT PATH. A scan opens hundreds of connections a second and
+# this addon runs on mitmproxy's event loop: a subprocess call inline would
+# stall the proxy, which means dropping traffic to find out who sent it. A
+# background thread keeps a recent snapshot and every lookup is a dict read.
+#
+# What that costs, stated plainly: a connection that opens and closes entirely
+# between two refreshes is never seen, and its flows go out unattributed. That
+# is the same failure as before, an order of magnitude narrower, and it fails
+# the same way — no edge, rather than a guessed one.
+
+_OWNER_REFRESH_SEC = 0.5
+_OWNER_IDLE_STOP_SEC = 30.0
+
+_owner_table: dict[int, int] = {}
+_owner_lock = threading.Lock()
+_owner_last_want = 0.0
+_owner_thread = None
+
+
+# Parsing is separated from shelling out so it can be tested against real
+# output from each platform without a socket, a subprocess, or mitmproxy
+# installed. A wrong pid here becomes a wrong claim about which command
+# produced a request, in a record that goes to a client, so the parsers skip
+# anything they do not fully understand rather than guessing at it.
+def _parse_owner_output(plat: str, out: str) -> dict:
+    """local port -> owning pid, from one platform's socket listing."""
+    table = {}
+    if plat.startswith("linux"):
+        # `ss -tnpH state established` carries the pid directly. Parsing
+        # /proc/net/tcp instead would give an inode, and resolving that needs
+        # a scan of every process's file descriptors.
+        #   ESTAB 0 0 127.0.0.1:54321 127.0.0.1:8080 users:(("dirb",pid=123,fd=3))
+        for line in out.splitlines():
+            if "pid=" not in line:
+                continue
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            local = parts[3] if ":" in parts[3] else parts[2]
+            try:
+                port = int(local.rsplit(":", 1)[1])
+                pid = int(line.split("pid=", 1)[1].split(",", 1)[0])
+            except (ValueError, IndexError):
+                continue
+            table[port] = pid
+    elif plat == "darwin":
+        # `lsof -FpPn` is a field-per-line format: `p<pid>` then `n<addr>`.
+        pid = None
+        for line in out.splitlines():
+            if line.startswith("p"):
+                try:
+                    pid = int(line[1:])
+                except ValueError:
+                    pid = None
+            elif line.startswith("n") and pid is not None:
+                local = line[1:].split("->", 1)[0]
+                try:
+                    table[int(local.rsplit(":", 1)[1])] = pid
+                except (ValueError, IndexError):
+                    continue
+    elif plat.startswith("win"):
+        #   TCP    127.0.0.1:54321   127.0.0.1:8080   ESTABLISHED   1234
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) < 5 or parts[3] != "ESTABLISHED":
+                continue
+            try:
+                table[int(parts[1].rsplit(":", 1)[1])] = int(parts[4])
+            except (ValueError, IndexError):
+                continue
+    return table
+
+
+def _read_owner_table() -> dict:
+    """local port -> owning pid, for established TCP connections.
+
+    Best effort on every platform. No `ss`, no `lsof`, a timeout, a
+    locked-down host: attribution goes quiet, and must never be able to take
+    capture with it.
+    """
+    import subprocess
+    plat = sys.platform
+    try:
+        if plat.startswith("linux"):
+            argv, timeout = ["ss", "-tnpH", "state", "established"], 3
+        elif plat == "darwin":
+            argv, timeout = ["lsof", "-nP", "-iTCP", "-sTCP:ESTABLISHED", "-FpPn"], 3
+        elif plat.startswith("win"):
+            argv, timeout = ["netstat", "-ano", "-p", "TCP"], 5
+        else:
+            return {}
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=timeout).stdout
+        return _parse_owner_output(plat, out)
+    except Exception:
+        return {}
+
+
+def _owner_loop():
+    global _owner_table
+    while True:
+        with _owner_lock:
+            idle = time.time() - _owner_last_want
+        if idle > _OWNER_IDLE_STOP_SEC:
+            # Nothing has asked in a while. Stop shelling out every half second
+            # for an answer nobody wants; the next lookup restarts the thread.
+            with _owner_lock:
+                globals()["_owner_thread"] = None
+            return
+        fresh = _read_owner_table()
+        if fresh:
+            with _owner_lock:
+                _owner_table = fresh
+        time.sleep(_OWNER_REFRESH_SEC)
+
+
+def _socket_owner_pid(addr: str):
+    """The pid that owns the local port in "ip:port", or None.
+
+    A dict read. The snapshot is refreshed on a background thread, started on
+    the first ask and stopped once nothing has asked for a while.
+    """
+    global _owner_thread, _owner_last_want
+    if not addr:
+        return None
+    try:
+        port = int(addr.rsplit(":", 1)[1])
+    except (ValueError, IndexError):
+        return None
+    with _owner_lock:
+        _owner_last_want = time.time()
+        if _owner_thread is None:
+            _owner_thread = threading.Thread(target=_owner_loop, daemon=True)
+            _owner_thread.start()
+        return _owner_table.get(port)
+
+
+def _client_addr(flow) -> str:
+    """The client's own ip:port on its connection to the proxy, or "".
+
+    This is what ties a request back to the command that made it. RedLog joins
+    it as source port -> pid (from the socket table the connection monitor
+    reads) -> the shell command_start that owns that pid, and writes the result
+    into `_causes`; see src/core/socket-attribution.ts and
+    docs/DESIGN-traffic-attribution.md 2.3.
+
+    Without it that whole join is dead: `socketCausesFor` has no port to look
+    up, returns [], and every request in the timeline is unattributed. The DNS
+    handler sent it from the start and HTTP never did, so the design shipped
+    working for lookups and silently not for requests.
+
+    Best-effort on purpose. A flow with no readable peer still produces its
+    event -- attribution must never be able to block capture.
+    """
+    try:
+        conn = getattr(flow, 'client_conn', None)
+        peer = getattr(conn, 'peername', None) if conn else None
+        if peer:
+            return f"{peer[0]}:{peer[1]}"
+    except Exception:
+        pass
+    return ""
+
+
+def _compute_ja3(client_hello: tls.ClientHelloData) -> dict | None:
+    """Compute JA3 fingerprint from a TLS ClientHello.
+
+    JA3 format: TLSVersion,Ciphers,Extensions,EllipticCurves,ECPointFormats
+    Each field is a dash-separated list of decimal values.
+    The JA3 hash is the MD5 of the resulting string.
+    """
+    try:
+        ch = client_hello.context
+        if not ch:
+            return None
+
+        tls_version = getattr(ch, 'tls_version', None)
+        cipher_suites = getattr(ch, 'cipher_suites', None) or []
+        extensions = getattr(ch, 'extensions', None) or {}
+        ec_curves = getattr(ch, 'elliptic_curves', None) or []
+        ec_point_formats = getattr(ch, 'ec_point_formats', None) or []
+
+        grease_values = {
+            0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a,
+            0x6a6a, 0x7a7a, 0x8a8a, 0x9a9a, 0xaaaa, 0xbaba,
+            0xcaca, 0xdada, 0xeaea, 0xfafa,
+        }
+
+        ciphers_clean = [c for c in cipher_suites if c not in grease_values]
+        ext_clean = sorted(e for e in extensions if e not in grease_values)
+        curves_clean = [c for c in ec_curves if c not in grease_values]
+        points_clean = list(ec_point_formats)
+
+        ver_str = str(tls_version) if tls_version else "0"
+        ja3_raw = ",".join([
+            ver_str,
+            "-".join(str(c) for c in ciphers_clean),
+            "-".join(str(e) for e in ext_clean),
+            "-".join(str(c) for c in curves_clean),
+            "-".join(str(p) for p in points_clean),
+        ])
+
+        ja3_hash = hashlib.md5(ja3_raw.encode()).hexdigest()
+        return {
+            "ja3": ja3_hash,
+            "ja3_raw": ja3_raw[:500],
+        }
+    except Exception:
+        return None
+
+
+def _extract_tls_info(flow: http.HTTPFlow) -> dict | None:
+    """Extract TLS handshake details from a completed flow."""
+    try:
+        conn = flow.server_conn
+        if not conn or not getattr(conn, 'tls_version', None):
+            return None
+        info: dict = {
+            "tls_version": conn.tls_version,
+        }
+        if hasattr(conn, 'alpn') and conn.alpn:
+            info["alpn"] = conn.alpn.decode("ascii", errors="replace") if isinstance(conn.alpn, bytes) else str(conn.alpn)
+        if hasattr(conn, 'cipher') and conn.cipher:
+            info["cipher"] = conn.cipher
+        cert_list = getattr(conn, 'certificate_list', None)
+        if cert_list and len(cert_list) > 0:
+            leaf = cert_list[0]
+            info["cert_subject"] = str(getattr(leaf, 'subject', ''))
+            info["cert_issuer"] = str(getattr(leaf, 'issuer', ''))
+            san = getattr(leaf, 'altnames', None) or getattr(leaf, 'san', None)
+            if san:
+                info["cert_san"] = [
+                    s.value if hasattr(s, 'value') else str(s)
+                    for s in list(san)[:20]
+                ]
+            serial = getattr(leaf, 'serial', None)
+            if serial is not None:
+                info["cert_serial"] = str(serial)
+        return info
+    except Exception:
+        return None
+
+
+def _extract_timing(flow: http.HTTPFlow) -> dict | None:
+    """Extract timing breakdown from a completed flow (ms precision)."""
+    try:
+        sc = flow.server_conn
+        if not sc:
+            return None
+        timing: dict = {}
+        ts_start = getattr(sc, 'timestamp_start', None)
+        ts_tcp = getattr(sc, 'timestamp_tcp_setup', None)
+        ts_tls = getattr(sc, 'timestamp_tls_setup', None)
+        req_start = getattr(flow.request, 'timestamp_start', None)
+        req_end = getattr(flow.request, 'timestamp_end', None)
+        resp_start = getattr(flow.response, 'timestamp_start', None) if flow.response else None
+        resp_end = getattr(flow.response, 'timestamp_end', None) if flow.response else None
+        if ts_start and ts_tcp:
+            timing["connect_ms"] = round((ts_tcp - ts_start) * 1000)
+        if ts_tcp and ts_tls:
+            timing["tls_ms"] = round((ts_tls - ts_tcp) * 1000)
+        if req_start and req_end:
+            timing["send_ms"] = round((req_end - req_start) * 1000)
+        if req_end and resp_start:
+            timing["wait_ms"] = round((resp_start - req_end) * 1000)
+        if resp_start and resp_end:
+            timing["receive_ms"] = round((resp_end - resp_start) * 1000)
+        if ts_start and resp_end:
+            timing["total_ms"] = round((resp_end - ts_start) * 1000)
+        return timing if timing else None
+    except Exception:
+        return None
+
+
+def _extract_request_cookies(flow: http.HTTPFlow) -> list[dict] | None:
+    """Extract cookies sent in the request's Cookie header."""
+    try:
+        cookie_header = flow.request.headers.get("cookie", "")
+        if not cookie_header:
+            return None
+        cookies = []
+        for pair in cookie_header.split(";"):
+            pair = pair.strip()
+            if "=" in pair:
+                name, _, value = pair.partition("=")
+                cookies.append({"name": name.strip(), "value": value.strip()[:200]})
+        return cookies[:50] if cookies else None
+    except Exception:
+        return None
+
+
+def _extract_set_cookies(flow: http.HTTPFlow) -> list[dict] | None:
+    """Extract Set-Cookie headers from the response."""
+    try:
+        if not flow.response:
+            return None
+        set_cookies = []
+        for value in flow.response.headers.get_all("set-cookie"):
+            parts = value.split(";")
+            main = parts[0].strip()
+            name, _, val = main.partition("=")
+            attrs: dict = {"name": name.strip(), "value": val.strip()[:200]}
+            for attr in parts[1:]:
+                attr = attr.strip().lower()
+                if attr.startswith("path="):
+                    attrs["path"] = attr[5:]
+                elif attr.startswith("domain="):
+                    attrs["domain"] = attr[7:]
+                elif attr.startswith("expires="):
+                    attrs["expires"] = attr[8:]
+                elif attr.startswith("max-age="):
+                    attrs["max_age"] = attr[8:]
+                elif attr == "secure":
+                    attrs["secure"] = True
+                elif attr == "httponly":
+                    attrs["httponly"] = True
+                elif attr.startswith("samesite="):
+                    attrs["samesite"] = attr[9:]
+            set_cookies.append(attrs)
+        return set_cookies[:50] if set_cookies else None
+    except Exception:
+        return None
+
+
+PENDING_TTL_SEC = int(os.environ.get("REDLOG_PENDING_TTL_SEC", "300"))
+
+
+class RedLogAddon:
+    def __init__(self):
+        self._request_times: dict[str, dict] = {}
+        self._dns_query_events: dict[str, dict] = {}
+        self._ja3_cache: dict[str, dict] = {}
+        self._cookie_jar: dict[str, dict[str, str]] = {}
+
+    def done(self):
+        # A clean shutdown records what the queue still held (#291) and writes
+        # the refusals still being counted (#459, #460). On Windows a kill
+        # never reaches here; the owner asks through /__redlog_stop instead.
+        _stop_sending(1.0)
+        _flush_gaps()
+
+    def _track_cookies(self, domain: str, set_cookies: list[dict], identity: dict):
+        """Track Set-Cookie headers in memory. When a session-like cookie
+        changes value, emit a cookie_change event so the operator knows
+        a session was established or rotated. `identity` is the project of
+        the flow that set it."""
+        if domain not in self._cookie_jar:
+            self._cookie_jar[domain] = {}
+
+        session_names = {"session", "sessionid", "sid", "jsessionid", "phpsessid",
+                         "connect.sid", "asp.net_sessionid", "laravel_session",
+                         "token", "auth", "jwt", "access_token", "csrf", "_csrf_token"}
+
+        for cookie in set_cookies:
+            name = cookie.get("name", "")
+            value = cookie.get("value", "")
+            name_lower = name.lower()
+            prev = self._cookie_jar[domain].get(name)
+            self._cookie_jar[domain][name] = value
+
+            if prev is not None and prev != value and name_lower in session_names:
+                _send_to_redlog({
+                    "agent_type": "scanner",
+                    "_identity": identity or {},
+                    "data": {
+                        "subtype": "cookie_change",
+                        "domain": domain,
+                        "cookie_name": name,
+                        "old_hash": hashlib.sha256(prev.encode()).hexdigest()[:16],
+                        "new_hash": hashlib.sha256(value.encode()).hexdigest()[:16],
+                        "secure": cookie.get("secure", False),
+                        "httponly": cookie.get("httponly", False),
+                    },
+                    "target_id": domain,
+                })
+
+        if len(self._cookie_jar) > 500:
+            oldest_domains = list(self._cookie_jar.keys())[:100]
+            for d in oldest_domains:
+                self._cookie_jar.pop(d, None)
+
+    def _sweep_stale(self):
+        """Emit dropped-markers for pending requests older than PENDING_TTL_SEC."""
+        now = time.time()
+        stale_ids = [
+            fid for fid, meta in self._request_times.items()
+            if now - meta["at"] > PENDING_TTL_SEC and not meta.get("streaming")
+        ]
+        for fid in stale_ids:
+            meta = self._request_times.pop(fid, None)
+            if not meta:
+                continue
+            age_sec = int(now - meta["at"])
+            url = meta.get("url", "")
+            parsed = urlparse(url)
+            payload = {
+                "agent_type": "scanner",
+                # Present even when empty, so a flow that started with no
+                # project is refused rather than bound to the current one.
+                "_identity": meta.get("identity") or {},
+                "data": {
+                    "subtype": "http_request_dropped",
+                    "flow_id": fid,
+                    "method": meta.get("method", ""),
+                    "url": url,
+                    "age_sec": age_sec,
+                },
+                "target_id": parsed.hostname or "",
+            }
+            _send_to_redlog(payload)
+            if VERBOSE:
+                ctx.log.info(
+                    f"[redlog] dropped {meta.get('method', '')} {url} "
+                    f"(age {age_sec}s, no response/error)"
+                )
+
+        stale_dns = [
+            fid for fid, meta in self._dns_query_events.items()
+            if now - meta["at"] > PENDING_TTL_SEC
+        ]
+        for fid in stale_dns:
+            self._dns_query_events.pop(fid, None)
+
+    def http_connect(self, flow: http.HTTPFlow):
+        # A CONNECT to the verification host is accepted here. Otherwise the
+        # default eager strategy dials the host upstream first, fails to
+        # resolve it, and the client never reaches the TLS handshake that the
+        # HTTPS check exists to test.
+        if flow.request.host == VERIFY_HOST:
+            flow.response = http.Response.make(200)
+
+    def tls_failed_client(self, data: tls.TlsData):
+        # The client refused RedLog's certificate for the verification host:
+        # it does not trust the CA. There is no nonce at this point, only the
+        # fact, and RedLog shows it as a likely reason, not as a result.
+        try:
+            if getattr(data.conn, "sni", None) == VERIFY_HOST:
+                _report_verification({"scheme": "https", "rejected": True})
+        except Exception:
+            pass
+
+    def _answer_verification(self, flow: http.HTTPFlow) -> bool:
+        if flow.request.pretty_host != VERIFY_HOST:
+            return False
+        if flow.request.path == "/__redlog_ready":
+            # Private managed-process readiness, not a user capture proof.
+            # The caller never sends this token in its request; another
+            # listener cannot satisfy the check by reflecting a challenge.
+            token = os.environ.get("REDLOG_PROXY_READY_TOKEN", "")
+            flow.response = http.Response.make(200 if token else 403, token.encode("utf-8"), {
+                "content-type": "text/plain", "cache-control": "no-store"
+            })
+            return True
+        if flow.request.path == "/__redlog_stop":
+            # Private managed-process stop (#291). A kill on Windows never runs
+            # done(), so the owner asks here and the addon records what it
+            # still holds before shutting down. Its own token, not the
+            # readiness one: that is served to anyone who asks this host.
+            secret = os.environ.get("REDLOG_PROXY_CONTROL_TOKEN", "")
+            offered = flow.request.headers.get("x-redlog-control", "")
+            if not secret or not hmac.compare_digest(offered.encode("utf-8"), secret.encode("utf-8")):
+                flow.response = http.Response.make(403, b"", {"cache-control": "no-store"})
+                return True
+            flow.response = http.Response.make(202, b"", {"cache-control": "no-store"})
+            threading.Thread(target=_stop_and_exit, daemon=True).start()
+            return True
+        scheme = flow.request.scheme
+        nonce = _verify_nonce(flow.request.path)
+        wants_html = "text/html" in flow.request.headers.get("accept", "")
+        if nonce:
+            body, ctype = _verify_page(scheme, nonce, wants_html)
+            flow.response = http.Response.make(200, body, {"content-type": ctype, "cache-control": "no-store"})
+            _report_verification({
+                "nonce": nonce,
+                "scheme": scheme,
+                "user_agent": flow.request.headers.get("user-agent", "")[:200],
+            })
+        else:
+            flow.response = http.Response.make(404, b"", {"cache-control": "no-store"})
+        return True
+
+    def request(self, flow: http.HTTPFlow):
+        # Verification traffic is answered here and is not engagement
+        # evidence, so it never becomes an http_request_start row.
+        if self._answer_verification(flow):
+            return
+        self._sweep_stale()
+        pinned = {}
+        _embed_identity(pinned)
+        flow.metadata["redlog_identity"] = pinned.get("_identity", {})
+
+        url = flow.request.pretty_url
+        method = flow.request.method
+
+        # The project is fixed here, with the flow (#459). A marker the TTL
+        # sweep emits later carries this, not whatever is active by then.
+        self._request_times[flow.id] = {
+            "at": time.time(),
+            "method": method,
+            "url": url,
+            "identity": flow.metadata["redlog_identity"],
+        }
+
+        if SKIP_STATIC and _is_static(url):
+            return
+
+        parsed = urlparse(url)
+        target = parsed.hostname or ""
+        path = parsed.path
+
+        params = _extract_params(flow)
+        req_headers = _extract_all_headers(flow.request.headers)
+
+        content_type = flow.request.headers.get("content-type", "")
+        request_body = None
+        request_body_preview = ""
+        try:
+            request_body = _capture_body(flow.request.content, content_type, MAX_BODY)
+            if request_body and request_body["encoding"] == "text":
+                request_body_preview = _truncate(request_body["data"], PREVIEW_BODY)
+        except Exception as exc:
+            if VERBOSE:
+                ctx.log.warn(f"[redlog] req body decode failed for {url}: {exc}")
+
+        event_data = {
+            "subtype": "http_request_start",
+            "flow_id": flow.id,
+            "method": method,
+            "url": url,
+            "path": path,
+            "host": target,
+            "port": parsed.port or (443 if parsed.scheme == "https" else 80),
+            "scheme": parsed.scheme,
+            "request_headers": req_headers,
+        }
+
+        client_addr = _client_addr(flow)
+        if client_addr:
+            event_data["source_addr"] = client_addr
+            # The owning pid, resolved while this process still holds the
+            # socket. Without it the port has to be matched against a snapshot
+            # taken somewhere else, later, by something that is off by default.
+            owner = _socket_owner_pid(client_addr)
+            if owner:
+                event_data["pid"] = owner
+
+        if params:
+            event_data["params"] = params
+        if request_body_preview:
+            event_data["request_body_preview"] = request_body_preview
+        if request_body:
+            event_data["request_body"] = request_body
+
+        http_version = getattr(flow.request, 'http_version', None)
+        if http_version:
+            event_data["http_version"] = http_version
+        stream_id = getattr(flow.request, 'stream_id', None)
+        if stream_id is not None:
+            event_data["stream_id"] = stream_id
+
+        req_cookies = _extract_request_cookies(flow)
+        if req_cookies:
+            event_data["cookies"] = req_cookies
+
+        event_data["proxy_mode"] = PROXY_MODE
+        payload = {
+            "agent_type": "scanner",
+            "data": event_data,
+            "target_id": target,
+        }
+
+        payload["_identity"] = flow.metadata.get("redlog_identity", {})
+        _send_to_redlog(payload)
+
+        if VERBOSE:
+            body_info = f" ({request_body['size']}B)" if request_body else ""
+            ctx.log.info(f"[redlog] → {method} {url}{body_info}")
+
+    def responseheaders(self, flow: http.HTTPFlow):
+        # SSE is indefinite: capture bounded raw segments before response().
+        # Preserve compressed bytes and UTF-8 boundaries verbatim, without
+        # changing routing, headers or the bytes forwarded to the client.
+        if flow.request.pretty_host == VERIFY_HOST or not flow.response:
+            return
+        if "text/event-stream" not in flow.response.headers.get("content-type", "").lower():
+            return
+        if flow.response.stream:
+            return  # Do not replace another addon's streaming transform.
+        pinned = {"_identity": flow.metadata.get("redlog_identity", {})}
+        state = {"seq": 0, "bytes": 0, "ended": False, "not_queued_bytes": 0}
+        flow.metadata["redlog_stream"] = state
+        if flow.id in self._request_times:
+            self._request_times[flow.id]["streaming"] = True
+        def capture(chunk):
+            if not chunk:
+                state["ended"] = True
+                return chunk
+            for offset in range(0, len(chunk), 65536):
+                part = chunk[offset:offset + 65536]
+                state["seq"] += 1
+                payload = {
+                    "agent_type": "scanner",
+                    "_identity": pinned.get("_identity", {}),
+                    "target_id": urlparse(flow.request.pretty_url).hostname or "",
+                    "data": {
+                        "subtype": "http_response_chunk", "flow_id": flow.id,
+                        "url": flow.request.pretty_url, "method": flow.request.method,
+                        "seq": state["seq"], "offset": state["bytes"],
+                        "source_timestamp": int(time.time() * 1000),
+                        "content_type": flow.response.headers.get("content-type", ""),
+                        "content_encoding": flow.response.headers.get("content-encoding", "identity"),
+                        "response_body": {"data": base64.b64encode(part).decode("ascii"), "encoding": "base64", "size": len(part)},
+                        "streamed": True,
+                    },
+                }
+                state["bytes"] += len(part)
+                try:
+                    queued = _send_to_redlog(payload)
+                except Exception:
+                    queued = False
+                if not queued:
+                    state["not_queued_bytes"] += len(part)
+            return chunk
+        flow.response.stream = capture
+
+    def response(self, flow: http.HTTPFlow):
+        if flow.request.pretty_host == VERIFY_HOST:
+            return
+        self._sweep_stale()
+
+        url = flow.request.pretty_url
+
+        if SKIP_STATIC and _is_static(url):
+            self._request_times.pop(flow.id, None)
+            return
+
+        parsed = urlparse(url)
+        target = parsed.hostname or ""
+        method = flow.request.method
+        status = flow.response.status_code if flow.response else 0
+
+        meta = self._request_times.pop(flow.id, None)
+        start_time = meta["at"] if meta else None
+        duration_ms = int((time.time() - start_time) * 1000) if start_time else None
+
+        resp_headers = _extract_all_headers(flow.response.headers) if flow.response else []
+
+        content_type = flow.response.headers.get("content-type", "") if flow.response else ""
+        response_body = None
+        response_body_preview = ""
+        content_length = 0
+        try:
+            resp_content = flow.response.content if flow.response else None
+            response_body = _capture_body(resp_content, content_type, MAX_BODY)
+            if response_body and response_body["encoding"] == "text":
+                response_body_preview = _truncate(response_body["data"], PREVIEW_BODY)
+            if resp_content:
+                content_length = len(resp_content)
+        except Exception as exc:
+            content_length = int(flow.response.headers.get("content-length", "0") or "0") if flow.response else 0
+            if VERBOSE:
+                ctx.log.warn(f"[redlog] body decode failed for {url}: {exc}")
+
+        event_data = {
+            "subtype": "http_response",
+            "flow_id": flow.id,
+            "method": method,
+            "url": url,
+            "status": status,
+            "content_length": content_length,
+            "content_type": content_type,
+            "response_headers": resp_headers,
+        }
+
+        stream = flow.metadata.get("redlog_stream")
+        if stream:
+            event_data["streamed"] = True
+            event_data["stream_bytes_observed"] = stream["bytes"]
+            event_data["stream_chunks_observed"] = stream["seq"]
+            event_data["stream_not_queued_bytes"] = stream["not_queued_bytes"]
+            event_data["capture_delivery"] = "unknown"
+            event_data["stream_state"] = "ended" if stream["ended"] else "interrupted"
+        if response_body_preview:
+            event_data["response_preview"] = response_body_preview
+        if response_body:
+            event_data["response_body"] = response_body
+        if duration_ms is not None:
+            event_data["duration_ms"] = duration_ms
+
+        tls_info = _extract_tls_info(flow)
+        if tls_info:
+            event_data["tls"] = tls_info
+        timing = _extract_timing(flow)
+        if timing:
+            event_data["timing"] = timing
+
+        ja3 = self._get_ja3_for_flow(flow)
+        if ja3:
+            if "tls" not in event_data:
+                event_data["tls"] = {}
+            event_data["tls"]["ja3"] = ja3["ja3"]
+            event_data["tls"]["ja3_raw"] = ja3["ja3_raw"]
+
+        http_version = getattr(flow.request, 'http_version', None)
+        if http_version:
+            event_data["http_version"] = http_version
+        stream_id = getattr(flow.request, 'stream_id', None)
+        if stream_id is not None:
+            event_data["stream_id"] = stream_id
+
+        set_cookies = _extract_set_cookies(flow)
+        if set_cookies:
+            event_data["set_cookies"] = set_cookies
+            self._track_cookies(target, set_cookies, flow.metadata.get("redlog_identity", {}))
+
+        event_data["proxy_mode"] = PROXY_MODE
+        payload = {
+            "agent_type": "scanner",
+            "data": event_data,
+            "target_id": target,
+        }
+
+        payload["_identity"] = flow.metadata.get("redlog_identity", {})
+        _send_to_redlog(payload)
+
+        if VERBOSE:
+            ctx.log.info(
+                f"[redlog] ← {method} {status} {url} "
+                f"({content_length}B, {duration_ms}ms)"
+            )
+
+    # ─── DNS mode (mitmproxy --mode dns) ────────────────────────────────────
+
+    # mitmproxy dispatches DNS through `dns_request` / `dns_response`; there is
+    # no `dns_message` hook, so the handler below was never called and DNS
+    # capture recorded nothing at all. Verified against mitmproxy 12.2.3, whose
+    # DNS layer declares exactly three hooks:
+    #
+    #     DnsRequestHook  -> dns_request
+    #     DnsResponseHook -> dns_response
+    #     DnsErrorHook    -> dns_error
+    #
+    # The proxy itself worked the whole time — a query sent to `--mode dns@N`
+    # was resolved and answered — so nothing surfaced as broken except an
+    # empty timeline, which reads as "the target made no lookups".
+
+    def dns_request(self, flow):  # type: (Any) -> None  (mitmproxy.dns.DNSFlow)
+        self._dns_query(flow)
+
+    def dns_response(self, flow):  # type: (Any) -> None
+        self._dns_response(flow)
+
+    def dns_error(self, flow):  # type: (Any) -> None
+        # A failed lookup is evidence too: a target that could not resolve is
+        # not a target that was never asked about.
+        if VERBOSE:
+            try:
+                ctx.log.info(f"[redlog] DNS error on flow {flow.id}")
+            except Exception:
+                pass
+
+    def dns_message(self, flow):  # type: (Any) -> None
+        """Kept for any mitmproxy that dispatches a single message hook."""
+        try:
+            flow.request
+        except AttributeError:
+            return
+        if getattr(flow, 'response', None) is None:
+            self._dns_query(flow)
+        else:
+            self._dns_response(flow)
+
+    def _dns_query(self, flow):
+        try:
+            question = flow.request.questions[0] if flow.request.questions else None
+        except Exception:
+            question = None
+        query_name = getattr(question, 'name', '') if question else ''
+        query_type = _dns_type_name(getattr(question, 'type', 0) if question else 0)
+        source_addr = _client_addr(flow)
+        source_pid = _socket_owner_pid(source_addr)
+        transport = 'udp'
+        try:
+            if getattr(flow, 'client_conn', None) and getattr(flow.client_conn, 'transport_protocol', None):
+                transport = str(flow.client_conn.transport_protocol)
+        except Exception:
+            pass
+        event_data = {
+            'subtype': 'dns_query',
+            'query_name': query_name,
+            'query_type': query_type,
+            'query_id': getattr(flow.request, 'id', None),
+            'transport': transport,
+            'source_addr': source_addr,
+            'flow_id': flow.id,
+        }
+        if source_pid:
+            event_data['pid'] = source_pid
+        payload = {
+            'agent_type': 'dns',
+            'data': event_data,
+            'target_id': query_name,
+        }
+        # The answer is sent later; it keeps the question's project (#459).
+        _embed_identity(payload)
+        payload.setdefault('_identity', {})
+        self._dns_query_events[flow.id] = {'at': time.time(), 'event_id': None, 'identity': payload['_identity']}
+        event_id = _send_to_redlog_and_get_id(payload)
+        entry = self._dns_query_events.get(flow.id)
+        if entry is not None:
+            entry['event_id'] = event_id
+        if VERBOSE:
+            ctx.log.info(f"[redlog] DNS ⇒ {query_name} {query_type}")
+
+    def _dns_response(self, flow):
+        try:
+            question = flow.request.questions[0] if flow.request.questions else None
+        except Exception:
+            question = None
+        query_name = getattr(question, 'name', '') if question else ''
+        query_type = _dns_type_name(getattr(question, 'type', 0) if question else 0)
+        rcode = getattr(flow.response, 'response_code', None)
+        response_code = _dns_rcode_name(rcode) if rcode is not None else 'UNKNOWN'
+        answers = []
+        try:
+            for ans in (flow.response.answers or []):
+                answers.append({
+                    'name': getattr(ans, 'name', ''),
+                    'type': _dns_type_name(getattr(ans, 'type', 0)),
+                    'ttl': getattr(ans, 'ttl', 0),
+                    'data': str(getattr(ans, 'data', '') or ''),
+                })
+        except Exception:
+            pass
+        entry = self._dns_query_events.pop(flow.id, None)
+        duration_ms = int((time.time() - entry['at']) * 1000) if entry else None
+        causes = [entry['event_id']] if entry and entry.get('event_id') else []
+        event_data = {
+            'subtype': 'dns_response',
+            'query_name': query_name,
+            'query_type': query_type,
+            'response_code': response_code,
+            'answers': answers,
+            'flow_id': flow.id,
+        }
+        if duration_ms is not None:
+            event_data['duration_ms'] = duration_ms
+        if causes:
+            event_data['_causes'] = causes
+        payload = {
+            'agent_type': 'dns',
+            'data': event_data,
+            'target_id': query_name,
+        }
+        if entry is not None:
+            payload['_identity'] = entry.get('identity') or {}
+        _send_to_redlog(payload)
+        if VERBOSE:
+            ans_preview = ', '.join(f"{a['type']} {a['data']}" for a in answers[:3]) or '(no answers)'
+            ctx.log.info(
+                f"[redlog] DNS ⇐ {query_name} {query_type} → {response_code} "
+                f"[{ans_preview}] ({duration_ms}ms)"
+            )
+
+    # ─── WebSocket capture ────────────────────────────────────────────────
+
+    def websocket_message(self, flow: http.HTTPFlow):
+        assert flow.websocket is not None
+        msg = flow.websocket.messages[-1]
+        seq = _next_message_seq(flow, "redlog_ws_seq", flow.websocket.messages)
+
+        url = flow.request.pretty_url
+        parsed = urlparse(url)
+        target = parsed.hostname or ""
+
+        direction = "client" if msg.from_client else "server"
+        is_text = msg.type == 1
+        content = msg.content
+
+        raw_size = len(content) if content else 0
+        ws_body = None
+        ws_preview = ""
+
+        if content and raw_size > 0:
+            ws_body = _capture_body(content, "text/plain" if is_text else "application/octet-stream", MAX_BODY)
+            if ws_body and ws_body["encoding"] == "text":
+                ws_preview = _truncate(ws_body["data"], PREVIEW_BODY)
+
+        event_data = {
+            "subtype": "ws_message",
+            "flow_id": flow.id,
+            "url": url,
+            "host": target,
+            "direction": direction,
+            "message_type": "text" if is_text else "binary",
+            "size": raw_size,
+            "message_count": seq,
+        }
+
+        client_addr = _client_addr(flow)
+        if client_addr:
+            event_data["source_addr"] = client_addr
+            # The owning pid, resolved while this process still holds the
+            # socket. Without it the port has to be matched against a snapshot
+            # taken somewhere else, later, by something that is off by default.
+            owner = _socket_owner_pid(client_addr)
+            if owner:
+                event_data["pid"] = owner
+
+        if ws_preview:
+            event_data["ws_preview"] = ws_preview
+        if ws_body:
+            event_data["ws_body"] = ws_body
+
+        payload = {
+            "agent_type": "scanner",
+            "data": event_data,
+            "target_id": target,
+        }
+        payload["_identity"] = flow.metadata.get("redlog_identity", {})
+        if ws_body and ws_body.get("truncated"):
+            flow.metadata["redlog_ws_truncated"] = True
+        if not _send_to_redlog(payload):
+            flow.metadata["redlog_ws_not_queued_bytes"] = flow.metadata.get("redlog_ws_not_queued_bytes", 0) + raw_size
+
+        if VERBOSE:
+            arrow = "▲" if msg.from_client else "▼"
+            ctx.log.info(
+                f"[redlog] WS {arrow} {url} "
+                f"({raw_size}B {'text' if is_text else 'bin'}, "
+                f"#{seq})"
+            )
+
+    def websocket_end(self, flow: http.HTTPFlow):
+        if flow.websocket is None:
+            return
+        code = getattr(flow.websocket, "close_code", None)
+        _send_to_redlog({
+            "agent_type": "scanner", "_identity": flow.metadata.get("redlog_identity", {}),
+            "target_id": urlparse(flow.request.pretty_url).hostname or "",
+            "data": {"subtype": "websocket_end", "flow_id": flow.id, "url": flow.request.pretty_url,
+                     "streamed": True, "stream_state": "ended" if code in (1000, 1001) else "interrupted",
+                     "close_code": code, "message_count_observed": flow.metadata.get("redlog_ws_seq", 0),
+                     "stream_not_queued_bytes": flow.metadata.get("redlog_ws_not_queued_bytes", 0),
+                     "truncated": flow.metadata.get("redlog_ws_truncated", False), "capture_delivery": "unknown"}
+        })
+
+    # ─── TCP stream capture ───────────────────────────────────────────────
+
+    def tcp_start(self, flow: tcp.TCPFlow):
+        pinned = {}
+        _embed_identity(pinned)
+        flow.metadata["redlog_identity"] = pinned.get("_identity", {})
+
+    def tcp_message(self, flow: tcp.TCPFlow):
+        msg = flow.messages[-1]
+        seq = _next_message_seq(flow, "redlog_tcp_seq", flow.messages)
+        direction = "client" if msg.from_client else "server"
+        content = msg.content
+        raw_size = len(content) if content else 0
+        target, port = _tcp_peer(flow)
+
+        tcp_body = None
+        tcp_preview = ""
+        if content and raw_size > 0:
+            tcp_body = _capture_body(content, "application/octet-stream", MAX_BODY)
+            if tcp_body and tcp_body["encoding"] == "text":
+                tcp_preview = _truncate(tcp_body["data"], PREVIEW_BODY)
+            elif tcp_body:
+                tcp_preview = f"[binary, {raw_size} bytes]"
+
+        event_data = {
+            "subtype": "tcp_message",
+            "flow_id": flow.id,
+            "direction": direction,
+            "size": raw_size,
+            "host": target,
+            "port": port,
+            "message_count": seq,
+        }
+
+        client_addr = _client_addr(flow)
+        if client_addr:
+            event_data["source_addr"] = client_addr
+            # The owning pid, resolved while this process still holds the
+            # socket. Without it the port has to be matched against a snapshot
+            # taken somewhere else, later, by something that is off by default.
+            owner = _socket_owner_pid(client_addr)
+            if owner:
+                event_data["pid"] = owner
+
+        if tcp_preview:
+            event_data["tcp_preview"] = tcp_preview
+        if tcp_body:
+            event_data["tcp_body"] = tcp_body
+
+        tls_version = getattr(flow.server_conn, 'tls_version', None)
+        if tls_version:
+            event_data["tls_version"] = tls_version
+
+        payload = {
+            "agent_type": "scanner",
+            "data": event_data,
+            "target_id": target,
+        }
+        payload["_identity"] = flow.metadata.get("redlog_identity", {})
+        if tcp_body and tcp_body.get("truncated"):
+            flow.metadata["redlog_tcp_truncated"] = True
+        if not _send_to_redlog(payload):
+            flow.metadata["redlog_tcp_not_queued_bytes"] = flow.metadata.get("redlog_tcp_not_queued_bytes", 0) + raw_size
+
+        if VERBOSE:
+            arrow = "▲" if msg.from_client else "▼"
+            ctx.log.info(f"[redlog] TCP {arrow} {target}:{port} ({raw_size}B, #{seq})")
+
+    def tcp_end(self, flow: tcp.TCPFlow):
+        # A close with an error on either connection is an interruption. Seen
+        # with mitmproxy 12.2.3: a peer's RST arrives as an ordinary close with
+        # no error, so "ended" for TCP means the connection closed, cause
+        # unknown (e2e/tcp-lifecycle.spec.ts).
+        error =getattr(flow.server_conn, "error", None) or getattr(flow.client_conn, "error", None)
+        self._tcp_close(flow, error)
+
+    def tcp_error(self, flow: tcp.TCPFlow):
+        self._tcp_close(flow, getattr(flow.error, "msg", None) or "error")
+
+    def _tcp_close(self, flow: tcp.TCPFlow, error):
+        """The close of a raw TCP stream, as websocket_end is for WebSocket
+        (#290): what the addon observed, never what RedLog saved, so delivery
+        stays unknown. Once per flow, so a tcp_end after tcp_error cannot turn
+        a failed connection into a normal close."""
+        if flow.metadata.get("redlog_tcp_closed"):
+            return
+        flow.metadata["redlog_tcp_closed"] = True
+        target, port = _tcp_peer(flow)
+        data = {"subtype": "tcp_end", "flow_id": flow.id, "host": target, "port": port, "streamed": True,
+                "stream_state": "interrupted" if error else "ended",
+                "message_count_observed": flow.metadata.get("redlog_tcp_seq", 0),
+                "stream_not_queued_bytes": flow.metadata.get("redlog_tcp_not_queued_bytes", 0),
+                "truncated": flow.metadata.get("redlog_tcp_truncated", False), "capture_delivery": "unknown"}
+        if error:
+            data["error"] = str(error)
+        _send_to_redlog({"agent_type": "scanner", "_identity": flow.metadata.get("redlog_identity", {}),
+                         "target_id": target, "data": data})
+
+    # ─── TLS ClientHello capture (JA3 fingerprint) ────────────────────────
+
+    def tls_clienthello(self, data: tls.ClientHelloData):
+        """Cache JA3 fingerprint from the TLS ClientHello for later attachment
+        to the HTTP response event. The ClientHello fires before any HTTP
+        hooks, so we stash by client address and look it up in response()."""
+        try:
+            ja3 = _compute_ja3(data)
+            if ja3:
+                conn = data.context.client
+                key = f"{conn.peername[0]}:{conn.peername[1]}" if hasattr(conn, 'peername') and conn.peername else ""
+                if key:
+                    self._ja3_cache[key] = ja3
+                    if len(self._ja3_cache) > 5000:
+                        oldest = list(self._ja3_cache.keys())[:1000]
+                        for k in oldest:
+                            self._ja3_cache.pop(k, None)
+        except Exception:
+            pass
+
+    def _get_ja3_for_flow(self, flow: http.HTTPFlow) -> dict | None:
+        """Look up cached JA3 fingerprint for a flow's client connection."""
+        try:
+            client = flow.client_conn
+            if client and hasattr(client, 'peername') and client.peername:
+                key = f"{client.peername[0]}:{client.peername[1]}"
+                return self._ja3_cache.get(key)
+        except Exception:
+            pass
+        return None
+
+    def error(self, flow: http.HTTPFlow):
+        if flow.request.pretty_host == VERIFY_HOST:
+            return
+        url = flow.request.pretty_url
+        parsed = urlparse(url)
+
+        meta = self._request_times.pop(flow.id, None)
+        start_time = meta["at"] if meta else None
+        duration_ms = int((time.time() - start_time) * 1000) if start_time else None
+
+        req_headers = _extract_all_headers(flow.request.headers)
+
+        event_data = {
+            "subtype": "http_error",
+            "flow_id": flow.id,
+            "method": flow.request.method,
+            "url": url,
+            "host": parsed.hostname or "",
+            "error": str(flow.error) if flow.error else "unknown",
+            "request_headers": req_headers,
+        }
+        if duration_ms is not None:
+            event_data["duration_ms"] = duration_ms
+        stream = flow.metadata.get("redlog_stream")
+        if stream:
+            event_data["streamed"] = True
+            event_data["stream_state"] = "interrupted"
+            event_data["stream_bytes_observed"] = stream["bytes"]
+            event_data["stream_chunks_observed"] = stream["seq"]
+            event_data["stream_not_queued_bytes"] = stream["not_queued_bytes"]
+            event_data["capture_delivery"] = "unknown"
+
+        payload = {
+            "agent_type": "scanner",
+            "data": event_data,
+            "target_id": parsed.hostname or "",
+        }
+        payload["_identity"] = flow.metadata.get("redlog_identity", {})
+        _send_to_redlog(payload)
+
+        if VERBOSE:
+            ctx.log.info(
+                f"[redlog] ✗ {flow.request.method} {url} "
+                f"({event_data['error']}, {duration_ms}ms)"
+            )
+
+
+addons = [RedLogAddon()]

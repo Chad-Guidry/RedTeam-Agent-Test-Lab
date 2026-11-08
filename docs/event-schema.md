@@ -1,0 +1,417 @@
+# Event schema
+
+The `events` table only fixes the top-level envelope (id, timestamp, operator, hostname, agent_type, target_id, hash, prev_hash, monotonic_ns, ntp_offset_ms). The `data` column is free-form JSON per agent_type.
+
+To make the timeline both **usable inside RedLog** and **portable to Ghostwriter's Oplog** (the industry-standard red-team activity log), agents should populate a small set of **standard keys** whenever they apply. Extra fields are fine — nothing rejects them.
+
+## Standard keys (align with Ghostwriter Oplog)
+
+| Key | Type | Meaning |
+|---|---|---|
+| `subtype` | string | Sub-category inside the agent_type (`command_start`, `dns_query`, `credential_use`, `c2_checkin`, …) |
+| `command` | string | The exact command / query / API call that was run |
+| `output` | string | Output produced (raw or truncated — run through `redlog_loot_scan` first) |
+| `output_preview` | string | First N chars of output, safe to display in a summary |
+| `tool` | string | Tool name used (`nmap`, `sqlmap`, `burp`, `curl`, `manual`, …) |
+| `dest_ip` | string | Destination IPv4/IPv6 |
+| `dest_host` | string | Destination hostname |
+| `dest_port` | number | Destination port |
+| `src_ip` | string | Source IPv4/IPv6 (usually your egress) |
+| `user_context` | string | User the action was performed as (`root`, `www-data`, `system`, …) |
+| `mitre_ttp` | string \| string[] | ATT&CK technique id(s), e.g. `T1046` or `["T1046","T1595.001"]` |
+| `description` | string | Human-readable one-liner for the report |
+| `comments` | string | Free-form notes / caveats |
+| `sha256` | string | SHA-256 of a payload / dropped file / screenshot |
+| `bytes` | number | Byte size of a transfer / payload |
+| `severity` | string | `marker`: `info` / `important` / `critical` (the vocabulary the marker dialog writes). `loot`: `info` / `low` / `medium` / `high` / `critical` |
+
+## Standard `agent_type` values
+
+All 15 are first-class Timeline lanes (empty lanes auto-collapse):
+
+**Recorded from operator / agent activity:**
+- `shell` — commands captured via hooks or the built-in terminal
+- `agent` — Claude Code / Codex tool calls (via the transcript tailer)
+- `http_navigation` — page loads inside the built-in CDP-connected browser
+- `dns` — DNS resolutions and probes (`subtype: dns_query` / `dns_response`)
+- `pivot` — tunnel/pivot lifecycle — RedLog auto-detects from shell (see below)
+- `screenshot` — desktop captures (periodic + on-demand, SHA-256 hashed)
+- `clipboard` — clipboard changes (opt-in; SHA-256 + length always, redacted preview optional)
+- `file_transfer` — ingress/exfil — RedLog auto-detects from shell (see below)
+- `credential_use` — every attempted / successful credential use
+- `c2_checkin` — C2 beacon / callback
+- `cleanup` — anti-forensics actions (T1070.\*, T1564.001) — RedLog auto-detects (see below)
+  **`system` / `scope_recomputed`** and **`system` / `scope_cleared`** (design
+  turn 8a). Both chained. When the allowlist changes, RedLog re-judges the rows
+  the live path was eligible to judge and appends the result; nothing already
+  written is modified.
+
+  - `scope_recomputed` is the summary and the anchor every row of a run cites:
+    the scope fingerprint before and after, the file's sha256, the alert floor,
+    what was scanned, and the counts. `newly_flagged` beside
+    `newly_flagged_written` is deliberate — writes are capped per run, and
+    truncation the operator cannot see would make the banner claim a smaller
+    number than the engagement holds.
+  - `scope_cleared` records that a violation no longer holds:
+    `violation_id`, the distance before and after, and `_causes:
+    [violationId, recomputeId]`. Its own subtype rather than a violation at
+    distance `in_scope`, so every `scope_violation` row keeps meaning "a
+    violation was judged".
+  - `scope_violation` gains optional fields on the retroactive form: `judged:
+    'retroactive'`, `recompute_id`, `source_ts`, `source_tier`,
+    `source_sanitized`, and `regrade_of` when it supersedes an earlier verdict
+    at a different rung. Their ABSENCE is what makes every row already on disk
+    read as judged-at-the-time, with no migration.
+
+  Withdrawals are computed from the violation RECORDS rather than by rescanning,
+  because the logged tier — where most of the eligible corpus lives — is pruned
+  after `retention.loggedTier.keepDays`.
+
+- `marker` — human-created finding notes / severity marks
+
+  **`subtype: 'amended'`** — a correction to an earlier marker (design turn 8b).
+  Chained, like the marker itself. Carries `markerId` (the marker it revises)
+  and `_causes: [markerId]`, plus ONLY the fields that changed, flat, under the
+  marker's own names: `title`, `severity`, `notes`. Never `atTimestamp`,
+  `category` or anything in the envelope — those are the record, not a
+  description of it. What a marker says now is the fold over (marker,
+  amendments in insertion order); the marker row is never modified, and
+  amending an amendment is refused, so the fold is a list, not a tree.
+
+  Two conventions worth stating once, because both features that write
+  correcting rows rely on them:
+  - **Absence means the old meaning.** A row without the newer field reads
+    exactly as it did before that field existed, so no migration is needed.
+  - **`_causes[0]` may point outside any loaded window.** A correction is
+    always newer than what it corrects, and readers page newest-first — a
+    cause that is merely not loaded is not a broken chain, and must not be
+    drawn as one.
+
+  Redaction is keyed `(event id, field)`, so masking a note on the marker does
+  NOT mask the same text in an amendment that restated it. Both ids have to be
+  listed when sanitizing.
+
+  `/api/events` refuses `marker` + `subtype: 'amended'` with 403: validating a
+  forged correction would only make it well-formed, and any token holder could
+  still re-title another operator's finding.
+- `loot` — credential/secret detections (auto from output, or explicit via `redlog_loot_scan`)
+- `scanner` — mitmproxy / port scan / vuln scan output (open agent_type)
+
+**System / drift-detection:**
+- `system` — RedLog's own audit trail. Distinct subtypes:
+  - `scope_violation` — command touched a target outside allowed scope (own timeline lane `scope`)
+  - `ip_transition` — external IP or safety state (safe/exposed/unknown) changed
+  - `opsec_state_changed` — VPN interfaces, DNS resolvers, primary MAC, or hostname changed
+  - `recording_paused` / `recording_resumed` — recording was toggled. Carries
+    `source`: `ui` (operator at the keyboard), `api` (redlog-cli or another
+    local REST client) or `mcp` (an AI agent calling `redlog_recording`).
+    While paused RedLog records nothing except `system` and `marker` events —
+    see [audit-trail.md](audit-trail.md)
+  - `config_changed` — security-relevant setting saved (scope targets, warn-on-violation, IP blacklist…) with a from→to diff
+  - `browser_launched` — proxied browser opened
+  - `secret_revealed` — reviewer clicked "Reveal" on an event whose data has redaction spans; records `source_event`, `fields`, and the viewing operator (four-layer redaction, layer 3 — see [redaction-design.md](redaction-design.md))
+  - `sanitized` — `redlog-cli sanitize --confirm` (or the REST equivalent) wrote sanitized bytes to the `sanitized_events` table for pre-delivery scrub; records `source_events`, `fields`, per-field `replacement_sha256`, and an optional `reason`. Source events are never mutated (four-layer redaction, layer 4)
+  - `proxy_bypass_suspected` — no longer written (removed 2026-09-23); older projects may still hold it (see [DESIGN-traffic-capture.md](DESIGN-traffic-capture.md))
+  - `api_started`, `session_start`, `deconfliction_test` — housekeeping, hidden from Timeline by default
+
+### `pivot` events
+
+RedLog **auto-detects** pivots from shell commands (ligolo-ng, chisel, `ssh -D/-L/-R`,
+sshuttle, proxychains, socat) and emits a `pivot` event alongside the command, so
+the timeline shows the intermediate node and route — not just the raw command.
+Agents can also log them explicitly. Keys:
+
+| Key | Meaning |
+|-----|---------|
+| `subtype` | `tunnel_start` / `socks_up` / `port_forward` / `route_add` / `agent_connect` / `proxied` |
+| `tool` | `ligolo-ng` / `chisel` / `ssh` / `sshuttle` / `proxychains` / `socat` |
+| `via` | the intermediate / jump node the pivot goes through |
+| `route` | CIDR reachable through the pivot (e.g. `10.10.0.0/16`) |
+| `socks_port` | local SOCKS port opened, if any |
+| `forward` | raw forward spec (e.g. `8080:10.0.0.5:80`) |
+| `mitre_ttp` | `T1090` (Proxy) or `T1572` (Protocol Tunneling) |
+
+```json
+{
+  "agent_type": "pivot",
+  "data": { "subtype": "route_add", "tool": "sshuttle", "via": "jump.corp", "route": "10.10.0.0/16", "mitre_ttp": "T1090" }
+}
+```
+
+A `pivot` also fires with `subtype: "closed"` when the foreground tunnel's
+`command_end` lands (durations ≥ 2s only; backgrounded `-fN`/`&` variants can't
+be reliably closed and drop off the HUD via the 30-min recency window instead).
+
+### `cleanup` events (anti-forensics)
+
+Auto-detected from shell commands: history clearing, log wiping (`journalctl
+--vacuum`, `wevtutil cl`, `rm /var/log/…`), secure delete (`shred`/`srm`/
+`sdelete`/`wipe`), timestomp (`touch -t`, SetMace), file-attribute hiding
+(`chattr +i`, `attrib +h`). NIST SP 800-86 requires these tracked distinctly.
+
+| Key | Meaning |
+|-----|---------|
+| `subtype` | `history_clear` / `log_clear` / `file_shred` / `timestomp` / `attr_hide` |
+| `tool` | `shell` / `wevtutil` / `journalctl` / `rm` / `shred` / `touch` / `chattr` / … |
+| `target` | the file/path named in the command, if any |
+| `mitre_ttp` | `T1070.001` (Win logs) / `T1070.002` (Linux logs) / `T1070.003` (history) / `T1070.004` (shred) / `T1070.006` (timestomp) / `T1564.001` (attr hide) |
+| `command` | verbatim command that triggered detection |
+
+### `file_transfer` auto-detection
+
+RedLog auto-emits a `file_transfer` companion event when a shell command matches:
+`curl -o/-O` / `wget -O` / `aria2c -o` / `scp` / `rsync` / `sftp` / `python -m
+http.server`. Agents can still emit explicit `file_transfer` events via API.
+
+| Key | Meaning |
+|-----|---------|
+| `subtype` | `download` / `upload` |
+| `tool` | `curl` / `wget` / `scp` / `rsync` / `python-http.server` / … |
+| `url`, `localPath`, `remotePath` | any of these populated depending on tool |
+| `mitre_ttp` | `T1105` (ingress-tool-transfer) for download; `T1041` (exfil over C2) for upload |
+| `command` | verbatim command that triggered detection |
+
+### `scanner` events (mitmproxy traffic capture)
+
+Events from the mitmproxy addon go to the **logged tier** (`events_logged`).
+See [DESIGN-traffic-capture.md](DESIGN-traffic-capture.md) for the full
+pipeline architecture.
+
+#### HTTP subtypes
+
+| Subtype | When | Key fields |
+|---------|------|------------|
+| `http_request_start` | `request()` hook fires | `method`, `url`, `host`, `port`, `scheme`, `request_headers` (all, ordered), `request_body` / `request_body_ref`, `request_body_preview`, `params`, `flow_id`, `http_version`, `stream_id`, `cookies` |
+| `http_response` | `response()` hook fires | `status`, `response_headers` (all, ordered), `response_body` / `response_body_ref`, `response_preview`, `content_type`, `content_length`, `duration_ms`, `tls` object (+ `ja3`, `ja3_raw`), `timing` object, `flow_id`, `http_version`, `stream_id`, `set_cookies` |
+| `cookie_change` | session cookie rotation detected | `domain`, `cookie_name`, `old_hash`, `new_hash`, `flow_id` |
+| `http_error` | `error()` hook fires | `error`, `request_headers`, `duration_ms`, `flow_id` |
+| `http_request_dropped` | stale-flow sweep (>300 s) | `flow_id`, `age_sec` |
+
+Headers are stored as `[[name, value], ...]` arrays preserving duplicates
+and casing, capped at `MAX_HEADERS` (default 200).
+
+Bodies larger than `INLINE_THRESHOLD` (4096 bytes) are stored as sidecar
+files in `<projectDir>/http-bodies/<sha256>.body` and replaced in the event
+with a `BodyRef`:
+```json
+{ "sha256": "a1b2c3...", "size": 81920, "file": "a1b2c3....body", "encoding": "text" }
+```
+
+A body over `MAX_BODY` (10 MiB by default) is cut by the addon. Its ref then
+has `"truncated": true`, `size` is the bytes stored, and `totalSize` is the
+size the addon saw, when it reported one. Without `totalSize` the total is
+unknown: it is never filled in from `size`.
+
+The `tls` object (HTTPS only):
+```json
+{ "tls_version": "TLSv1.3", "cipher": "...", "alpn": "h2",
+  "cert_subject": "CN=...", "cert_issuer": "...", "cert_san": [...], "cert_serial": "...",
+  "ja3": "e7d705a3286e19ea42f587b344ee6865", "ja3_raw": "771,4866-4867-..." }
+```
+
+`ja3` and `ja3_raw` are computed from the TLS ClientHello via the
+`tls_clienthello` hook. GREASE values are filtered. `ja3_raw` is
+truncated to 500 characters.
+
+The `timing` object:
+```json
+{ "connect_ms": 12, "tls_ms": 45, "send_ms": 1, "wait_ms": 230, "receive_ms": 15, "total_ms": 303 }
+```
+
+#### WebSocket subtype
+
+| Subtype | When | Key fields |
+|---------|------|------------|
+| `ws_message` | `websocket_message()` hook | `flow_id`, `url`, `host`, `direction` (`client`/`server`), `message_type` (`text`/`binary`), `size`, `message_count`, `ws_body` / `ws_body_ref`, `ws_preview` |
+
+Each WebSocket frame is a separate event. Binary payloads use base64 encoding.
+
+`message_count` is the message's own sequence number in its flow, 1, 2, 3…,
+counted by the addon across both directions. It is not the length of
+mitmproxy's message list: once a message has been sent here the addon lets
+mitmproxy drop the ones before it, so an hours-long stream does not hold every
+message in memory (#290). `tcp_message` numbers its messages the same way.
+
+#### TCP subtype
+
+| Subtype | When | Key fields |
+|---------|------|------------|
+| `tcp_message` | `tcp_message()` hook | `flow_id`, `host`, `port`, `direction`, `size`, `message_count`, `tls_version` (if TLS), `tcp_body` / `tcp_body_ref`, `tcp_preview` |
+| `tcp_end` | `tcp_end()` / `tcp_error()` hook, once per flow | `flow_id`, `host`, `port`, `streamed: true`, `stream_state` (`ended`, or `interrupted` when mitmproxy reported an error, such as a failed connect), `error`, `message_count_observed`, `stream_not_queued_bytes`, `truncated`, `capture_delivery: "unknown"` |
+
+`tcp_end` is what the addon observed, as `websocket_end` is: RedLog judges the
+stream by comparing it with the `tcp_message` rows it saved. A flow with
+messages and no `tcp_end` reads as "no end recorded": it may still be open, or
+the producer stopped first.
+
+For TCP, `ended` means the connection closed, not that the peer closed it
+cleanly. With mitmproxy 12.2.3 a peer's reset arrives as an ordinary close
+with no error (`e2e/tcp-lifecycle.spec.ts`), so a reset and a FIN read alike.
+Every message relayed before either is saved, which is what `end-observed`
+claims.
+
+Requires mitmproxy `--mode tcp@port` or transparent mode.
+
+#### Auto-detected `credential_use` companion
+
+When `http_request_start` carries authentication indicators, a companion
+`credential_use` event is emitted with `_causes` pointing to the source:
+
+| Pattern detected | `method` value |
+|------------------|---------------|
+| `Authorization: Basic …` | `basic_auth` |
+| `Authorization: Bearer …` | `bearer_token` |
+| `Authorization: NTLM …` | `ntlm` |
+| `Authorization: Negotiate …` | `negotiate` |
+| Session/auth cookies | `session_cookie` |
+| `X-API-Key` / `API-Key` header | `api_key` |
+| Body contains password/passwd/credential fields | `form_login` |
+
+All auto-detected credentials carry `mitre_ttp: "T1078"`.
+
+### `http_navigation` events
+
+Written every 3 s by the CDP monitor when a page URL changes in the built-in
+browser. `chrome://`, `about:`, `devtools:`, `view-source:` filtered out.
+
+| Key | Meaning |
+|-----|---------|
+| `subtype` | `navigation` |
+| `url`, `prev_url`, `host`, `title`, `tab_id` | the new location and its predecessor |
+| `mitre_ttp` | `T1071.001` (application-layer, web) |
+
+### `clipboard` events (opt-in)
+
+Off by default. When enabled in Settings ▸ Clipboard, RedLog polls (default
+1500 ms), hashes with SHA-256, dedupes by hash, and runs the loot detector.
+Credentials found in the content emit their own `loot` event; the clipboard
+event itself records only:
+
+| Key | Meaning |
+|-----|---------|
+| `subtype` | `clipboard_changed` |
+| `sha256` | SHA-256 of raw text (proves "this content was seen") |
+| `length`, `lines` | shape metrics |
+| `lootTypes` | credential types found (`aws_key`, `jwt`, …) — never the values |
+| `preview` | first 120 chars, run through redaction — **null** unless `storePreview` is on |
+
+### `system.opsec_state_changed` events
+
+One event per polling cycle (30 s) with a delta of what changed. Delta keys:
+`vpn` (VPN-shaped interfaces up/down), `primaryMac` (randomization signal),
+`dns` (resolver list), `hostname`. Detected via Node's `os.networkInterfaces()`
+plus `scutil --dns` / `/etc/resolv.conf` / `Get-DnsClientServerAddress`.
+
+### `system.config_changed` events
+
+Emitted on every `config:save` where a security-relevant field changed. Diffed
+fields: scope warnOnViolation/targets/excludeTargets/scopeFile, network white/blacklist,
+engagement id, operator id/name, deconfliction endpoint. Cosmetic changes stay silent.
+
+| Key | Meaning |
+|-----|---------|
+| `subtype` | `config_changed` |
+| `changed` | `{ "scope.warnOnViolation": { "from": true, "to": false }, ... }` |
+| `description` | comma-joined list of changed paths |
+
+## Examples
+
+DNS enumeration:
+```json
+{
+  "agent_type": "dns",
+  "target_id": "example.com",
+  "data": {
+    "subtype": "dns_query",
+    "command": "dig +short api.example.com A @8.8.8.8",
+    "dest_host": "api.example.com",
+    "tool": "dig",
+    "mitre_ttp": "T1596.001",
+    "description": "Recon: enumerate A records for target apex"
+  }
+}
+```
+
+Credential use:
+```json
+{
+  "agent_type": "credential_use",
+  "target_id": "vpn.corp.example.com",
+  "data": {
+    "subtype": "successful_login",
+    "user_context": "svc-backup",
+    "tool": "openvpn",
+    "dest_host": "vpn.corp.example.com",
+    "dest_port": 1194,
+    "mitre_ttp": "T1078",
+    "description": "Reused leaked svc-backup credentials to establish VPN tunnel",
+    "severity": "high"
+  }
+}
+```
+
+File transfer:
+```json
+{
+  "agent_type": "file_transfer",
+  "target_id": "10.0.0.15",
+  "data": {
+    "subtype": "upload",
+    "command": "scp /tmp/enum.sh user@10.0.0.15:/tmp/",
+    "sha256": "9f2c…",
+    "bytes": 4321,
+    "tool": "scp",
+    "user_context": "user",
+    "dest_ip": "10.0.0.15",
+    "mitre_ttp": "T1105"
+  }
+}
+```
+
+C2 check-in:
+```json
+{
+  "agent_type": "c2_checkin",
+  "target_id": "10.0.0.15",
+  "data": {
+    "subtype": "beacon",
+    "dest_ip": "10.0.0.15",
+    "user_context": "SYSTEM",
+    "mitre_ttp": "T1071.001",
+    "description": "Sliver implant checked in over HTTPS after reboot",
+    "bytes": 812
+  }
+}
+```
+
+## Why these keys
+
+Ghostwriter's Oplog CSV import maps directly onto these fields. Populating them now means an engagement can be dumped from RedLog and imported into Ghostwriter with zero manual munging, and the client's final report can filter/pivot by MITRE technique out of the box.
+
+## Related
+
+- [Agent integration](agent-integration.md) — how to actually POST an event
+- [Skill: redlog-pentest](skills/redlog-pentest.md) — flow that uses these keys
+
+## HTTP streaming segments
+
+`scanner.http_response_chunk` records bounded raw response segments for SSE before the HTTP response ends. These are byte segments, not inferred SSE message or packet boundaries. Each carries `flow_id`, `seq`, `offset`, `source_timestamp`, `content_type`, `content_encoding` and `response_body` (base64 bytes, or its normal saved-body ref after ingest). Offsets count the raw bytes observed, so compressed content remains compressed and UTF-8 sequences may span segments.
+
+The request pins project identity; later async sends or errors cannot rebind the flow. Pause rejects new bytes, including delayed segments observed before resume; rejection is never spooled for later replay. Transmission has four workers and at most 64 admitted events. Offline spool admission is bounded to 5,000 files / 64 MiB, and publication uses a temporary file followed by rename. An unacknowledged delivery stores only project-bound `scanner.capture_gap` metadata (`reason: delivery-unconfirmed`, `capture_delivery: unknown`); it never retains the original URL, headers or body for replay. This prevents transport failure during pause from saving refused raw content. It also means failed original content cannot be recovered from this spool. Explicit HTTP refusals are never spooled.
+
+Events admitted to the send queue and not yet delivered when the proxy stops are recorded the same way, as content-free `scanner.capture_gap` records for their own project (#291):
+
+| `reason` | `capture_delivery` | When | `skipped_units` |
+|---|---|---|---|
+| `proxy-stopped` | `not-sent` | The addon was told to stop (its shutdown hook, or the managed proxy's private stop request) while events were still queued. | Exact. |
+| `delivery-interrupted` | `unknown` | Events were mid-send when a told stop gave up waiting for them, or the proxy was killed. | An upper bound: some or all may have arrived. |
+
+A kill runs no code, so while anything is in flight the addon keeps a marker in `~/.redlog/inflight/<pid>-<ns>.json`: `pid`, `heartbeat_at`, and per project `identity`, `upper_bound`, `since` and `last`. It holds no URL, header or body. The marker is written before an event is queued, with the bound rounded up to a multiple of 8. A heartbeat lowers the bound to the real count each second, and the marker is removed once nothing is in flight or a told stop has recorded its exact counts. The app's spool drain turns the marker of a producer that is gone (its pid is not running, or its heartbeat is ten minutes old) into a `delivery-interrupted` spool record and removes it. `gap_started_at` is when the producer's current run of in-flight events began, and `gap_ended_at` its last admission or heartbeat; under steady traffic the window can be much wider than the events it counts, never narrower. Both reasons are judged against recording pauses like `queue-full`. That judgment is approximate at a pause boundary: RedLog judges an `http_request_*` event by when it arrives, not when it was admitted.
+
+Terminal response/error metadata records `stream_state`, `stream_bytes_observed`, `stream_chunks_observed`, `stream_not_queued_bytes` and `capture_delivery: unknown`. Observed counts are not acknowledged persistence counts. Known unqueued bytes or interruption mark partial capture; otherwise completeness remains unverified. A missing terminal event is not normal completion.
+
+HTTP selection exports include only the segments inside the approved snapshot. HAR keeps raw segment bodies in `_redlog.streamChunks` with event ID, sequence, offset and content encoding; it does not fabricate one fully decoded response. Bundle uses the existing Event/body-ref attachment contract. Reading and search remain per saved segment; no logical SSE parser or cross-segment text-search guarantee is introduced.
+
+`scanner.ws_message` retains observed order, direction, original message size and the bounded captured body. `scanner.websocket_end` records the close code, observed message count, known unqueued bytes and ended/interrupted state. HAR preserves captured messages in `_redlog.webSocketMessages` with raw binary bodies; a stream remains incomplete rather than implying the entire conversation was captured. This does not establish a bound for mitmproxy’s own WebSocket message history or certify multi-hour memory usage.
+
+HTTP body sidecars are written to a unique temporary file and published under their content hash only after the write succeeds. Existing content is verified before reuse; a partial or corrupt file cannot silently become successful evidence on retry.

@@ -1,0 +1,574 @@
+import { useEffect, useState, useRef, useLayoutEffect } from 'react'
+import { useI18n } from './i18n'
+import { HUD, hexA } from './lib/hud'
+import { usePivotRead } from './lib/usePivots'
+import { formatTime, formatFreshness, useDisplayZone } from './lib/time'
+import { useTick } from './lib/useTick'
+import { hudWindowWidth, hudWindowHeight } from '../../core/overlay-layout'
+
+// HUD palette — cyberpunk, but DESATURATED for dark-UI comfort (see lib/hud):
+// cyan frame identity, calmer state accents, angular corner brackets that frame
+// without enclosing (reads as an active scan), low-alpha glows.
+const CYAN = HUD.cyan
+const SKY = HUD.sky
+const MUTED = HUD.muted
+const VALUE = HUD.value
+
+export default function OverlayApp(): JSX.Element {
+  // Another window: the display zone reaches it through `storage` (spec 038).
+  useDisplayZone()
+  const [status, setStatus] = useState<IPStatus | null>(null)
+  const [expanded, setExpanded] = useState(false)
+  // null until the main process has answered, and again if it cannot: the HUD
+  // must not say "recording" before it knows.
+  const [recording, setRecording] = useState<boolean | null>(null)
+  const [interactive, setInteractive] = useState(false)
+  const [showMark, setShowMark] = useState(true)
+  const [flashExposed, setFlashExposed] = useState(true)
+  const [scale, setScale] = useState(1.0)
+  const [emphasizeIp, setEmphasizeIp] = useState(false)
+  // Pin: when true, the expanded HUD never auto-collapses. Session-local (not
+  // persisted). Toggle via a pin button in the compact bar. Audit finding #52.
+  const [pinned, setPinned] = useState(false)
+  // Pass-through visual state — dims non-critical HUD chrome while keeping the
+  // external IP fully readable (user asked for exactly that: "外部IP可以保持
+  // 透明度嗎"). Applied via CSS opacity on the root, IP nodes opt back to 1
+  // via `data-critical` — window opacity stays at 1 so the ip's colour isn't
+  // washed out by the compositor.
+  const [passThrough, setPassThrough] = useState(false)
+  const [passThroughOpacity, setPassThroughOpacity] = useState(0.4)
+  const pivotRead = usePivotRead()
+  useTick()   // keeps "last seen" current
+  const pivots = pivotRead.pivots
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Inline confirmation for the instant mark. Without it the button gives no
+  // sign anything happened — there is no dialog and no window change, which is
+  // the entire point of it.
+  const [justMarked, setJustMarked] = useState(false)
+  const [markFailed, setMarkFailed] = useState<false | 'failed' | 'project-changed'>(false)
+  // The "Add marker" form lives inside the HUD. `markAt` is taken at the click
+  // that opened it, so the marker is timed at that moment, not at save.
+  const [markOpen, setMarkOpen] = useState(false)
+  const [markMore, setMarkMore] = useState(false)
+  const [markTitle, setMarkTitle] = useState('')
+  const [markNotes, setMarkNotes] = useState('')
+  const markAtRef = useRef(0)
+  const markBindRef = useRef<Promise<string | null>>(Promise.resolve(null))
+  const markedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const contentRef = useRef<HTMLDivElement | null>(null)
+  const { t } = useI18n()
+
+  // Report the exact content height so the window fits it — no clipping, no
+  // empty gap. Runs after every layout-affecting change.
+  useLayoutEffect(() => {
+    const el = contentRef.current
+    if (!el) return
+    const h = el.offsetHeight
+    // Width tracks the clamped scale (the panel renders at the clamped scale,
+    // not the raw config value) and stays inside the same band main enforces —
+    // see hudWindowWidth. Height is measured; hudWindowHeight adds the chrome.
+    if (h) window.redlog.overlay.autosize!(hudWindowHeight(h), hudWindowWidth(scale, emphasizeIp))
+  })
+
+  useEffect(() => {
+    const cfg = window.redlog.config as {
+      get?: () => Promise<unknown>
+      onShowMark?: (cb: (show: boolean) => void) => () => void
+      onFlashExposed?: (cb: (on: boolean) => void) => () => void
+      onScale?: (cb: (s: number) => void) => () => void
+      onEmphasizeIp?: (cb: (on: boolean) => void) => () => void
+      onPassThrough?: (cb: (on: boolean, opacity: number) => void) => () => void
+    } | undefined
+    cfg?.get?.().then((c) => {
+      const ov = (c as { overlay?: { showMarkButton?: boolean; flashOnExposed?: boolean; scale?: number; emphasizeExternalIp?: boolean; passThrough?: boolean; passThroughOpacity?: number } } | null)?.overlay
+      setShowMark(ov?.showMarkButton !== false)
+      setFlashExposed(ov?.flashOnExposed !== false)
+      if (typeof ov?.scale === 'number' && ov.scale > 0) setScale(ov.scale)
+      setEmphasizeIp(ov?.emphasizeExternalIp === true)
+      setPassThrough(ov?.passThrough === true)
+      if (typeof ov?.passThroughOpacity === 'number' && ov.passThroughOpacity > 0) setPassThroughOpacity(ov.passThroughOpacity)
+    }).catch(() => {})
+    // live-update when the settings are toggled in Settings
+    const off1 = cfg?.onShowMark?.(setShowMark)
+    const off2 = cfg?.onFlashExposed?.(setFlashExposed)
+    const off3 = cfg?.onScale?.(setScale)
+    const off4 = cfg?.onEmphasizeIp?.(setEmphasizeIp)
+    const off5 = cfg?.onPassThrough?.((on, op) => { setPassThrough(on); if (op > 0) setPassThroughOpacity(op) })
+    return () => { off1?.(); off2?.(); off3?.(); off4?.(); off5?.() }
+  }, [])
+
+  useEffect(() => {
+    const overlay = window.redlog.overlay as { onInteractive?: (cb: (v: boolean) => void) => () => void }
+    if (overlay.onInteractive) return overlay.onInteractive(setInteractive)
+  }, [])
+
+  useEffect(() => {
+    window.redlog.ip.getStatus().then(setStatus)
+    return window.redlog.ip.onStatus(setStatus)
+  }, [])
+
+  useEffect(() => {
+    window.redlog.recording.get().then(setRecording).catch(() => setRecording(null))
+    return window.redlog.recording.onChange(setRecording)
+  }, [])
+
+
+  // §8: an exposed external IP forces the HUD open and holds it — the topology
+  // and last-check must be on screen for the one condition allowed to override
+  // the operator's own preferences. The auto-collapse guard below keeps it open.
+  useEffect(() => {
+    if (status?.ipSafety === 'exposed' && !expanded) {
+      setExpanded(true)
+    }
+  }, [status?.ipSafety])
+
+  // §8: a 3-second hint the instant pass-through turns on, so the operator who
+  // just ghosted the HUD sees the click-free way back out (⌘⇧P / menu bar)
+  // before the chrome they would otherwise click is gone.
+  const [ptHint, setPtHint] = useState(false)
+  const ptHintTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const ptWas = useRef(passThrough)
+  useEffect(() => {
+    if (passThrough && !ptWas.current) {
+      setPtHint(true)
+      if (ptHintTimer.current) clearTimeout(ptHintTimer.current)
+      ptHintTimer.current = setTimeout(() => setPtHint(false), 3000)
+    }
+    ptWas.current = passThrough
+  }, [passThrough])
+
+  // Auto-collapse the expanded HUD after 8s of inactivity — but reset the
+  // timer while the pointer is on the overlay so a reviewer reading the
+  // topology chain / Reveal button doesn't get it yanked out from under
+  // them (audit finding P1 #15). `interactive` flips true when the mouse
+  // enters the overlay window (main-process tracker). An exposed IP holds it
+  // open (§8) — never auto-collapse while the address is out.
+  useEffect(() => {
+    if (!expanded || interactive || pinned || markOpen || status?.ipSafety === 'exposed') return
+    timerRef.current = setTimeout(() => collapse(), 8000)
+    return () => { if (timerRef.current) clearTimeout(timerRef.current) }
+  }, [expanded, interactive, pinned, markOpen, status?.ipSafety])
+
+  // The window height follows the content through overlay:autosize, so expanding
+  // is renderer state only.
+  const collapse = (): void => setExpanded(false)
+  // §8: while the address is exposed the details stay on screen, so the
+  // collapse control does nothing then (and says why).
+  const exposedNow = status?.ipSafety === 'exposed'
+  const toggleExpand = (): void => { if (expanded && exposedNow) return; setExpanded(!expanded) }
+
+  // fs = font-size scaler; ip = extra emphasis for the external IP.
+  // Clamp scale to a sane band so a rogue config can't blow the HUD up beyond
+  // useful. `autosize` picks up the new content height on every render so the
+  // window still fits without clipping.
+  const openMarkForm = (): void => {
+    markAtRef.current = Date.now()
+    markBindRef.current = (window.redlog.overlay.beginMarker?.() ?? Promise.resolve(null)).catch(() => null)
+    setMarkTitle(''); setMarkNotes(''); setMarkMore(false); setMarkFailed(false)
+    setMarkOpen(true)
+  }
+  const closeMarkForm = (): void => {
+    setMarkOpen(false)
+    window.redlog.overlay.releaseFocus?.()
+  }
+  // A save in flight. The ref answers a second Enter in the same tick; the state
+  // disables the button for the eye.
+  const markSavingRef = useRef(false)
+  const [markSaving, setMarkSaving] = useState(false)
+  const saveMark = async (): Promise<void> => {
+    if (markSavingRef.current) return
+    markSavingRef.current = true
+    setMarkSaving(true)
+    try {
+      await saveMarkOnce()
+    } finally {
+      markSavingRef.current = false
+      setMarkSaving(false)
+    }
+  }
+  const saveMarkOnce = async (): Promise<void> => {
+    // A failed save keeps the form open with what was typed, and says so: it
+    // must not look like a recorded marker.
+    // The draft belongs to the project that was open when it was started.
+    const bind = await markBindRef.current
+    const r = await window.redlog.overlay.addMarker!({ title: markTitle, notes: markNotes, at: markAtRef.current, ...(bind ? { bind } : {}) }).catch(() => null)
+    if (!r?.ok) { setMarkFailed(r?.reason === 'project-changed' ? 'project-changed' : 'failed'); return }
+    setMarkFailed(false)
+    setMarkOpen(false)
+    setJustMarked(true)
+    window.redlog.overlay.releaseFocus?.()
+    if (markedTimerRef.current) clearTimeout(markedTimerRef.current)
+    markedTimerRef.current = setTimeout(() => setJustMarked(false), 1400)
+  }
+
+  const s = Math.max(0.75, Math.min(1.75, scale))
+  // 11px is the HUD's text floor (UIUX-STANDARD §2 — the HUD is the one
+  // exception to the app's 13px floor, because it has its own scale setting
+  // and sits at arm's length). The ladder used to run down to 8px, which is
+  // below the size at which a label is legible at any distance. Sizes under
+  // the floor collapse onto it; the hierarchy they used to carry is carried by
+  // weight and colour instead, which is how §2 says it should have worked.
+  const HUD_MIN_PX = 11
+  const fs = (n: number): number => Math.round(Math.max(n, HUD_MIN_PX) * s * 10) / 10
+  const fsIp = (n: number): number => Math.round(n * s * (emphasizeIp ? 1.4 : 1) * 10) / 10
+  // px() scales layout dimensions (padding, gap, separator sizes) with the
+  // same factor. Without this the middle gap stays fixed while text shrinks —
+  // small scale looks loose, large scale looks cramped.
+  const px = (n: number): number => Math.round(n * s)
+  const BTN_CLIP = 'polygon(6px 0,100% 0,100% calc(100% - 6px),calc(100% - 6px) 100%,0 100%,0 6px)'
+  // The action row was two buttons on `flex: 1` beside two on their own
+  // padding, at a different font size — so the pair of toggles came out a
+  // width nobody chose and a height that did not match the verbs beside them.
+  // One height for all four; the verbs share what is left; the toggles are
+  // square, which is what a toggle looks like.
+  const rowH = px(26)
+  const hudVerb: React.CSSProperties = {
+    flex: 1, height: rowH, padding: 0, fontSize: fs(10), fontWeight: 700,
+    letterSpacing: '0.12em', clipPath: BTN_CLIP, cursor: 'pointer',
+    fontFamily: 'inherit', transition: 'background 0.12s, color 0.12s'
+  }
+  const hudToggle: React.CSSProperties = {
+    width: rowH, height: rowH, flex: 'none', padding: 0, fontSize: fs(11),
+    fontWeight: 700, clipPath: BTN_CLIP, cursor: 'pointer',
+    fontFamily: 'inherit', transition: 'background 0.12s, color 0.12s'
+  }
+  const hair = <span style={{ width: 1, height: px(13), background: 'rgba(34,211,238,0.25)', flexShrink: 0 }} />
+
+  const safety = status?.ipSafety ?? 'unknown'
+  const link = status?.link
+  const linkText = link?.type === 'wifi' ? (link.name || 'Wi-Fi')
+    : link?.type === 'wired' ? t('overlay.wired') : ''
+  const STATE = { safe: HUD.green, exposed: HUD.red, unknown: HUD.amber }[safety]
+  const LABEL = { safe: t('overlay.safeIp'), exposed: t('overlay.exposedIp'), unknown: t('overlay.ipUnknown') }[safety]
+  const STATUS_TXT = { safe: t('overlay.safeIpStatus'), exposed: t('overlay.exposedIpStatus'), unknown: t('overlay.unknownIp') }[safety]
+  // exposure turns the whole frame into a red-alert scan; otherwise cyan HUD.
+  const FRAME = safety === 'exposed' ? HUD.red : CYAN
+  // when EXPOSED, flash the whole frame as an unmissable alarm (opt-out in Settings).
+  const alarm = safety === 'exposed' && flashExposed
+  const noDrag = { WebkitAppRegion: 'no-drag' } as React.CSSProperties
+  const isMac = navigator.platform?.includes('Mac')
+  const ptChord = isMac ? '⌘⇧P' : 'Ctrl+Shift+P'
+  // RedLog lives in the menu bar on macOS and in the tray elsewhere.
+  const placeKey = (key: string): string => isMac ? key : `${key}Tray`
+
+  const bracket = (pos: React.CSSProperties): JSX.Element => (
+    <span style={{ position: 'absolute', width: 9, height: 9, borderColor: FRAME, boxShadow: `0 0 4px ${FRAME}55`, pointerEvents: 'none', ...noDrag, ...pos }} />
+  )
+  const iconBtn: React.CSSProperties = {
+    color: CYAN, fontSize: fs(10), cursor: 'pointer', width: 18, height: 16,
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+    padding: 0, fontFamily: 'inherit', appearance: 'none', outline: 'none',
+    background: interactive ? 'rgba(34,211,238,0.10)' : 'transparent',
+    border: `1px solid ${interactive ? 'rgba(34,211,238,0.35)' : 'transparent'}`,
+    transition: 'background 0.12s, border-color 0.12s'
+  }
+  // The newest by time, not by position: nothing promises the list is ordered.
+  const latestPivot = pivots.reduce<(typeof pivots)[number] | undefined>((a, p) => (!a || p.ts > a.ts ? p : a), undefined)
+  const tick = (c: string): React.CSSProperties => ({ width: 6, height: 6, borderRadius: '50%', background: c, boxShadow: `0 0 7px ${c}, 0 0 3px ${c}`, flexShrink: 0 })
+
+  // Pass-through dimming — applied to individual "chrome" children instead
+  // of the outer wrapper. CSS opacity on a parent forces every descendant
+  // to composite at the reduced alpha, so children can never opt back to
+  // opacity 1. Instead we sprinkle `...dimStyle` on non-critical rows and
+  // leave the external IP row untouched, so the whole point of the HUD
+  // (the IP) stays fully readable regardless of pass-through state.
+  const dimStyle: React.CSSProperties = passThrough ? { opacity: passThroughOpacity } : {}
+  return (
+    <div
+      onMouseEnter={() => window.redlog.overlay.mouseEnter!()}
+      onMouseLeave={() => window.redlog.overlay.mouseLeave!()}
+      style={{ width: '100%', height: '100%', padding: 3, WebkitAppRegion: 'drag', cursor: interactive ? 'grab' : 'default' } as React.CSSProperties}
+    >
+      {/* frame (neon edge) */}
+      <div style={{ position: 'relative', height: '100%', borderRadius: 5, background: FRAME, opacity: interactive ? 1 : 0.94, transition: 'background 0.2s, opacity 0.15s', boxShadow: `0 0 16px ${FRAME}44`, animation: alarm ? 'alarm 0.9s ease-in-out infinite' : undefined }}>
+        {/* panel (inset fill) */}
+        <div
+          style={{
+            position: 'absolute', inset: 1, borderRadius: 4,
+            background: 'rgba(7,12,17,0.65)',
+            backdropFilter: 'blur(16px) saturate(1.5)',
+            overflow: 'hidden',
+            // Vertically centre the measured content: the window autosizes to
+            // content + fixed chrome, and with the content anchored to the top
+            // that chrome all fell below it (the HUD read "偏上"). Centring
+            // splits it evenly. In the expanded state the content fills the
+            // panel, so this is a no-op there.
+            display: 'flex', flexDirection: 'column', justifyContent: 'center',
+            fontFamily: '"JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace'
+          }}
+        >
+          {/* scanlines */}
+          <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none', background: 'repeating-linear-gradient(0deg, rgba(34,211,238,0.035) 0px, rgba(34,211,238,0.035) 1px, transparent 1px, transparent 3px)', opacity: 0.6 }} />
+
+          {/* measured content — window auto-sizes to this */}
+          <div ref={contentRef}>
+          {/* compact bar — two columns: external IP (left) with any active pivot
+              stacked beneath it, and internal IP (right) with the Wi-Fi/wired name
+              beneath it. Keeping the pivot in the external column stops it crowding
+              the internal IP. */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: px(8), padding: `${px(4)}px ${px(54)}px ${px(4)}px ${px(12)}px`, minHeight: px(40), fontSize: fs(12), position: 'relative', zIndex: 2, overflow: 'hidden' }}>
+            <span style={{ display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0, ...dimStyle }}>
+              <span style={{ ...tick(recording ? HUD.red : '#3a4a52'), animation: recording ? 'blinkRec 1.1s step-end infinite' : undefined }} />
+              <span data-testid="hud-rec" style={{ fontSize: fs(9), fontWeight: 700, letterSpacing: '0.14em', color: recording ? '#e39aa0' : '#4a5a62', textShadow: recording ? `0 0 7px ${hexA(HUD.red, 0.4)}` : 'none' }}>{recording === null ? t('overlay.recUnknown') : recording ? t('overlay.rec') : t('overlay.paused')}</span>
+            </span>
+            <span style={dimStyle}>{hair}</span>
+            <span style={{ ...tick(STATE), animation: safety === 'exposed' ? 'pulse 1.4s infinite' : undefined, ...dimStyle }} />
+            <span style={{ color: STATE, fontWeight: 700, fontSize: fs(10.5), letterSpacing: '0.09em', textShadow: `0 0 8px ${STATE}55`, flexShrink: 0, ...dimStyle }}>{status ? LABEL : '···'}</span>
+            {/* external IP + pivot (left column) */}
+            <span style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 1, flexShrink: 1, minWidth: 0, lineHeight: 1.15, overflow: 'hidden' }}>
+              <span style={{ display: 'flex', alignItems: 'baseline', gap: 4, maxWidth: '100%' }}>
+                <span style={{ color: MUTED, fontSize: fs(8.5), letterSpacing: '0.1em', flexShrink: 0 }}>{t('overlay.ext')}</span>
+                <span style={{ color: VALUE, fontWeight: 600, whiteSpace: 'nowrap', fontSize: fsIp(12), overflow: 'hidden', textOverflow: 'ellipsis' }}>{status?.externalIP ?? '—'}</span>
+              </span>
+              {latestPivot && (
+                <span
+                  data-testid="hud-pivot-latest"
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '1px 6px', clipPath: 'polygon(4px 0,100% 0,100% calc(100% - 4px),calc(100% - 4px) 100%,0 100%,0 4px)', background: hexA(CYAN, 0.2), border: `1px solid ${hexA(CYAN, 0.6)}`, boxShadow: `0 0 5px ${hexA(CYAN, 0.2)}`, maxWidth: 160 }}
+                  title={pivots.map((p) => `${p.tool} ${p.via}${p.route ? ` (${p.route})` : ''}`).join('\n')}
+                >
+                  <span style={{ color: CYAN, fontSize: fs(9), textShadow: `0 0 6px ${CYAN}` }}>⇄</span>
+                  <span style={{ color: '#bff2ff', fontSize: fs(9.5), fontWeight: 600, maxWidth: 100, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{latestPivot.via}</span>
+                  {pivots.length > 1 && <span style={{ color: CYAN, fontSize: fs(8.5), fontWeight: 700 }}>+{pivots.length - 1}</span>}
+                </span>
+              )}
+            </span>
+            {/* internal IP + network name (right column) */}
+            <span style={{ marginLeft: 'auto', display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 1, minWidth: 0, lineHeight: 1.15, flexShrink: 1, overflow: 'hidden', ...dimStyle }}>
+              <span style={{ display: 'flex', alignItems: 'baseline', gap: 4, maxWidth: '100%' }}>
+                <span style={{ color: MUTED, fontSize: fs(8.5), letterSpacing: '0.1em', flexShrink: 0 }}>{t('overlay.int')}</span>
+                <span style={{ color: '#9fd8e6', fontWeight: 500, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{status?.internalIP ?? '—'}</span>
+              </span>
+              {linkText && (
+                <span style={{ display: 'flex', alignItems: 'baseline', gap: 4, maxWidth: '100%', minWidth: 0 }}>
+                  <span style={{ color: MUTED, fontSize: fs(8), letterSpacing: '0.1em', flexShrink: 0 }}>{link?.type === 'wifi' ? '⌁' : t('overlay.net')}</span>
+                  <span style={{ color: '#7fb8c6', fontWeight: 500, fontSize: fs(10), overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{linkText}</span>
+                </span>
+              )}
+            </span>
+          </div>
+
+          {/* expanded */}
+          {expanded && (
+            <div style={{ padding: '0 14px 11px', fontSize: fs(11), position: 'relative', zIndex: 2, ...dimStyle }}>
+              <div style={{ height: 1, background: `linear-gradient(90deg, ${FRAME}55, transparent)`, margin: '0 0 8px' }} />
+              {/* v0.11.1: the label column scales with the text. It was a hard
+                  70px while the labels render at fs(11), so "Last check" sat
+                  right on the boundary at scale 1 and wrapped to two lines —
+                  and at scale 1.25/1.5 every label wrapped. `px()` ties the
+                  column to the same factor as the type, which is what the
+                  rest of the panel already does. */}
+              <div style={{ display: 'grid', gridTemplateColumns: `${px(78)}px 1fr`, rowGap: px(5), alignItems: 'baseline' }}>
+                <span style={{ color: MUTED, letterSpacing: '0.06em' }}>{t('overlay.status')}</span>
+                <span style={{ color: STATE, fontWeight: 600, textShadow: `0 0 8px ${STATE}55` }}>{STATUS_TXT}</span>
+                <span style={{ color: MUTED, letterSpacing: '0.06em' }}>{t('overlay.external')}</span>
+                <span style={{ color: VALUE, fontSize: fsIp(11) }}>{status?.externalIP ?? '—'}</span>
+                <span style={{ color: MUTED, letterSpacing: '0.06em' }}>{t('overlay.internal')}</span>
+                <span style={{ color: VALUE }}>{status?.internalIP ?? '—'}</span>
+                <span style={{ color: MUTED, letterSpacing: '0.06em' }}>{t('overlay.network')}</span>
+                <span style={{ color: VALUE }}>{link?.type === 'wifi' ? `⌁ ${linkText}` : linkText || '—'}</span>
+                <span style={{ color: MUTED, letterSpacing: '0.06em' }}>{t('overlay.lastCheck')}</span>
+                <span style={{ color: '#9fd8e6' }}>{status?.lastCheck ? formatTime(status.lastCheck, { seconds: true }) : '—'}</span>
+              </div>
+
+              {safety === 'unknown' && (
+                <p style={{ color: '#ffcc44', fontSize: fs(9), marginTop: 6, letterSpacing: '0.02em', opacity: 0.85 }}>ⓘ {t('overlay.unknownHint', { page: t('settings.pageNetwork') })}</p>
+              )}
+
+              {/* Relay nodes seen in commands, listed — not drawn as a route. A
+                  detected node does not say which node forwards to which, nor
+                  that its channel is up, so no arrows and no health. A failed
+                  read says so instead of looking like "none". */}
+              {pivotRead.status === 'error' && (
+                <p data-testid="hud-pivot-error" style={{ color: '#ffcc44', fontSize: fs(9), marginTop: 8 }}>⚠ {pivots.length ? t('pivot.readFailedStale', { count: pivots.length }) : t('pivot.readFailed')}</p>
+              )}
+              {pivots.length > 0 && (
+                <div data-testid="hud-pivot-nodes">
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, margin: '9px 0 6px' }}>
+                    <span style={{ color: CYAN, fontSize: fs(10), textShadow: `0 0 6px ${CYAN}` }}>⇄</span>
+                    <span style={{ color: '#7fe6f7', fontSize: fs(8.5), fontWeight: 700, letterSpacing: '0.14em' }}>{t('pivot.detected', { count: pivots.length }).toUpperCase()}</span>
+                    <span style={{ flex: 1, height: 1, background: `linear-gradient(90deg, ${CYAN}44, transparent)` }} />
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    {pivots.map((p) => (
+                      <div key={p.via + p.tool + p.ts} style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'baseline', gap: '2px 8px', padding: '3px 8px', background: hexA(CYAN, 0.14), border: `1px solid ${hexA(CYAN, 0.45)}`, fontSize: fs(10) }}>
+                        <span style={{ color: MUTED, letterSpacing: '0.06em' }}>{p.tool}</span>
+                        <span style={{ color: '#d6f7fd', fontWeight: 600, overflowWrap: 'anywhere' }}>{p.via}</span>
+                        {p.route && <span style={{ color: '#9fd8e6', overflowWrap: 'anywhere' }}>{t('pivot.route', { route: p.route })}</span>}
+                        <span style={{ marginLeft: 'auto', color: MUTED }}>{t('pivot.lastSeen', { when: formatFreshness(p.ts, t) })}</span>
+                      </div>
+                    ))}
+                  </div>
+                  <p style={{ color: MUTED, fontSize: fs(8.5), marginTop: 4 }}>{t('pivot.unverified')}</p>
+                </div>
+              )}
+
+              {status?.error && <p style={{ color: '#e39aa0', marginTop: 6, fontSize: fs(10) }}>{status.error}</p>}
+
+              {/* One way to add a marker. The click opens a small form here in
+                  the HUD: the time is the click's, the title is optional, Enter
+                  or "Save marker" finishes, Esc cancels, and "More" adds notes.
+                  The global shortcut still opens the full dialog. Below it, the
+                  HUD's own controls (keep expanded, click-through) are a second
+                  row because they are a different kind of control. */}
+              {showMark && !markOpen && (
+                <div style={{ ...noDrag, display: 'flex', gap: 6, marginTop: 10 }}>
+                  <button
+                    type="button"
+                    className="hudBtn"
+                    data-testid="hud-add-marker"
+                    onClick={openMarkForm}
+                    style={{
+                      ...hudVerb,
+                      color: justMarked ? HUD.green : CYAN,
+                      background: justMarked ? hexA(HUD.green, 0.18) : hexA(CYAN, 0.09),
+                      border: `1px solid ${justMarked ? HUD.green : CYAN}55`,
+                      textShadow: `0 0 7px ${justMarked ? HUD.green : CYAN}55`
+                    }}
+                    title={`${t('overlay.addMarkerHint')} · ${navigator.platform?.includes('Mac') ? '⌘⇧M' : 'Ctrl+Shift+M'}`}
+                  >
+                    {justMarked ? `✓ ${t('overlay.marked')}` : t('overlay.addMarker')}
+                  </button>
+                </div>
+              )}
+              {showMark && markOpen && (
+                <form
+                  data-testid="hud-marker-form"
+                  style={{ ...noDrag, display: 'flex', flexDirection: 'column', gap: 6, marginTop: 10 }}
+                  onSubmit={(e) => { e.preventDefault(); void saveMark() }}
+                  onKeyDown={(e) => { if (e.key === 'Escape') { e.preventDefault(); closeMarkForm() } }}
+                >
+                  <input
+                    data-testid="hud-marker-title"
+                    autoFocus
+                    value={markTitle}
+                    onChange={(e) => setMarkTitle(e.target.value)}
+                    placeholder={t('overlay.markTitlePlaceholder')}
+                    aria-label={t('overlay.markTitlePlaceholder')}
+                    style={{ height: rowH, padding: '0 8px', fontSize: fs(11), color: '#eaf7fb', background: 'rgba(255,255,255,0.07)', border: `1px solid ${CYAN}55`, outline: 'none', fontFamily: 'inherit' }}
+                  />
+                  {markMore && (
+                    <textarea
+                      data-testid="hud-marker-notes"
+                      value={markNotes}
+                      onChange={(e) => setMarkNotes(e.target.value)}
+                      placeholder={t('overlay.markNotesPlaceholder')}
+                      aria-label={t('overlay.markNotesPlaceholder')}
+                      rows={3}
+                      style={{ padding: '4px 8px', fontSize: fs(11), color: '#eaf7fb', background: 'rgba(255,255,255,0.07)', border: `1px solid ${CYAN}55`, outline: 'none', resize: 'none', fontFamily: 'inherit' }}
+                    />
+                  )}
+                  {markFailed && (
+                    <p role="alert" data-testid="hud-marker-failed" style={{ margin: 0, fontSize: fs(10), color: HUD.red }}>{`✕ ${markFailed === 'project-changed' ? t('overlay.markProjectChanged') : t('overlay.markFailed')}`}</p>
+                  )}
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <button type="submit" className="hudBtn" data-testid="hud-marker-save" disabled={markSaving} style={{ ...hudVerb, color: CYAN, background: hexA(CYAN, 0.09), border: `1px solid ${CYAN}55` }}>
+                      {t('overlay.markSave')}
+                    </button>
+                    {!markMore && (
+                      <button type="button" className="hudBtn" data-testid="hud-marker-more" onClick={() => setMarkMore(true)} style={{ ...hudVerb, flex: 'none', padding: `0 ${px(8)}px`, letterSpacing: '0.06em', color: MUTED, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(150,170,180,0.35)' }}>
+                        {t('overlay.markMore')}
+                      </button>
+                    )}
+                    <button type="button" className="hudBtn" data-testid="hud-marker-cancel" onClick={closeMarkForm} style={{ ...hudVerb, flex: 'none', padding: `0 ${px(8)}px`, letterSpacing: '0.06em', color: MUTED, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(150,170,180,0.35)' }}>
+                      {t('common.cancel')}
+                    </button>
+                  </div>
+                </form>
+              )}
+              <div style={{ ...noDrag, display: 'flex', alignItems: 'center', gap: 6, marginTop: 6 }}>
+                {/* Keep expanded: controls the 8s auto-collapse. A checkbox
+                    glyph carries the state in words, not a square to decode. */}
+                <button
+                  type="button"
+                  className="hudBtn"
+                  data-testid="hud-keep-open"
+                  onClick={() => setPinned((p) => !p)}
+                  style={{ ...hudVerb, flex: 'none', padding: `0 ${px(8)}px`, letterSpacing: '0.06em', color: pinned ? HUD.green : MUTED, background: pinned ? hexA(HUD.green, 0.14) : 'rgba(255,255,255,0.05)', border: `1px solid ${pinned ? hexA(HUD.green, 0.55) : 'rgba(150,170,180,0.35)'}` }}
+                  title={pinned ? t('overlay.keepOpenOnHint') : t('overlay.keepOpenOffHint')}
+                  aria-pressed={pinned}
+                >
+                  {pinned ? '☑' : '☐'} {t('overlay.keepOpen')}
+                </button>
+                <span style={{ flex: 1 }} />
+                {/* Pass-through (§8): the way IN to ghost mode. Once on, the HUD
+                    is click-through so this button cannot turn it off; the way
+                    back is the shortcut or the menu bar (both wired in main),
+                    so the button's own tooltip and the line below name it
+                    BEFORE it is pressed. */}
+                <button
+                  type="button"
+                  className="hudBtn"
+                  data-testid="hud-pass-through"
+                  onClick={() => window.redlog.overlay.setPassThrough!(true)}
+                  style={{ ...hudVerb, flex: 'none', padding: `0 ${px(8)}px`, letterSpacing: '0.06em', color: MUTED, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(150,170,180,0.35)' }}
+                  title={`${t('overlay.passThrough')} — ${t(placeKey('overlay.passThroughHint'), { chord: ptChord })}`}
+                >
+                  {t('overlay.passThrough')}
+                </button>
+              </div>
+              <p data-testid="hud-pass-through-hint" style={{ ...noDrag, margin: '4px 0 0', fontSize: fs(10), color: MUTED }}>
+                {t(placeKey('overlay.passThroughHint'), { chord: ptChord })}
+              </p>
+            </div>
+          )}
+          </div>
+
+          {/* buttons (top-right): expand + hide only. The pin toggle used to
+              live here too, but the operator asked to move it into the
+              expanded pane's bottom row — it's a low-frequency action and
+              a fixed-position icon in the corner competed with the more
+              important expand button for glances.
+
+              Rendered LAST inside the panel, and it has to stay last. Chromium
+              inherits `-webkit-app-region`, so every descendant of the dragging
+              root declares `drag` too, and Electron replays those rects in tree
+              order — union for drag, difference for no-drag. A `drag` rect that
+              comes after this cluster and overlaps it hands the area back to the
+              window, and the compact bar (full width, the button row's own row)
+              did exactly that: WM_NCHITTEST over ✕ answered HTCAPTION, so every
+              click started a window drag and the HUD could only be moved.
+              Playwright cannot see this — CDP clicks are delivered straight to
+              the renderer, below the hit test — so the guard is the region-order
+              test in renderer-smoke. */}
+          <div style={{ position: 'absolute', top: 5, right: 7, zIndex: 10, display: 'flex', alignItems: 'center', gap: 3, ...noDrag, ...dimStyle }}>
+            {/* Real <button>s, not onClick divs: keyboard-reachable and
+                announced as controls, matching the mark/pin buttons below
+                (§21 — icon-only controls must be focusable; the focus ring is
+                the .hudBtn rule in the <style> block). */}
+            <button data-testid="hud-expand" type="button" aria-disabled={expanded && exposedNow ? true : undefined} className="hudBtn" onClick={toggleExpand} style={iconBtn} title={expanded ? (exposedNow ? t('overlay.collapseBlocked') : t('overlay.collapse')) : t('overlay.expand')} aria-label={expanded ? t('overlay.collapse') : t('overlay.expand')}>{expanded ? '▲' : '▼'}</button>
+            <button data-testid="hud-hide" type="button" className="hudBtn" onClick={() => window.redlog.overlay.hide()} style={iconBtn} title={t(placeKey('overlay.hide'))} aria-label={t(placeKey('overlay.hide'))}>✕</button>
+          </div>
+        </div>
+
+        {/* §8 pass-through hint — opaque and outside the dimmed chrome so it
+            stays readable exactly when everything else has just gone ghost.
+            Auto-hides after 3s (ptHint effect). */}
+        {ptHint && (
+          <div style={{ position: 'absolute', left: 0, right: 0, bottom: 6, display: 'flex', justifyContent: 'center', pointerEvents: 'none', zIndex: 30, ...noDrag }}>
+            <span style={{ padding: '3px 10px', fontSize: fs(9.5), fontWeight: 600, letterSpacing: '0.04em', color: '#d6f7fd', background: 'rgba(7,12,17,0.92)', border: `1px solid ${hexA(CYAN, 0.6)}`, clipPath: BTN_CLIP, boxShadow: `0 0 8px ${hexA(CYAN, 0.3)}` }}>
+              {t(placeKey('overlay.passThroughActive'), { chord: ptChord })}
+            </span>
+          </div>
+        )}
+
+        {/* L-brackets on all four (now square) corners — no chamfered triangles. */}
+        {bracket({ top: 4, left: 4, borderTop: `1.5px solid ${FRAME}`, borderLeft: `1.5px solid ${FRAME}` })}
+        {bracket({ top: 4, right: 4, borderTop: `1.5px solid ${FRAME}`, borderRight: `1.5px solid ${FRAME}` })}
+        {bracket({ bottom: 4, left: 4, borderBottom: `1.5px solid ${FRAME}`, borderLeft: `1.5px solid ${FRAME}` })}
+        {bracket({ bottom: 4, right: 4, borderBottom: `1.5px solid ${FRAME}`, borderRight: `1.5px solid ${FRAME}` })}
+
+        <style>{`
+          /* §21: every HUD control shows a focus ring. The buttons carry their
+             own backgrounds, so the ring is a cyan glow, not the OS outline. */
+          .hudBtn:focus-visible { box-shadow: 0 0 0 2px ${hexA(CYAN, 0.65)}; border-radius: 2px; }
+          @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+          @keyframes blinkRec { 0%,100% { opacity: 1; } 50% { opacity: 0.15; } }
+          @keyframes alarm {
+            0%,100% { box-shadow: 0 0 16px ${HUD.red}44; filter: brightness(1); }
+            50% { box-shadow: 0 0 26px ${HUD.red}dd, 0 0 44px ${HUD.red}88; filter: brightness(1.5); }
+          }
+        `}</style>
+      </div>
+    </div>
+  )
+}

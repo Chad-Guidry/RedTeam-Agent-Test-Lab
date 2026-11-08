@@ -1,0 +1,502 @@
+import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, useId } from 'react'
+import { useI18n } from '../i18n'
+import { confirm } from './ConfirmDialog'
+import { DEFAULT_CDP_PORT } from '../lib/defaults'
+import { useListKeyboard } from '../lib/useListKeyboard'
+import { useInfiniteScroll } from '../lib/useInfiniteScroll'
+import { ListFooter } from './ListFooter'
+import { formatDateTime } from '../lib/time'
+import { EmptyState } from './EmptyState'
+import { LoadingSpinner } from './Feedback'
+import { Flag, ChevronLeft, ChevronRight } from 'lucide-react'
+import { Button } from './Button'
+import { toast } from './Toast'
+import { BOOKMARKS_CHANGED } from './EvidenceHeader'
+
+// A hash of the mark's title used to pick one of eight hues. It grouped
+// nothing an operator could rely on -- two unrelated marks share a colour as
+// readily as two related ones -- while spending the palette that has to be
+// available when something is out of scope (§1).
+
+const PINNED_KEY = 'redlog-bookmarks-pinned'
+
+function readPinned(): string[] {
+  try {
+    const current = localStorage.getItem(PINNED_KEY)
+    return current === null ? [] : JSON.parse(current) as string[]
+  } catch { return [] }
+}
+
+export function BookmarksView({ onOpenInTimeline }: { onOpenInTimeline?: (ts: number) => void } = {}): JSX.Element {
+  // One column at every width: the list, then one bookmark's detail or editor
+  // in its place, then back. The list's search, scroll and selection survive
+  // the round trip (below).
+  const [detailOpen, setDetailOpen] = useState(false)
+  const listRef = useRef<HTMLDivElement>(null)
+  const listPosition = useRef(0)
+  const selectedRow = useRef<HTMLButtonElement | null>(null)
+  useLayoutEffect(() => {
+    if (!detailOpen && listRef.current) {
+      listRef.current.scrollTop = listPosition.current
+      selectedRow.current?.focus({ preventScroll: true })
+    }
+  }, [detailOpen])
+  const [marks, setMarks] = useState<Bookmark[]>([])
+  const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [selected, setSelected] = useState<Bookmark | null>(null)
+  const [creating, setCreating] = useState(false)
+  const [browserTab, setBrowserTab] = useState<BrowserTabInfo | null>(null)
+  const [search, setSearch] = useState('')
+  // Pinned bookmark ids, in localStorage rather than in the row. The old
+  // comment here said chain-immutable events cannot be reordered — these rows
+  // are neither chained nor events. The real reason is that a pin is one
+  // operator's view of their own list, not a fact about the bookmark: pinned
+  // float to the top and keep their timestamp.
+  const [pinned, setPinned] = useState<Set<string>>(() => new Set(readPinned()))
+  const togglePin = useCallback((id: string) => {
+    setPinned((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id); else next.add(id)
+      localStorage.setItem(PINNED_KEY, JSON.stringify([...next]))
+      return next
+    })
+  }, [])
+  const { t } = useI18n()
+
+  // Memoized so its identity is stable across renders — the infinite-scroll
+  // window resets on list-identity change, and an IIFE rebuilding the array
+  // every render would snap it back to page 1 on every keystroke.
+  const filteredMarks = useMemo(() => {
+    const list = search.trim()
+      ? marks.filter((m) => {
+          const q = search.toLowerCase()
+          return m.title.toLowerCase().includes(q)
+            || (m.url ?? '').toLowerCase().includes(q)
+            || (m.note ?? '').toLowerCase().includes(q)
+        })
+      : marks
+    return [...list].sort((a, b) => {
+      const ap = pinned.has(a.id) ? 1 : 0
+      const bp = pinned.has(b.id) ? 1 : 0
+      if (ap !== bp) return bp - ap
+      return b.createdAt - a.createdAt
+    })
+  }, [marks, search, pinned])
+
+  // §9: page the rows; nav spans the rendered window.
+  const paged = useInfiniteScroll(filteredMarks)
+  const visibleMarks = paged.visible
+
+  // Every list in the app answers to the same keys (§9). Enter opens the
+  // mark's detail panel; ⌘↩ takes it to the Timeline, which is the question
+  // an operator asks of a finding more often than any other.
+  const listNav = useListKeyboard({
+    count: visibleMarks.length,
+    onActivate: (i) => { const m = visibleMarks[i]; if (m) { setSelected(m); setCreating(false); setDetailOpen(true) } },
+    onJumpToTimeline: (i) => { const m = visibleMarks[i]; if (m) onOpenInTimeline?.(m.createdAt) },
+    onEscape: () => setSelected(null)
+  })
+
+  const refresh = useCallback(async () => {
+    setLoading(true)
+    try {
+      setMarks(await window.redlog.bookmarks.list())
+      setLoadError(null)
+      window.dispatchEvent(new Event(BOOKMARKS_CHANGED))
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => { refresh() }, [refresh])
+
+  useEffect(() => {
+    // Poll CDP for the currently-focused tab. 3s while connected is fine, but
+    // if the CDP browser isn't running there's no point polling every 3s —
+    // back off to 10s until it reconnects (audit finding P1 #25).
+    let stopped = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const tick = async (): Promise<void> => {
+      const tab = await window.redlog.cdp.getTab().catch(() => ({ connected: false } as never))
+      if (stopped) return
+      setBrowserTab(tab)
+      timer = setTimeout(tick, tab.connected ? 3000 : 10000)
+    }
+    tick()
+    return () => { stopped = true; if (timer) clearTimeout(timer) }
+  }, [])
+
+  const quickCapture = async (): Promise<void> => {
+    const tab = await window.redlog.cdp.getTab()
+    setBrowserTab(tab)
+    setCreating(true)
+    setDetailOpen(true)
+    setSelected(null)
+  }
+
+  return (
+    <div data-testid="bookmarks-workspace" className="flex h-full min-w-0">
+      {(marks.length > 0 || !creating || !detailOpen) && <div hidden={detailOpen} className="flex-1 min-w-0 flex flex-col">
+        <div className="p-2 border-b border-redlog-border">
+          <div className="flex items-center justify-between mb-2 gap-1">
+            <span className="text-xs font-semibold text-redlog-text-dim uppercase tracking-wider flex-1 truncate">
+              {t('bookmarks.title', { count: marks.length })}
+            </span>
+            <Button size="compact" level="quiet"
+              onClick={quickCapture}
+            >
+              {t('bookmarks.capture')}
+            </Button>
+          </div>
+          {marks.length > 0 && (
+            // Gives way when the window is short (small window at high zoom): a line here
+            // pushed the list under the status bar. The empty state carries the same fact.
+            <p className="mb-2 hidden rounded border border-redlog-border bg-redlog-surface px-3 py-2 text-xs text-redlog-text-dim [@media(min-height:640px)]:block"><span aria-hidden className="mr-1.5">ⓘ</span><span data-testid="bookmarks-scope-note">{t('bookmarks.scopeNote')}</span></p>
+          )}
+          <div className={`flex items-center gap-1.5 px-2 py-1 rounded text-xs ${
+            browserTab?.connected ? 'bg-green-500/10 text-green-400' : 'bg-redlog-elevated text-redlog-text-dim'
+          }`}>
+            <span className={`w-1.5 h-1.5 rounded-full ${browserTab?.connected ? 'bg-green-400' : 'bg-redlog-elevated-hover'}`} />
+            {browserTab?.connected
+              ? <span title={browserTab.url ?? undefined} className="truncate">{browserTab.url || t('bookmarks.connected')}</span>
+              : <span>{t('bookmarks.cdpDisconnected')}</span>
+            }
+          </div>
+        </div>
+        {/* Search filters title / URL / note case-insensitively, live as the
+            user types. It is always there: a list that grows past one screen
+            is found by searching, and the field must not appear mid-session. */}
+        {marks.length > 0 && (
+          <div className="px-2 py-1.5 border-b border-redlog-border">
+            <input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder={t('bookmarks.searchPlaceholder')}
+              className="w-full bg-redlog-surface border border-redlog-border rounded px-2 py-1 text-xs text-redlog-text font-mono focus:outline-none focus:border-red-500/40 placeholder-redlog-muted"
+            />
+          </div>
+        )}
+        {loadError && (
+          <div data-testid="bookmarks-load-error" role="alert" className="min-h-0 overflow-auto p-3 text-xs text-redlog-danger [overflow-wrap:anywhere]">
+            <div>{t('bookmarks.loadFailed')}</div>
+            <div className="mt-1 truncate font-mono text-redlog-text-dim" title={loadError}>{loadError}</div>
+            <Button size="compact" level="quiet" onClick={() => void refresh()} disabled={loading}>{t('common.retry')}</Button>
+          </div>
+        )}
+        {loading && <LoadingSpinner label={t('common.loading')} />}
+        <div ref={listRef} onScroll={() => {
+          if (!detailOpen) listPosition.current = listRef.current?.scrollTop ?? 0
+        }} className="flex-1 min-h-0 overflow-auto" {...listNav.containerProps} aria-label={t('bookmarks.title', { count: paged.total })}>
+          {visibleMarks.map((m, i) => {
+            const isPinned = pinned.has(m.id)
+            const rowProps = listNav.itemProps(i)
+            return (
+              <button
+                key={m.id}
+                {...rowProps}
+                ref={(el) => {
+                  rowProps.ref(el)
+                  if (m.id === selected?.id) selectedRow.current = el
+                }}
+                onClick={() => { rowProps.onClick(); setSelected(m); setCreating(false); setDetailOpen(true) }}
+                className={`w-full text-left px-3 py-2.5 border-b border-redlog-border hover:bg-redlog-elevated/50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-redlog-accent/50 ${
+                  selected?.id === m.id ? 'bg-redlog-elevated' : ''
+                }`}
+              >
+                <div className="flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full shrink-0 bg-redlog-lane" />
+                  <span title={m.title} className="text-xs text-redlog-text truncate flex-1">{m.title}</span>
+                  {/* Pinned marks get a small star indicator; pin/unpin action
+                      lives in the detail panel (low-frequency action, keep
+                      the list clean). */}
+                  {isPinned && <span className="text-xs text-amber-400 shrink-0" aria-hidden="true">★</span>}
+                </div>
+                {m.url && <div title={m.url} className="text-xs text-redlog-cyan/70 truncate mt-0.5 font-mono pl-4">{m.url}</div>}
+                {m.note && <div className="text-xs text-redlog-text-dim truncate mt-0.5 pl-4">{m.note.split('\n')[0]}</div>}
+                <div className="text-xs text-redlog-text-faint mt-0.5 pl-4">
+                  {formatDateTime(m.createdAt)}
+                </div>
+              </button>
+            )
+          })}
+          <ListFooter shown={paged.shown} total={paged.total} sentinelRef={paged.sentinelRef} />
+          {!loading && !loadError && filteredMarks.length === 0 && !creating && (
+            marks.length === 0 ? (
+              <EmptyState
+                icon={Flag}
+                title={t('bookmarks.empty')}
+                reason={t('bookmarks.emptyReason')}
+                action={{ label: t('bookmarks.quickCapture'), onClick: () => { setCreating(true); setDetailOpen(true) } }}
+              />
+            ) : (
+              <div className="p-4 text-xs text-redlog-text-faint text-center">
+                {t('bookmarks.noSearchMatches', { query: search })}
+              </div>
+            )
+          )}
+        </div>
+      </div>}
+
+      {(marks.length > 0 || creating) && <div hidden={!detailOpen} data-testid="bookmark-detail-pane" className="min-w-0 flex-1 overflow-auto p-pad">
+        {detailOpen && (
+          <Button data-testid="bookmarks-back" size="compact" level="quiet" onClick={() => setDetailOpen(false)}>
+            <ChevronLeft size={14} aria-hidden />{t('bookmarks.backToList')}
+          </Button>
+        )}
+        {creating && (
+          <BookmarkForm
+            browserTab={browserTab}
+            onSave={() => { setCreating(false); setDetailOpen(false); refresh() }}
+            onCancel={() => { setCreating(false); setDetailOpen(false) }}
+          />
+        )}
+        {selected && !creating && (() => {
+          const idx = visibleMarks.findIndex((m) => m.id === selected.id)
+          return (
+            <BookmarkDetail
+              key={selected.id}
+              mark={selected}
+              onUpdate={() => { refresh(); window.redlog.bookmarks.get(selected.id).then((m) => m && setSelected(m)) }}
+              onDelete={() => { setSelected(null); setDetailOpen(false); refresh() }}
+              onOpenInTimeline={onOpenInTimeline}
+              isPinned={pinned.has(selected.id)}
+              onTogglePin={() => togglePin(selected.id)}
+              onStep={(d) => { const n = visibleMarks[idx + d]; if (n) setSelected(n) }}
+              canStepPrev={idx > 0}
+              canStepNext={idx >= 0 && idx < visibleMarks.length - 1}
+            />
+          )
+        })()}
+        {!selected && !creating && (
+          <div className="flex flex-col items-center justify-center h-full text-redlog-text-faint text-sm gap-2">
+            <span>{t('bookmarks.placeholder')}</span>
+            <span className="text-xs text-redlog-muted">{t('bookmarks.placeholderSub')}</span>
+          </div>
+        )}
+      </div>}
+    </div>
+  )
+}
+
+function BookmarkForm({ browserTab, onSave, onCancel, initial }: {
+  browserTab: BrowserTabInfo | null
+  onSave: () => void
+  onCancel: () => void
+  initial?: Bookmark
+}): JSX.Element {
+  const formId = useId()
+  const [title, setTitle] = useState(initial?.title ?? browserTab?.title ?? '')
+  const [url, setUrl] = useState(initial?.url ?? browserTab?.url ?? '')
+  const [note, setNote] = useState(initial?.note ?? '')
+  const { t } = useI18n()
+
+  const [saving, setSaving] = useState(false)
+  const submit = async (): Promise<void> => {
+    if (!title.trim() || saving) return
+    setSaving(true)
+    try {
+      if (initial) {
+        await window.redlog.bookmarks.update(initial.id, { title, url, note })
+      } else {
+        await window.redlog.bookmarks.create({ title, url: url || undefined, note })
+      }
+      onSave()
+    } catch (e) {
+      // The draft stays on screen: nothing was saved, and saying so is the point.
+      toast(t('bookmarks.saveFailed'), { type: 'error', why: t('bookmarks.saveFailedWhy'), detail: e instanceof Error ? e.message : String(e) })
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="space-y-3 max-w-xl">
+      <h3 className="text-sm font-semibold text-redlog-text">{initial ? t('bookmarks.editMark') : t('bookmarks.quickCapture')}</h3>
+
+      {!initial && browserTab?.connected && (
+        <div className="bg-green-500/10 border border-green-500/20 rounded px-3 py-2 text-xs text-green-400">
+          {t('bookmarks.autoCaptured', { title: browserTab.title || '' })}
+        </div>
+      )}
+      {!initial && !browserTab?.connected && (
+        <div className="bg-redlog-elevated border border-redlog-border rounded px-3 py-2 text-xs text-redlog-text-dim">
+          {t('bookmarks.cdpHint', { port: String(browserTab?.port ?? DEFAULT_CDP_PORT) })}
+        </div>
+      )}
+
+      <div>
+        <label htmlFor={`${formId}-title`} className="text-xs text-redlog-text-dim uppercase tracking-wider">{t('bookmarks.fieldTitle')}</label>
+        <input id={`${formId}-title`} value={title} onChange={(e) => setTitle(e.target.value)}
+          placeholder={t('bookmarks.fieldTitlePlaceholder')}
+          className="w-full mt-0.5 px-2 py-1.5 bg-redlog-surface border border-redlog-border rounded text-sm text-redlog-text focus:border-red-500 outline-none" />
+      </div>
+
+      <div>
+        <label htmlFor={`${formId}-url`} className="text-xs text-redlog-text-dim uppercase tracking-wider">{t('bookmarks.fieldUrl')}</label>
+        <input id={`${formId}-url`} value={url} onChange={(e) => setUrl(e.target.value)}
+          placeholder="https://..."
+          className="w-full mt-0.5 px-2 py-1.5 bg-redlog-surface border border-redlog-border rounded text-sm text-redlog-text focus:border-red-500 outline-none font-mono text-xs" />
+      </div>
+
+      <div>
+        <label htmlFor={`${formId}-note`} className="text-xs text-redlog-text-dim uppercase tracking-wider">{t('bookmarks.fieldNote')}</label>
+        <textarea id={`${formId}-note`} value={note} onChange={(e) => setNote(e.target.value)} rows={4}
+          placeholder={t('bookmarks.fieldNotePlaceholder')}
+          className="w-full mt-0.5 px-2 py-1.5 bg-redlog-surface border border-redlog-border rounded text-sm text-redlog-text outline-none resize-y" />
+      </div>
+
+      <div className="flex gap-2 pt-1">
+        <Button level="primary" disabled={!title.trim() || saving} onClick={submit}>
+          {initial ? t('bookmarks.update') : t('bookmarks.save')}
+        </Button>
+        <Button level="secondary" onClick={onCancel}>{t('bookmarks.cancel')}</Button>
+      </div>
+    </div>
+  )
+}
+
+function BookmarkDetail({ mark, onUpdate, onDelete, onOpenInTimeline, isPinned, onTogglePin, onStep, canStepPrev = false, canStepNext = false }: {
+  mark: Bookmark
+  onUpdate: () => void
+  onDelete: () => void
+  onOpenInTimeline?: (ts: number) => void
+  isPinned?: boolean
+  onTogglePin?: () => void
+  // Step/close in the pane's own header, consistent with the HTTP log and the
+  // Timeline inspector, so every detail pane is driven the same way.
+  onStep?: (delta: -1 | 1) => void
+  canStepPrev?: boolean
+  canStepNext?: boolean
+}): JSX.Element {
+  const [editing, setEditing] = useState(false)
+  const { t } = useI18n()
+
+  if (editing) {
+    return <BookmarkForm browserTab={null} initial={mark} onSave={() => { setEditing(false); onUpdate() }} onCancel={() => setEditing(false)} />
+  }
+
+  const handleDelete = async (): Promise<void> => {
+    const ok = await confirm(t('confirm.deleteBookmark'), t('confirm.deleteBookmarkDesc'), true)
+    if (!ok) return
+    await window.redlog.bookmarks.delete(mark.id)
+    onDelete()
+  }
+
+  return (
+    <div className="min-w-0 space-y-4 max-w-2xl">
+      <div className="flex flex-wrap items-start gap-3">
+        <div className="flex flex-1 basis-64 items-start gap-2 min-w-0">
+          {onStep && (
+            <span className="flex items-center mt-0.5 shrink-0">
+              <button
+                type="button"
+                data-testid="bookmark-step-prev"
+                disabled={!canStepPrev}
+                onClick={() => onStep(-1)}
+                title={t('timeline.stepPrev')}
+                aria-label={t('timeline.stepPrev')}
+                className="w-5 h-5 flex items-center justify-center rounded-l border border-redlog-border/60 bg-redlog-elevated/40 text-redlog-text-dim hover:text-redlog-text hover:border-redlog-border disabled:opacity-35 disabled:hover:text-redlog-text-dim transition-colors"
+              ><ChevronLeft size={12} strokeWidth={2} aria-hidden /></button>
+              <button
+                type="button"
+                data-testid="bookmark-step-next"
+                disabled={!canStepNext}
+                onClick={() => onStep(1)}
+                title={t('timeline.stepNext')}
+                aria-label={t('timeline.stepNext')}
+                className="w-5 h-5 flex items-center justify-center rounded-r border border-l-0 border-redlog-border/60 bg-redlog-elevated/40 text-redlog-text-dim hover:text-redlog-text hover:border-redlog-border disabled:opacity-35 disabled:hover:text-redlog-text-dim transition-colors"
+              ><ChevronRight size={12} strokeWidth={2} aria-hidden /></button>
+            </span>
+          )}
+        <div className="min-w-0">
+          <h3 className="text-base font-semibold text-redlog-text [overflow-wrap:anywhere]">{mark.title}</h3>
+          {mark.url && (
+            <button
+              onClick={(e) => { e.stopPropagation(); (window.redlog.app as { openExternal?: (u: string) => Promise<unknown> }).openExternal?.(mark.url as string) }}
+              className="text-xs text-redlog-cyan font-mono mt-1 break-all text-left hover:text-redlog-text hover:underline transition-colors cursor-pointer"
+              title={t('bookmarks.openUrl')}
+            >
+              {mark.url} ↗
+            </button>
+          )}
+          <div className="text-xs text-redlog-text-dim mt-1">
+            {formatDateTime(mark.createdAt, { seconds: true })}
+          </div>
+        </div>
+        </div>
+        <div className="flex flex-wrap gap-1">
+          {onOpenInTimeline && (
+            <Button size="compact" level="quiet" onClick={() => onOpenInTimeline(mark.createdAt)} >{t('bookmarks.goToTime')}</Button>
+          )}
+          <Button size="compact" level="quiet" onClick={() => setEditing(true)} >{t('bookmarks.edit')}</Button>
+          <Button size="compact" level="quiet" onClick={handleDelete} >{t('bookmarks.delete')}</Button>
+        </div>
+      </div>
+
+      {/* Pin toggle lives here (low-frequency action, out of the mark list). */}
+      {onTogglePin && (
+        <Button size="compact" level="quiet"
+          onClick={onTogglePin}
+          aria-pressed={!!isPinned}
+        >
+          <span>{isPinned ? '★' : '☆'}</span>
+          <span>{isPinned ? t('bookmarks.unpin') : t('bookmarks.pin')}</span>
+        </Button>
+      )}
+
+      {mark.note && (
+        <div>
+          <label className="text-xs text-redlog-text-dim uppercase tracking-wider">{t('bookmarks.fieldNote')}</label>
+          <div className="mt-1 text-xs text-redlog-text whitespace-pre-wrap [overflow-wrap:anywhere] bg-redlog-surface rounded p-3 border border-redlog-border">{mark.note}</div>
+        </div>
+      )}
+
+      {Object.keys(mark.context).length > 0 && (
+        <div>
+          <label className="text-xs text-redlog-text-dim uppercase tracking-wider">{t('bookmarks.autoContext')}</label>
+          <div className="mt-1 bg-redlog-surface rounded p-3 border border-redlog-border space-y-1">
+            {mark.context.browserUrl && (
+              <div className="text-xs">
+                <span className="text-redlog-text-dim">{t('bookmarks.browserUrl')}</span>{' '}
+                <button
+                  onClick={(e) => { e.stopPropagation(); (window.redlog.app as { openExternal?: (u: string) => Promise<unknown> }).openExternal?.(mark.context!.browserUrl as string) }}
+                  className="text-redlog-cyan font-mono break-all hover:text-redlog-text hover:underline transition-colors cursor-pointer"
+                  title={t('bookmarks.openUrl')}
+                >
+                  {mark.context.browserUrl} ↗
+                </button>
+              </div>
+            )}
+            {mark.context.browserTitle && (
+              <div className="text-xs">
+                <span className="text-redlog-text-dim">{t('bookmarks.pageTitle')}</span>{' '}
+                <span className="text-redlog-text">{mark.context.browserTitle}</span>
+              </div>
+            )}
+            {mark.context.externalIP && (
+              <div className="text-xs">
+                <span className="text-redlog-text-dim">{t('bookmarks.ipLabel')}</span>{' '}
+                <span className="text-redlog-text font-mono">{mark.context.externalIP}</span>
+              </div>
+            )}
+            {mark.context.lastKnownExternalIP && (
+              // No current IP reading when the bookmark was made: the address
+              // is the last one read, and must not pass for the one in use.
+              <div className="text-xs" data-testid="bookmark-last-known-ip" title={t('bookmarks.lastKnownIpHint')}>
+                <span className="text-redlog-text-dim">{t('bookmarks.lastKnownIpLabel')}</span>{' '}
+                <span className="text-redlog-text-dim font-mono">{mark.context.lastKnownExternalIP.address}</span>
+                {mark.context.lastKnownExternalIP.readAt > 0 && (
+                  <span className="text-redlog-text-dim">
+                    {' '}{t('bookmarks.lastKnownIpReadAt', { time: formatDateTime(mark.context.lastKnownExternalIP.readAt, { seconds: true }) })}
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}

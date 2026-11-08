@@ -1,0 +1,650 @@
+# Verification: 紀錄優先工作區
+
+**Date**: 2026-10-26。Feature 保持 Draft；這是局部實作與驗證 checkpoint，不是整份 Spec 064 完成。
+
+最新搜尋批次：2026-10-28 的 T012／T013／T048 已完成，見本文件末節；下列各日期的未完成狀態是當時紀錄。
+
+## RED
+
+- `test/terminal-origin.test.ts` 初跑 4 failed／1 passed：系統無法證明 origin 時，TERM_PROGRAM、WT_SESSION 及 REDLOG_TERMINAL 仍能放行；corrupt preference 也被旗標繞過。
+- terminal enrollment／HooksPanel 的 unsupported platform 兩案失敗：Linux／Windows 能保存未驗證的限定 App，畫面也提供假能力。
+- 真機 probe 第一輪 Warp 亦被拒：framework Python 位於 Python.app，被當成 host App。先補 fixture 重現，再忽略 verifier 自己的 bundle，保留實際祖先核對。
+- 首次完整回歸：離線大輸出只剩小型 command_end，原 229 KB 內容不在 spool；已補有界本機 listener readiness，不能因有 identity／token 檔就丟掉 inline record。暫停／拒絕不走離線 fallback。
+- C1 初跑：Timeline／Tool pairing 12 案失敗，重複同 PID／文字被隱藏、provider／Session／capture namespace 跨組、衝突後來者覆蓋。
+- DB／Transcript 三案失敗：跨頁查詢忽略 provider／project／capture namespace；閱讀面亦跨 provider 合併。
+- 搜尋映射兩案失敗：仍以 PID＋文字／裸 Session ID 高亮另一個操作。已沿同一 canonical key 修正。
+
+## GREEN
+
+- S1 checkpoint `npm run typecheck → verify:specs → verify:architecture → verify:i18n → npm test`：全部 gates 通過；**4294 passed、28 skipped，428 test files（423 passed／5 skipped）**。Log：`/private/tmp/redlog-064-current-unit.log`。
+- 型別、來源鍵、DB counterpart／Transcript、搜尋映射相關 focused checks 通過；新增測試使用既有檔案／fixture，只有 origin 需要新的行為測試檔。
+- `npm run build` 通過。隔離 macOS arm64 package 完成；`verify:package-resources` 與 bundle signature check 通過，正式 App 未覆蓋。
+- 設定互動 E2E 7 passed（S1 checkpoint）：真實保存／reload、800／1600 視窗、繁中／英文、100／150／200% zoom、讀取／儲存失敗。後續 C1 不改此設定元件。
+- 更新後候選的 command I/O／Transcript／packaged smoke：**9 passed、0 skipped、0 flaky**，24.7 秒。包含跨 cast part I/O、bundle 保留分段、真實擷取／匯出／驗證／重啟，以及增量閱讀位置。Report：`/private/tmp/redlog-064-current-e2e.json`。
+
+## Operational Verification
+
+Risk surface: capture / packaging / external integration。
+
+使用者在真實 Warp 與另一個終端執行隔離 probe；來源檢查未改 profile／正式專案：
+
+| 來源 | Warp 限制下送達事件 | 合成 stdout／stderr／exit 7 | spool |
+| --- | --- | --- | --- |
+| Warp（OS origin 辨識成功） | 起訖 2 筆 | 正確 | 0 |
+| 另一終端（無匹配 origin） | 0 | 沒有保存輸出；命令本身正常結束 | 0 |
+
+偽造環境提示不改變判斷，corrupt preference 被拒絕。根據原生工具對 Warp 的安全限制，本次由使用者手動跑兩個終端，我方讀回合成結果；沒有繞過工具限制。
+
+packaged smoke 實跑 RELEASE-SMOKE-TEST 對應的已打包啟動、內建終端 I/O、managed proxy HTTP／HTTPS nonce（只用測試 client CA，沒有修改系統信任）、證據包／隨包 verifier／重啟讀回。JSON report 無 HTTP 未執行 annotation；不是瀏覽器全機 CA 已信任的證明。
+
+macOS 候選：`/private/tmp/redlog-064-package/mac-arm64/RedLog.app`。基準 HEAD `853ce4a0` 加本工作樹未提交變更，不冒充已 merge／發版。
+
+| 檔案 | SHA-256 |
+| --- | --- |
+| packaged app.asar | `666611d40066ce6bf3a39ee8c4d0231af3f08af0a668bdbc97f968a4c6ba0f01` |
+| hooks/terminal_app.py | `d9045586383bef1ec4236f58684e75640945855fad8731cb4ffaf756b62c243f` |
+| hooks/redlog-relay.py | `556b6ebe2c08e2e6d2c49c4c5d478a5ab922cf619549f9bde650dd973cc89d78` |
+
+目前工作樹的 SQLite addon 在 package／E2E 後會還原為 Node 測試 ABI；候選包內為 Electron ABI，兩者不可混稱。
+
+## 尚未完成／不能宣稱
+
+- T004／T005／T006／T008 的完整有效邊界、故障注入、tmux／重接及 Windows／Kali／WSL 原生矩陣仍有缺口。28 skipped 不當作平台通過。#432 未因此合併。
+- C1 的 act1 ID、群組 cursor／總數／來源集合與 IPC 已補；Activity UI、跨閱讀模式及完整覆蓋仍未完成。PowerShell 無可靠 ID 的列保留未配對。
+- C2 搜尋覆蓋 metadata、C3 共用 Reader、C4 anchor、C5 新 Activity／Session 選取與跨目標錄影政策仍依 tasks 續做。
+- 五入口／三閱讀方式／Settings 五分類尚未整併；全產品人工視覺、五人任務與效能量測仍 NOT RUN。沒有新增裝飾介面或官方 OpenCode。
+- 沒有 commit、push、PR、merge、release 或覆蓋正式安裝。此候選未公證，不作正式發布聲明。
+
+## Release Impact
+
+| | |
+| --- | --- |
+| User-visible | yes |
+| Breaking | yes：受限 App 不接受環境提示；無來源身分不再猜配對 |
+| Packaging affected | yes：hook support file／optional packages |
+| CHANGELOG updated | yes（Unreleased） |
+| Upgrade note required | yes |
+| Packaged smoke required | yes，macOS 通過；其他平台未完成 |
+
+## Gates
+
+| Gate | Result | Date |
+| --- | --- | --- |
+| Clarify | 使用者八項審查已編入 C1–C6；沿既定範圍，無新增產品問題。 | 2026-10-26 |
+| Checklist | requirements 16／16 checked；只代表規格品質，不是產品 PASS。 | 2026-10-26 |
+| Analyze | 已交叉核對實作與 C1／C6：配對鍵必須同時供 query／Timeline／Transcript／highlight 使用；剩餘差異明列 tasks。 | 2026-10-26 |
+| Converge | 尚未執行最終收斂：實作 tasks 未完成，不將局部修正宣稱全規格完成。 | 2026-10-26 |
+
+## 2026-10-26 — Activity query checkpoint
+
+本輪只接 C1 查詢底層與 preload／IPC，不宣稱 S2／整份 Spec 完成，未換主導覽。
+
+- `activity-projection.ts` 以來源 tuple 產生 act1 SHA-256 身分；補 Call／Result 不改 ID，跨 provider／Session／binding／project 不配對，缺鍵保留 Event fallback。
+- `activity-queries.ts` 在 SQLite 先解析全專案群組，再依操作起點／穩定鍵分頁；兩個 tier 都查，matched 與 context 分開。預覽各最多 20 IDs，原事件可另以有界 cursor 完整讀取，不改 Event／hash。
+- Cursor 固定 rowid 邊界、列數及尾端 ID；新增／晚到列留到 refresh，retention／rowid 重用／已命中 body 索引變動明確失效。來源詳情缺確認 snapshot 時拒絕。
+- 共用既有 Event 查詢條件、FTS／body 命中及 bare-tool 解讀。IPC 依 main 的目前 engagement 及 scope 判定；延遲畫面不能查目前另一專案。
+- Claude Code／Codex 只以已知精確工具名稱分類；讀檔／寫檔／搜尋／瀏覽不冒充獨立 Shell／HTTP，未知工具不猜類型。
+
+RED：8 項基礎 query 案最初因未實作而失敗；IPC 的專案／scope 兩案在接線前失敗；未知 filter 及缺 snapshot 的案例先各重現失敗，再修正。
+
+GREEN：
+
+- 四項 gates 通過；最終完整 suite **4309 passed／28 skipped，429 files（424 passed／5 skipped）**，`/private/tmp/redlog-064-activity-final-unit.log`。
+- Query／IPC focused run **19 passed**，包含 snapshot 必填及索引部分建立失敗後的 rollback／重開；均已納入上述最終完整 suite。
+- Build 通過；沿既有 Transcript E2E 同一 App 走真實 `/api/events` → ingest → Activity preload／IPC → source context，再驗原 Transcript；**2 passed、0 skipped／flaky**。Report `/private/tmp/redlog-064-activity-final-e2e.json`（索引版最終重跑 10.35 秒）。這是自動整合測試，不是全產品人工視覺驗收。
+- E2E 後已將本工作樹 SQLite addon 還原為 Node ABI；本輪沒有重打安裝包，前面的 macOS package 僅代表 S1 checkpoint，不包含新 Activity API。
+
+仍未完成：C2 覆蓋／索引狀態、Activity UI、C3／C4 Reader 與定位、C5 新匯出契約、Settings／五主入口、Windows／Kali／WSL 原生矩陣。T009–T015 保留未勾，不以 query PASS 代替閱讀／效能 gate。
+
+### Activity query performance and derived-index lifecycle
+
+同一 Apple M2 Pro、macOS arm64、Node v26.12.1，固定十萬原始 Event（五萬 tool Call／Result），30 次輪替六類查詢：全專案、FTS、Action、時間、Session、指定 Tool＋Session。每次驗證正確群組總數及首批數量；沒有以 LIMIT 先截斷來源。
+
+- 重算版本 p95 **1193.9 ms**；連線內 SQLite TEMP 衍生索引版 p95 **905.9 ms**（下降約 24%），30 次包括第一次建立索引。
+- 索引冷啟動第一次 **1653.7 ms**，其餘 **519.2–905.9 ms**；不把冷啟動成本藏掉。這份 fixture 的 p95 達到一秒目標，但尚無完整舊 UI／輸入延遲比較，**不將 SC-007 全項標完成**。
+- Index 只含身分、時間、分類及 digest；不保存輸出／Prompt／Tool Input 原文。原始證據仍只由既有 Event 查詢讀回。新列增量補入；資料清理／rowid 替換、失敗 rollback 及關專案重開均驗證不沿用錯誤索引。
+- Report：`/private/tmp/redlog-064-activity-indexed-performance.log`；對照 `/private/tmp/redlog-064-activity-final-performance.log`；fixture 存 `/private/tmp/redlog-064-activity-benchmark.fixture.txt`。暫存 timing test 已移除，不加入每輪 unit suite。
+
+## 2026-10-26 — Approved full-checkpoint push
+
+使用者明確授權原隔離工作樹 178 個路徑全部提交／推送；先前獨立 Activity checkpoint 之外的剩餘 171 路徑已提交。來源驗證 commit：`deb483f9`（含 `fbd43f35` 的整批實作與 `4cf286be` 的 Activity query）。
+
+- 在已提交來源上依序完成 typecheck、Spec、architecture、i18n、unit gates。**4309 passed、28 skipped；429 files（424 passed／5 skipped）**。Log：`/private/tmp/redlog-approved-checkpoint-unit.log`。
+- 最新 production build 通過；指令 I/O 與 Transcript／Activity Electron 整合 **8 passed、0 skipped／flaky**。Report：`/private/tmp/redlog-approved-checkpoint-e2e.json`；build log：`/private/tmp/redlog-approved-checkpoint-build.log`。
+- Electron 驗證後恢復 Node SQLite ABI；沒有改正式安裝或專案。
+- 本次 push 包含已授權的累積實作／文件，不代表 Spec 062／063／064、原生跨平台矩陣或全產品人工驗收已完成。macOS package 證據仍僅適用上面的 S1 candidate；本次未建立新安裝包、合併或發布 release。
+
+## 2026-10-26 — PR #444 macOS CI follow-up
+
+Head `66aef83a` 的 macOS unit job `121474366721` 有兩個失敗：ignore-certificate-errors 警告未出現，以及 paused 驗證逾時未出現；Ubuntu／Windows unit 及 package smoke 成功，GitHub E2E 因 unit gate 失敗跳過。
+
+- 可重現根因：HttpCaptureStep 在新 proxy／policy 已 commit 後，才於 passive effect 更換 attempt nonce 並清 timer。這個過渡狀態能接受使用者操作，之後卻丟棄回覆或取消已開始的逾時。
+- RED：新增同一個 FirstRun Profiler 回歸案例，直接觀察每個 commit 的 endpoint／nonce／readiness，修正前穩定失敗；不是只靠重跑原本偶發案例。
+- 修正：在同一元件的 context 改變時，先調整 attempt／timeout state 再 commit；沒有放寬 CA 警告、nonce 比對、60 秒逾時、測試條件或平台檢查。
+- GREEN：FirstRun／HTTP focused checks 74 passed；完整五道 gates 通過，unit **4310 passed／28 skipped**（429 files）。補明確等待 deferred status probe 被呼叫後，FirstRun 檔 **51 passed**，不靠加長 timeout。
+- Build 通過；同一 Electron App 的 managed HTTP／nonce 驗證／routing 流程 **1 passed、0 skipped／flaky**，7.78 秒。Log：`/private/tmp/redlog-444-http-race-unit.log`；Report：`/private/tmp/redlog-444-http-race-e2e.json`。這個 UI fixture 不替代真實 CA 信任或跨平台人工驗收。
+- Electron 後恢復 Node SQLite ABI；遠端新 head 的 CI 需另行確認，舊 head 的紅／綠均不當成新修正驗證。
+
+
+## 2026-10-26 — Activity search → saved I/O → source Event
+
+本輪基於 `ef65ca15` 的隔離工作樹；提交／推送狀態以 Git 記錄為準。新增既有 Search 內的「操作／原始事件」呈現，未取代主 Timeline、Search、Transcript，也不代表 S2／S3／S4 全部完成。
+
+### 行為與故障驗證
+
+- C2：UTF-8 sidecar（包括以 base64 傳入、落盤為原始 bytes 的文字）可索引；binary 不假裝是文字。缺檔移除舊命中，稍後到達／還原可重建；相同大小改寫及還原 mtime 仍失效。損壞 ref 回報 failed coverage，不阻擋其他已驗證內容。資料邊界內的 coverage 變動使舊 Activity cursor 明確失效；邊界外新增 body 不污染舊分頁。
+- C3：ContentRef 綁 project／Event／field／hash；64 KiB 視窗（UTF-8 邊界補償）、JSON／空輸出／未擷取區分、逐段字面 Find 及取消、當前視窗複製。17 MiB 尾端命中跨多次 1 MiB 掃描，不把掃描預算當成零結果。來源檔案或 body-store 目錄的 symlink、缺檔、版本改變、跨專案請求均明確拒絕；不重寫原始 Event hash。
+- UI：同一 query/filter 送 SQL 群組／分頁，命中與背景分開計數。一般指令兩端皆命中時預設開結果，可切 stdout／stderr／工具參數／工具結果。新查詢等待期間不可誤點舊結果；失效分頁提供重新整理，不反覆重送舊 cursor。原始事件返回保留查詢、展開及內容位置。
+- 實際截圖發現 Find 跳到尾端後 Previous 停用，已補回歸並修正，可回看前文、回到命中範圍及標亮文字。
+- 移除兩個限定程式碼字面形狀的舊斷言，改以實際 Session 查詢確認 Cast 不混入無法套用條件的結果。錄影條件限制、50 筆上限及不可索引 body 只在影響判讀時顯示。
+
+### 驗證與限制
+
+- 完整 typecheck → specs → architecture → i18n → unit 通過：**4328 passed、28 skipped（426 passed／5 skipped files）**。Log：`/private/tmp/redlog-064-content-unit-final.log`。之前一次未修改的 Bash PTY 測試受 `setpgid: Operation not permitted` 干擾；未改斷言，完整重跑通過。
+- 後續 UI 來源選擇、等待及失效分頁恢復以受影響檢查驗證；最後 focused **70 passed／9 files**，結果見 `/private/tmp/redlog-064-content-focused-final.log`，不倒灌成前一次完整測試數。
+- Production build 通過：`/private/tmp/redlog-064-content-build-final.log`。
+- Electron 自動操作：原有 query contract 與 Activity workflow 2 passed；擴充同一 workflow 驗 Shell stdout／stderr、Claude 工具結果、HTTP body、前後段、原始事件返回及 800×700 視窗，最新 **1 passed、0 skipped／flaky**，6.11 秒。Report：`/private/tmp/redlog-064-content-e2e-final.json`。之後的失效分頁恢復按鈕由 UI 故障注入驗證、build 通過，未為此重開 App。
+- 已檢視實際截圖：`/private/tmp/redlog-064-activity-desktop.png`、`/private/tmp/redlog-064-activity-narrow.png`。這是合成持久化資料的 Electron 操作及視覺檢查，**不是人工全 App、真實 AI vendor、Windows／WSL／Kali 驗收**。
+- 十萬個 inline Event、30 次代表查詢：p95 **932.9 ms**、冷啟動 **1838.1 ms**。已移除重複 coverage 掃描；report：`/private/tmp/redlog-064-content-performance-final.log`。不代表大量 sidecar、持續寫入負載或完整 SC-007 通過；暫存量測腳本已刪除。
+- 本輪未建立新安裝包、合併或發版；Electron 後恢復 Node SQLite ABI。
+
+### 仍未完成的契約
+
+- FTS 每份 body 上限 **16 MiB**；超過時明示 limited，原件不刪／不截短，仍能用來源 Reader 及完整 Find 讀取。不能宣稱所有保存內容皆已進入全域索引。
+- Cast generation、AI raw JSONL／一般附件的 C2 覆蓋，C3 其他 Reader／完整 raw/readable 映射及跨模式恢復、C4 片段 anchor，仍依原 tasks 維持未勾。
+- 目前匯出 canonical query 命中事件，沿用 ExportPlan；尚未提供 Activity 全背景／跨目標 Session 附件的固定選取，不將這輪當成 C5 完成。
+- 五主頁面、Settings 整併及全產品人工／跨平台矩陣依原 gate 繼續，不提前刪除舊入口。
+
+
+### Push preparation
+
+- 新增故障回歸：來源分頁出現匹配的 Result 時，不得自動切走正在閱讀的 Call。先重現來源從 start 跳到 end，再固定首次選擇，保留明確切換控制。
+- 已在來源提交 `b14d18ee` 依序完成 typecheck → specs → architecture → i18n → unit，全部通過；unit **4330 passed、28 skipped（426 passed／5 skipped files）**，140.12 秒，log：`/private/tmp/redlog-064-push-unit.log`。此提交的 production build 亦通過，log：`/private/tmp/redlog-064-push-build.log`。前述 4328／70 保留為當時的實際結果。
+- 本輪提交包含 Activity 搜尋、內容 Reader、body index、相關 IPC／UI／測試與 Spec 紀錄；不把其餘未勾的 Session 匯出／跨平台驗收等項目列為完成。
+
+
+## 2026-10-26 — Windows CI export follow-up
+
+遠端 head `82073921`：Ubuntu／macOS unit、Linux package smoke 及 Windows install smoke 通過；Windows unit job `121567924365` 失敗兩項，E2E 因 unit gate 未通過而跳過。此結果不是跨平台手動驗收。
+
+- 附件排除重新解析的焦點還原原本在 passive effect。Profiler 在已更新、可操作的附件列 commit 時穩定觀察到 focus 仍在 body（RED），不是只重跑偶發失敗。改為 layout effect 並等待 previewLoading 結束，在畫面交還操作者前恢復焦點；保留不搶走其他控制項焦點的條件。
+- 大量輸出測試在 Windows 超過原 15 秒預算。前置資料逐筆自動提交，包含 2005 筆 chunk；改為一個批次 transaction 建立同一資料集。520 筆查詢、505 對 HTTP fixture 亦改批次；預覽後的新增資料仍在獨立 transaction，2006 筆交付及快照排除斷言不變。不改產品 SQLite durability 設定、不延長 testTimeout、不跳過 Windows。
+- 修正後兩檔 8 passed；本機長輸出案例 671 → 367 ms、整批 2.41 → 1.20 秒（含 RED／GREEN 執行差異，僅作前置成本參考，不當 Windows 效能證明）。Log：`/private/tmp/redlog-444-export-ci-red.log`、`/private/tmp/redlog-444-export-ci-green.log`。
+- 來源提交 `8768c5c0` 五道 gates 全通過，unit **4330 passed／28 skipped**；production build 通過，單一 Electron App 的匯出操作 **8 passed、0 skipped／flaky**，6.22 秒（含附件 Space 勾選、焦點、小視窗、預覽／執行、失敗重試及成品找回）。Logs：`/private/tmp/redlog-444-export-ci-unit.log`、`/private/tmp/redlog-444-export-ci-build.log`；report：`/private/tmp/redlog-444-export-ci-e2e.json`。Electron 後已恢復 Node SQLite ABI。新的 Windows CI 通過前不宣稱已在 Windows 驗收完成。
+
+
+### Linux E2E artifact path follow-up
+
+- Head `6632a486` 的三平台 unit 與兩項 package／install smoke 全部通過。CI 完整 E2E：157 passed、7 skipped、1 failed；失敗是新增 Activity workflow 將畫面截圖寫到 macOS 專用 `/private/tmp`，Linux runner 無此路徑。匯出焦點及其他操作已通過，不將此次腳本錯誤描述成產品讀取失敗。
+- 改為 `testInfo.outputPath()` 儲存 desktop／narrow 圖片，留在 Playwright 每次測試的成品目錄，隨既有 CI `test-results/` artifact 上傳。保留原來所有操作、結果及版面斷言，不跳過 Linux 或取消截圖。
+
+- `ee9f41ff` 五道 gates 通過，unit **4330 passed／28 skipped**；build 通過。修正後 Activity workflow **1 passed、0 skipped／flaky**（5.84 秒），desktop／narrow 圖片實際產生於 `test-results/http-body-search-*/`。Logs：`/private/tmp/redlog-444-portable-e2e-unit.log`、`/private/tmp/redlog-444-portable-e2e-build.log`；report：`/private/tmp/redlog-444-portable-e2e-local.json`。Electron 後已恢復 Node SQLite ABI；完整 Linux CI 結果仍須讀新 head，不能沿用本機或舊 head 的綠燈。
+
+## 2026-10-27 — macOS Activity / Session export and large saved-output search
+
+基底 `05949443`，本次在隔離工作樹完成並交付至候選分支；未發版、不更新公開安裝包。上述 2026-10-26 checkpoint 的「16 MiB 整份不入全域索引」及「只匯出命中 Event」限制，已由這個 slice 取代。整份 Spec 064 不升 Verified。
+
+### Behaviour
+
+- Search → Operations 展開後，可在同一匯出入口選操作或來源 Session；後端固定完整成員，不只包含搜尋命中列。未知 Session 不可選，Claude／Codex 同名 Session 不混合，project 不符拒絕。
+- 保留 query snapshot 的來源集合；預覽後的新 Event／cast part 不加入。cast 預設不選，預覽依完整來源顯示跨目標歸因。無關截圖／body 不交付。明選的錄影保留核准 prefix；出包後 digest 再核對；新增 do-not-export 拒絕舊 plan。
+- 17 MiB HTTP body 的檔尾可全域命中、開啟完整 Reader、Find／Previous／Next／原始事件返回。另以 >16 MiB 中英文輸出驗多段 AND、不同 ref 不拼湊、長 token／URL 邊界及來源改寫失效。
+
+### Checks and actual app flow
+
+- Ordered typecheck → verify:specs → verify:architecture → verify:i18n → unit：**4338 passed / 28 skipped**。之後追加成品-copy 故障注入與 AI provider 隔離，最新針對性回歸 **66 passed**（匯出／Bundle／UI）及 **19 passed**（搜尋／固定選取）；不把先前全套數量改寫為追加後的全套實跑。
+- Production build 通過；本機原生 Electron 匯出流程 **8 passed**（JSON preview/execute、recent delivery、窄窗、附件鍵盤 focus、失敗重試／缺檔／切專案）。
+- 更新的 Search → large body Reader → Shell／AI → Activity／Session JSON export 流程 **1 passed / 6.6s**。實際讀回成品，兩種選取皆含未命中搜尋文字的 command_start 與 command_end／stdout；不是只核對成功通知。
+- UI screenshots 已查看：`test-results/http-body-search-Search-op-c05e0-ce-without-losing-the-query/activity-narrow.png` 與 `activity-wide.png`（不提交產生圖片）。
+- 這是 macOS source-built Electron 的自動操作與畫面檢視，不是新 DMG 的乾淨安裝或 Windows／WSL／Kali 真機人工驗收。
+
+### Layout defect in acceptance method
+
+使用者指出測試視窗大片空白。診斷實測：Electron native content `[1400,900]`，舊 `page.setViewportSize` 將 renderer 固定為 `[800,700]`。只測 `scrollWidth <= clientWidth` 會漏掉縮小視區沒有填滿實體視窗的問題。改用既有 `resizeMainWindow`，以真實 800×700 與 1600×1000 視窗核對 native content、renderer viewport、root 及 status-bar 邊界；移除診斷用模擬與 CDP 程式碼。未為測試視區問題任意修改產品 CSS，也不宣稱所有頁面版面已全面人工驗收。
+
+剩餘：AI raw JSONL／一般附件／Cast generation 搜尋覆蓋、完整 reader／fragment 契約、導覽整併及跨平台人工驗收；不屬於本次兩項功能已完成的範圍。
+
+### Push gate — 2026-10-27
+
+重新 fetch 遠端後，最終修改依序通過 typecheck、verify:specs、verify:architecture、verify:i18n、完整 unit：**4340 passed / 28 skipped**（426 passed / 5 skipped files，126.32s）。沒有把先前 05949443 的遠端 CI 綠燈套到本次提交；新提交的跨平台 CI 以 PR #444 checks 為準。
+
+## 2026-10-27 — installed macOS candidate d2917021
+
+開發基底為已合併的 main `d2917021`。本輪工作分支 `codex/macos-internal-acceptance` 只修建置來源狀態與驗收入口；候選仍鎖定 d2917021 的 application source，不把未提交的驗收修改編進候選。
+
+### Artifact
+
+- `dist/RedLog-0.18.3-internal-d2917021-arm64.dmg`，約 207 MiB；Mac Apple Silicon。
+- SHA-256：`0a3042357c6c4c5da7166f0da814a69ad963dad431edc93edf5ff2836a13de7e`。
+- `dist/SHA256SUMS-d2917021.txt`、`dist/INTERNAL-TEST-d2917021.md` 為內測交付附件，不提交大型 binary。
+- DMG checksum、`codesign --verify --deep --strict`、package resources contract 均通過。ad-hoc，不是 Developer ID／公證。沒有 publish、修改 release 或更新 feed。
+- readonly mount DMG，用 ditto 安裝至 `/private/tmp/redlog-internal-d2917021/Applications/RedLog.app`，再卸載 image。正式 `/Applications/RedLog.app`、使用者 shell profile／系統 proxy／系統 CA 均未修改。
+
+### Build identity defect and repair
+
+首次包的 About 顯示 `d2917021+local`，不作為最終交付。原因由 electron-vite 5.0.0 的 `loadConfigFormBundledFile` 原始碼確認：它先在 configRoot 寫出 `electron.vite.config.<timestamp>.mjs`，再評估 Git status。即使來源在建置前後皆乾淨，評估當刻也把自己的產物當未追蹤來源。
+
+補一個實際 temp Git repo 的 RED→GREEN regression：編譯產物不算 dirty，修改 tracked config／新增一般 untracked source 仍算 dirty；`.gitignore` 只加根目錄對應 pattern。不移除 dirty check、不硬蓋 Build ID。
+
+為保留指定 d2917021 候選，本輪只暫存並還原自己的驗收修改，以乾淨 d2917021 重建；建置 subprocess 的 `core.excludesFile` 僅排除該已確認的編譯產物，其他來源照常檢查。沒有改 shared Git exclude／其他工作樹。重建後以實際 About 內容確定為 `RedLog v0.18.3 · d2917021`。
+
+### Final installed-package automated acceptance
+
+同一最終 DMG 副本，`REDLOG_PACKAGED_APP` 指向其實際 executable，About 比對 `REDLOG_EXPECTED_BUILD=d2917021`：**25 passed / 1.1m**，沒有將 source-launched 結果當安裝版通過。
+
+- Export dialog／external source recovery：8 cases，含真實 shell、附件、失敗重試、recent result、窄窗及 project switch。
+- FirstRun：11 cases 在同一 App 連續操作，驗證來源獨立、安裝 hook、略過／返回／修復與不遺失既有紀錄；此組部分 proof 是 fixture，不冒充真人從終端輸入。
+- Activity／saved output：1 case，實際 About、17 MiB body 搜尋／Find／原始 Event 返回、原生 resize、操作／Session JSON 匯出讀回。
+- Official AI：3 capture cases + 1 installation case，Claude Code／Codex 的合成 JSONL、明確授權／排除／暫停／移除；不宣稱啟動真人 AI provider client。
+- Packaged smoke：1 case，UI 建專案、真實終端／exit／cast、已存在 mitmdump 12.3.1 的真實 loopback HTTP 與 HTTPS nonce（client --cacert，不變更系統 trust）、bundle verifier，以及重啟後內容／cast 搜尋。
+
+Logs：`/private/tmp/redlog-d2917021-final-installed-acceptance.log`、`redlog-d2917021-final-resources.log`、`redlog-d2917021-final-dmg-verify.log`。測試 artifacts 不提交；若再跑其他 Playwright 項目需先保存想保留的截圖。
+
+### Native, non-E2E exit acceptance
+
+使用同一安裝副本、獨立 native-home，`REDLOG_E2E=0`，透過原生 UI 建立 `native-exit-d2917021`。未透過 Playwright／IPC 代替退出確認。
+
+- ⌘Q 實際出現原生確認，明示「受管網頁擷取代理：經由它的工具會失去代理服務」及外部終端後續指令不再記錄。
+- 點「留在背景」後可繼續專案。送出關窗操作後，authenticated health 為 `{ok:true,projectOpen:true}`，proxy 仍 listening。
+- 再次 ⌘Q →「停止並結束」，原生工具回 App quit，程序 exit 0；回環 API 與 proxy 皆停止。
+- 注意：E2E 模式原本會略過退出確認，因此沒有用那 25 個自動案例冒充此原生結果。
+
+### Remaining friction / not run
+
+- 網路下載後 Gatekeeper 與 macOS 系統 CA 授權未人工驗收；不以本機 build 或 client --cacert 當成通過。未做 Windows／WSL／Kali 此候選真機驗收。
+- 原生首次畫面在本輪未執行使用者指令前，等待一段時間後出現「指令跑了，但沒有東西進來」；目前只能確認文案／觸發時機可能誤導，仍需核對狀態條件，未宣稱已修。
+- 本輪是隔離安裝副本與工程驗收，不等於 2–3 名新使用者的無人協助完成率／時間量測。
+
+交付副本保存在 `/Users/guantou/Desktop/REDLOG/dist/internal-d2917021/`（DMG／SHA256SUMS／內測說明），避免隔離 worktree 後續清理時遺失 binary；不進 Git。共用 Desktop checkout 的既有三份規格 WIP 與未追蹤 DB 未變更。
+
+## 2026-10-27 — test execution consolidation (no GUI run)
+
+先前已有 docs 規則但沒有本機 default selector。上輪約 20 次 App 啟動：第一包的 AI／package 六次、export／Activity 二次、FirstRun／About 二次、重建後 25-case 全選九次，以及非測試原生退出一次。關鍵錯誤是把 metadata 重建當作整組 AI／FirstRun／UI 重跑理由；不是每次都需要全量。
+
+本批新增 `npm run e2e:smoke`：只選 packaged recording/export/restart 一案，正常二次啟動（第二次是明確重啟讀回），禁自動 retry；要求 executable／預期 commit／mitmdump，report 保存在獨立暫存目錄並經既有 strict validator。`--list` 不啟動 Electron。Build ID 檢查抽到共用 helper，在既有 App 執行。
+
+Windows／Linux installed workflow 路徑補 core／main／preload／optional packages 及 build inputs；純 i18n／docs／spec 不因此重建安裝包，保留 workflow_dispatch。FirstRun 六處固定 wait 改狀態／元件／PID 判定。現況改由 test-coverage-matrix.md 對照，不更寫舊 NOT RUN。未批次移動 tests、未刪產品仍使用的泳道測試，也不以這個整理宣稱 C2–C6 缺口完成。
+
+這輪只跑非 GUI unit、type/gates 與 Playwright --list；不為驗證這個整理再次開關 App。新 FirstRun 等待邏輯與 smoke runner 的實際執行留待下一次必要 E2E／CI；不能將 collection 通過寫成 UI 操作已通過。
+
+本批非 GUI 檢查：13 tests passed（installed-smoke-policy／smoke-report／build-source-status）、typecheck／Spec／architecture／i18n gates 通過。`e2e:smoke -- --list` 精確列出 1 test；FirstRun＋Activity collection 共 14 tests。這些列出與檢查均未啟動 App，新的 GUI 等待條件仍未執行。
+
+### Test consolidation submission — 2026-10-27
+
+本批15個路徑獨立收尾：依序通過 typecheck、verify:specs、verify:architecture、verify:i18n 與完整 npm test（4,347 passed / 28 skipped，121.76s）。未啟動 GUI；新 smoke selector 的實際安裝包執行將沿用合併後候選，避免另外啟動一次只驗證 selector。
+
+
+## 2026-10-27 — shared reading workspace candidate
+
+Base: `main/37b6d74f`; branch `codex/recording-workspace-integration`. This is a source UI candidate, not the previously delivered installed DMG and not a public release.
+
+### Implemented scope
+
+- `RecordingWorkspace`: one query and keyboard-accessible reading tabs over the existing Search entry. Empty queries browse Activities. Raw Events and Cast results retain the same store query and coverage restrictions.
+- `TranscriptView`: I/O and AI modes constrain source buckets before database pagination. Workspace reads open saved results on load, including matching Tool Results. Standalone continuous Transcript remains reachable until parity.
+- `ActivityResults`／`EventContentReader`: visited reading modes, source events and output fields retain their individual windows and Find text. New batches signal refresh without replacing the active Activity snapshot. Hidden narrative readers catch up on return instead of querying every incoming batch.
+- `exportScope`: only the owner may clear its contribution; an older reader unmount cannot erase the active reader selection. Query transitions discard stale operation selection and preview the latest typed query through ExportPlan, without freezing a transient searching state. Operation/session export still uses the canonical frozen ExportPlan.
+- `Settings`: five groups, unchanged routes, field search, auto-save, project ownership and source permissions. No new integration lifecycle or duplicate source switch.
+
+### Automated evidence so far
+
+- Workspace test began RED because the new module did not exist; the shared-query/mode/reader-preservation journey passes after implementation.
+- Focused behavioral checks: 56 passed in 10 files before final layout checks, including source-field restoration, scoped backend queries, inactive-reader refresh and export ownership.
+- Full unit suite: 4,354 passed, 28 skipped. The previous source-regex test requiring unconditional `current = null` was removed and replaced by an actual two-reader ownership/unmount test. The single-control API-call-site guard remains.
+- Electron saved-content journey passed after catching and fixing a real collapsed matching Tool Result. Its final native-size/zoom capture and expanded regression are recorded below when complete.
+
+### Boundaries
+
+This batch does not claim complete C2–C4 parity, a finished Session selector, generalized Markdown/raw coordinate maps, raw AI JSONL/general attachment full-text indexing, S1 source failure matrices, other-OS native acceptance or five-user task metrics. Existing main Timeline/Transcript routes are retained as required by the retirement gate; no old-hook or schema compatibility shim was added. Spec remains Draft and the compound tasks remain unchecked.
+
+
+### Final automated / visual results for this slice
+
+- `typecheck`, `verify:specs`, `verify:architecture`, `verify:i18n`, production build passed. Full unit suite: 4,354 passed / 28 skipped; later query/export refinements additionally passed 12 focused cases. No skip was counted as a pass.
+- 14 distinct Electron cases across `capture-settings-interaction`, `filtered-export` (both locales), `http-body-search`, `layout-reliability`, `search-query-contract`, and `transcript-view` passed. The first batch passed 12; failed export cases were diagnosed and rerun with the shared saved-content journey, all 3 then passed. No automatic retry masked these failures.
+- The export failures exposed a real transient-state freeze; latest typed query now goes directly through the canonical preview. Raw result locators were also narrowed to visible semantic rows; hidden visited readers remain mounted intentionally.
+- The saved-content journey uses one App for raw body search beyond 16 MiB, Activity source selection, full-content Find, original Event/back, stdout/stderr, selected Activity/Session export with artifact readback, all reading modes, empty-query browsing, and native 800×600 / 150% zoom.
+- Captured native zoom screenshot with `BrowserWindow.capturePage()` after sidebar transition settles. Chromium `page.screenshot` at non-default Electron zoom clipped the frame and was not used as native layout proof. Reviewed wide and native narrow screenshots directly; shared tabs, search, status bar and actions fit. Generated artifacts are under ignored `dist/uiqa-workspace-20261027/`, not committed.
+- The five-component layout matrix also passed 120 native size/zoom/locale combinations. Settings interaction checks passed English/Traditional Chinese at 800px and 100/150/200% zoom.
+- A separate isolated source-build window with synthetic Shell and Claude data is open for native interaction. CUA reported the Mac locked; requested unlock. Native clicks are NOT RUN until unlock, and this is not presented as installed-package acceptance.
+
+
+### Native interaction follow-up — completed after unlock
+
+Same isolated source-build process, synthetic Shell and Claude events, Traditional Chinese. No second App launch was needed; one renderer reload loaded the small cleanup built during this check. This is native interaction through CUA, not Playwright driving the following actions.
+
+- Typed `synthetic-output`, expanded its Activity, searched its saved content, opened the original Event and returned. Query, selected source, content Find text and highlight remained present.
+- Switched I/O and AI modes. Both displayed saved output immediately. Chose stderr via the native dropdown, then returned to stdout; the Find input and output selection were preserved. Arrow keys switched AI/Raw tabs, and Cmd+F selected the common query field.
+- Inspected the five Settings categories at the original window size. Used macOS Window > Move & Resize > Left to resize the actual window, then increased zoom until the source settings switched to the compact category dropdown. Source cards and primary actions remained readable and reachable.
+- Found and removed legacy Transcript heading and unrelated kind buttons inside scoped I/O/AI modes. Standalone Transcript retains its mixed-type controls. Shortened the coverage warning to reflect saved body indexing and the separate recording-search path. `typecheck`, 25 affected unit cases and production build passed after this cleanup; reloaded and inspected the result natively.
+- Opened the selected Claude operation's actual Export dialog. The preview showed exactly its two source events and the selected operation boundary; canceled the preview without writing another artifact.
+- Saved `native-settings-narrow.png`, `native-ai-reading.png`, `native-export-preview.png` under ignored `dist/uiqa-workspace-20261027/`. These synthetic-project screenshots remain local, not public fixtures.
+- Quit the isolated App through Cmd+Q. CUA returned `App quit`. No user shell profile, official project, system proxy preference or system CA was changed. The source window used E2E mode for synthetic seeding, so this quit is cleanup, not a replacement for production native-exit acceptance.
+
+T036 is complete for this bounded UI integration. The broader compound tasks and unsupported/unrun platform and user studies remain unchanged; this does not upgrade the whole Spec to Verified.
+
+## 2026-10-27 — Windows internal candidate `42601438` (T042)
+
+Product commit `4260143897ffe732b61662c4ae2cc483e1db243d` on `integrate/spec064-internal`: `main/37b6d74f` + `codex/recording-workspace-integration` (e7dbf331) + `codex/session-without-project` (960ff12c) + the part of `fix/windows-followups` (#432) not already on main — only the first-run rejected-start mock. Its WSL token probe and stdin payload reached main separately. This record is a docs-only commit on top; the installer was not rebuilt for it.
+
+Host: Windows 11 Pro 26300 x64, Node 22.23.1; e2e in WSL kali-linux under `xvfb-run`, as CI does.
+
+### Gates and suites
+
+- `typecheck`, `verify:specs`, `verify:architecture` (341 files), `verify:i18n` (9 removed strings, none asserted): passed on Windows.
+- Unit, Windows: **4,191 passed / 51 failed / 148 skipped** (435 files, 443 s). All 51 failures are in 10 files that drive zsh through `wsl -d kali-linux` (`zsh-*.pty`, `zsh-builtin-source`, `zsh-divert-missing-pts`, `zsh-pty-harness`, `relay-contract`); every other file passed. Rerun alone: same 10 files fail. Run natively inside kali (no `wsl.exe` hop) they fail too, and `zsh-pty-harness`/`zsh-redlog-command`/`relay-contract` fail **15/25 on both main `37b6d74f` and this candidate**. Main CI (ubuntu unit + e2e) is green on `37b6d74f`. The likely cause is `WSL_DISTRO_NAME` steering the hook to the Windows profile (`hooks/shell-common.sh`) instead of the harness collector; not proven. Counted as environment, **not** as a pass.
+- e2e, full suite in WSL: **150 passed / 3 failed / 7 skipped** (12.2 min). The 3 failures — `dependency-cancel` (prepare button never clickable), `export-preview:26` (`record-terminal-verified` absent), one `layout-reliability` bookmarks scroll case at 200% (size combination differs per run) — reproduce alone with `--retries=0`, and reproduce identically on main `37b6d74f` in the same distro. Not regressions of this candidate; also not a pass.
+
+### Windows package
+
+- Local VS 2026 lacks the Spectre-mitigated libraries (MSB8040), so `node-pty` cannot rebuild from source here. Packaged with `-c.npmRebuild=false`: `node-pty` 1.1.0 loads its N-API prebuild, `better-sqlite3` 13 is N-API. This differs from CI packaging, which rebuilds; the PR's `Windows install smoke` artifact is the authoritative installer.
+- `RedLog.Setup-0.18.3-internal-42601438.exe` SHA-256 `d9355641411b7f1c715b05ce2daab646771ed593e69aa2a54c2c6787391b2e87`; `app.asar` SHA-256 `71411e2a72223c90706c58402e2b6021406e56dff7aaaa7deef746ef0743fac2`. Not committed.
+- `verify:package-resources` passed on `dist/win-unpacked`.
+- `npm run e2e:smoke` against `dist/win-unpacked/RedLog.exe`, `REDLOG_EXPECTED_BUILD=42601438`: **1 passed**, strict report: no skipped tests or not-exercised steps. `packaged-session-smoke` is POSIX-only and skipped on win32 by design.
+
+### NOT RUN
+
+Silent install/uninstall on this machine (CI does it on a clean runner), native manual Windows interaction — PowerShell enrollment canary, the three reading modes, Settings five groups, display DPI — and T004/T008 Windows rows. The local Windows→WSL zsh harness needs its own fix before it can say anything about the adapter on this host.
+
+## 2026-10-27 — Session / Reader / fragment / navigation candidate
+
+Base: `e7dbf331` on `codex/recording-workspace-integration`. The preceding integration commit was already pushed before this slice. These results describe source builds with synthetic evidence, not a new installed release.
+
+### Scope / contracts
+
+- Source Session catalog reads the full stored project before grouping/paging (50 default, 100 maximum), newest activity first. The key includes project, capture binding, source kind, provider/shell and producer Session; no PID/text similarity fallback. Unknown Session identity remains available in All Sessions without fabricated grouping. Provider/source conditions use the shared SQL query engine.
+- I/O and Claude Code/Codex readers can select a Session. Reader and whole-Session export use the catalog's frozen dataset. Incoming events offer explicit refresh; refresh updates the selection boundary even when the selected Session is outside the first catalog page. An obsolete Load More response cannot overwrite the refreshed catalog. Failure retains the selected value and offers retry.
+- The same saved-content reader expands in place, traps keyboard focus, closes with Escape and keeps field/Find/window state. Hidden readers release expanded focus. Text selection maps to saved UTF-8 bytes; the main process verifies source version and fragment digest before marker creation. The marker stores canonical metadata and source `_causes`, not a duplicate plaintext excerpt. Selection over 16 KiB is explicitly refused rather than silently shortened.
+- Reopening a marker verifies and highlights the saved fragment. Unicode/emoji, CRLF and raw ANSI byte ranges are covered; split UTF-8, stale version, missing file, digest mismatch and foreign-project references fail explicitly. A one-byte fragment remains valid. Binary, rendered Markdown/normalized ANSI and cast coordinates are not claimed as implemented.
+- Primary navigation groups Dashboard, Activity, HTTP, Targets/Scope and Evidence, plus optional Terminal; shortcuts are Cmd/Ctrl+1–6 and Settings +9. Existing Targets/Scope and Screenshots/Loot/Bookmarks pages are reachable via tabs. Original-event Timeline and continuous Transcript remain real routes in the command palette/evidence links pending the full retirement gate; no compatibility alias or removed capability is hidden behind a renamed row.
+
+### Automated checks
+
+- Focused core anchor/Session/marker checks: 35 passed. Additional reader/catalog/error/keyboard/copy regression: 51 passed in six files. These include rejected marker writes leaving Event counts unchanged, snapshot paging, refresh-vs-paging races and preserving a selected Session on read failure.
+- One Electron journey passed for saved-body search beyond 16 MiB, Activity/source lookup, full-content Find, original Event/back, stdout/stderr, operation/Session export artifact readback, all reading modes, reader expand/Escape/Find preservation, selected text→marker→verified source highlight, Session pinned during a late arrival→explicit refresh→three-event artifact, Evidence/Targets tabs, and native 800×600/150% zoom. The six chrome-selection cases also passed. Locator mistakes in the new journey were corrected and only the failed journey was rerun; there was no automatic retry.
+- The first unrestricted full unit run identified an outdated guard expecting at least nine primary Sidebar entries. The guard now discovers all route types, so secondary list pages retain keyboard-contract coverage instead of reducing the required count. The restricted run before it had stalled without test results and was stopped; it is not counted as a pass. Final results and native inspection follow below.
+
+### Remaining boundaries
+
+This slice completes T037–T039, not the entire Spec. Raw AI JSONL/general attachment full-text indexing, complete C2/C3 parity across every reader, transformed/cast anchors, source fault/platform matrices, installed-package acceptance and five-user task measurements remain open. Primary grouping does not authorize deleting the still-needed original-event or continuous Transcript implementations.
+
+### Final results / native follow-up
+
+- Ordered typecheck, Spec, architecture and i18n gates passed. Final full unit run: **4,364 passed / 28 skipped** in 123.08s. Subsequent local Reader keyboard refinements passed 15 focused UI/copy checks and typecheck/build; the later App return-state correction was additionally checked by the affected Electron journey and native interaction rather than another full unit run.
+- **10 distinct Electron cases passed** across chrome-selection (6), saved-content/Session/fragment/export (1), query contract (1), continuous Transcript (2). The query test now waits for the actual read-state completion and checks the exact one-row result; a parse explanation is not proof the debounced query finished. After the native return-state fix, only the affected saved-content journey reran and passed (11.6s), now asserting its query survives Evidence/Targets navigation.
+- One isolated source-build App, synthetic Shell/Claude data, Traditional Chinese: selected the terminal Session via the native dropdown; opened saved stdout, typed content Find, expanded the same reader, used Cmd+F to select its content search and Escape to return with text/window preserved. Selected Claude Code and its separate AI Session. Used macOS Window > Move & Resize > Left, then increased Electron zoom until the Sidebar became a rail. Selectors, reading controls, status and source content fit; no claim is made about exact zoom percentages from the native menu steps.
+- Checked Evidence tabs (Screenshots/Loot/Bookmarks), Targets/Scope tabs, and Left-arrow selection/focus. Native inspection exposed a real loss of Activity mode/Session on ordinary cross-workspace navigation. App now retains the visited workspace for the same project and unmounts on project change; hidden readers remain inactive. Rebuilt and reloaded this **same** App, then confirmed AI mode and the selected Session survived Evidence→Activity. No second native App launch was needed for that fix.
+- Native screenshots: `native-session-reader-expanded.png`, `native-session-ai-narrow.png`, `native-session-return-preserved.png` in ignored `dist/uiqa-workspace-20261027/`. They remain local and are not public fixtures. Quit the isolated App via Cmd+Q (`App quit`); no production project, shell profile, CA trust or system proxy preference was edited.
+- T040 is complete for this bounded slice. Spec remains Draft, with the explicitly listed compound/platform/parity gates still open. These results do not describe a distributed installation package or a public release.
+
+## 2026-10-27 — complete saved-content delivery
+
+Base `97d66465`, same candidate branch. T041 is complete for saved Event fields, not for the whole C3 contract.
+
+- Added bounded whole-version clipboard copying (1 MiB UTF-8 maximum) and native file delivery. Existing window Copy remains a distinct operation. Binary is saved as original bytes rather than the reader's base64 window. Source hash/version and current project are rechecked; cancel is not an error or success delivery. Existing files are not overwritten, and destinations inside the source project are refused. Explicit failures remove only the file this operation still owns, not a replacement created by somebody else.
+- Tests started RED on the two missing delivery functions. Typecheck, Spec, architecture and i18n gates passed, then full unit suite **4,369 passed / 28 skipped** (141.20s). Final focused checks passed **27 cases**, including injected write failure after creation, version change, project switch during transfer, clipboard failure, dialog cancel and unchanged visible reader content after clipboard refusal. Production build passed.
+- The existing one-App Electron journey passed in **10.1s**. It refused the 17 MiB clipboard transfer with an actionable limit, saved the full version, and compared every byte against the original synthetic body. Only the native destination dialog was stubbed in that automated case; content IPC, validation, file writes, Session/fragment/export flow and native resize remained real.
+- Separate native CUA inspection used one isolated source-build App and synthetic Shell output. Opened the real macOS Save dialog, canceled, confirmed the original reader remained available, reopened, selected `/private/tmp`, and saved a uniquely named text file. The App showed the actual saved path. Filesystem readback confirmed exactly `synthetic-output\n` (17 bytes), mode `0600`. No production evidence or user file was overwritten. AX incorrectly marked the native Save control disabled while its rendered primary button was operable; the successful native click, app completion and filesystem readback establish the result.
+- Used macOS Window > Move & Resize > Left and increased zoom; source selection, Find, Copy, Save and source text remained reachable. Captured `native-source-save-controls.png` in ignored `dist/uiqa-workspace-20261027/`, inspected directly, and quit the isolated App. No shell profile, system CA or system proxy preference was modified.
+- NOT RUN: Windows/Linux native Save-dialog acceptance, abrupt-process-termination cleanup, all normalized/cast readers, general attachment/raw-AI full-text indexing and broader Spec/platform/user-study gates. A locally saved field is not a sanitized delivery bundle, and a partial capture remains partial.
+- Final error-copy cleanup distinguishes a destination write failure from a source read failure; its retry/location guidance and preserved reader passed 14 focused UI/copy checks. Typecheck, three gates and production build passed after that copy-only refinement; the App was not reopened for it.
+- Publication review follow-up: destination identity uses BigInt filesystem stats, preserving full device/inode precision. The real-file fault case now replaces the destination after the first chunk and verifies a changed result while the replacement's bytes survive cleanup. All 17 core content cases passed; this does not stand in for Windows/Linux native-dialog acceptance.
+
+## PR #450 — first remote checks and test-contract repairs
+
+Head `2d80a94a`: macOS and Ubuntu unit/build jobs and Windows install smoke passed. Windows unit failed only because the route-inventory parser assumed LF blank lines; Linux installed smoke passed five cases but failed the Session case on a global text locator matching both retained Activity content and the Raw Events row. E2E was skipped behind the Windows unit failure, so it was not counted as passed.
+
+- Route discovery now accepts LF and CRLF and explicitly tests both; it retains all secondary-route keyboard coverage and the minimum-count guards. The local complete suite passed 4,371 cases / 28 skipped after those cases were added.
+- Installed Session assertions wait for query completion and target the actual raw-result options, still checking each of the five PTY outputs. Built a separate ad-hoc-signed macOS arm64 `.app` under ignored `dist/pr450-smoke-candidate/`, verified its real packaged resources, and passed this packaged Session/automatic Zsh/profile restoration case in 11.2s. This candidate has the same product code as the head plus test-only working changes; it is not a public or notarized release.
+- A focused search/navigation batch found the related external-Session fixture's old numeric shortcut and a palette invocation while a text input still held focus. The helper now moves focus to the actual active Sidebar control before invoking the palette, respecting the existing typing guard rather than changing it. Standalone AI Transcript assertions scope to its visible body. The four affected external PTY / Claude / Codex / privacy cases passed together in 33.2s; personal-traffic visibility also passed in the initial batch.
+- These repairs change test routing/locators/newline handling, not capture behavior or the product keyboard contract. The first CI failure is preserved here, and the next remote head must be assessed independently before readiness or merge.
+- Second remote head `e240abc6`: all three unit/build jobs and both installed package smoke jobs passed. Full E2E ran and reported 157 passed, 7 skipped, 1 not run, 2 failed: the project shortcut journey still expected the retired primary route order, and the bookmark matrix assumed a fixed 80px position after repeated native resizes and Playwright auto-scrolling the first row. Updated the shortcut expectations to all six current workspaces plus pinned Settings. The bookmark matrix now keeps the same fourth bookmark/draft, establishes a reachable nonzero position at each narrow size, and compares the actual position before opening detail with the position after returning; no tolerance, skip or product behavior was changed. Local shortcut/project journey passed all three cases, and the full bilingual 120-layout matrix passed in 30.9s. New-head remote checks remain required.
+
+## 2026-10-28 — Windows native acceptance of the internal candidate (T043)
+
+Host: Windows 11 Pro 26300 x64, two displays, the RedLog window on the 125% one. Installed from PR #448's **Windows install smoke** artifact, not a local build.
+
+- First pass, head `97775fd6`: CI run `40481761792`, build `1ab280ca` (`refs/pull/448/merge`), `RedLog.Setup.0.18.3.exe` SHA-256 `e9128cde42caec3c7ae45940ef90df526b77ff3d26ee09a23a7af6f384f25aa3`.
+- Recheck, head `af88b238` (the fixes below, plus #449 and #450 merged in): CI run `40618912665`, build `98e1814c`, SHA-256 `6444b183b5bf0b1267ed75c39b821d0885388ef6a9338eeb71f01f3341e24b63`; installed with `/S` over the running first-pass install, which the installer closed itself.
+
+Driven through the UI Automation tree (Open Computer Use) on the real desktop, with the operator typing the PowerShell commands. Synthetic project `spec064-acceptance` only; the user's own profile was backed up first, and no system proxy or CA was changed (`ProxyEnable=0` throughout).
+
+### Passed
+
+- Install and first run: project created and opened; Settings opened with no first-run error.
+- PowerShell enrollment: Settings installed the prompt hook into the pwsh profile; the operator ran the canary `Write-Output redlog-ok-895e0a99` in a new pwsh window and the panel turned verified. A follow-up command with stdout, stderr, `cmd /c "exit 7"` and `$LASTEXITCODE` was recorded with its command line, cwd and exit status. PowerShell output is not captured by default, and I/O says so ("未捕獲輸出") rather than showing it empty.
+- Reading modes, project `spec064-acceptance`, query `acc-stdout`: Activity listed the operations and opened the source event; I/O showed 2 round trips; AI conversation showed its empty state ("尚未捕獲任何內容…"); raw events listed the 4 events with the shell facet.
+- Settings in five groups (擷取來源, 專案與範圍, 資料與隱私, 介面與操作, 進階與系統), each page opened; search found fields by label and hint (`HUD`, among others).
+- DPI: maximized on the 125% display, a UIA sweep found no element outside the window, in Activity, Settings and the reading modes.
+- Quit from the tray asked for confirmation (live sources listed). "停止並結束" ended every RedLog process and closed the API port. A first attempt left the app running, and a repeat with that button explicitly named quit it; treated as the "留在背景" button, not a defect.
+- Restart: the project picker listed `spec064-acceptance` (40.2 MB); reopening it showed 677 events (669 before quit, plus lifecycle events) and the same 4 `acc-stdout` hits.
+- Upgrade in place: `/S` over the running install closed it, kept the project, and the new build showed Codex's five primary workspaces.
+
+### Defects found, fixed, rechecked on the installed build
+
+- **Each PowerShell command listed twice in Activity** (`其他事件`, one per start/end). The prompt hook sent neither a source session nor a command id, so nothing could pair them. Fixed in `c559dfe8` with `test/powershell-hook-pairing.test.ts` (RED first, on pwsh 7 and Windows PowerShell 5.1). On build `98e1814c`: two commands showed as "2 個操作 · 命中 4 筆事件", each a `指令操作` with 2 events.
+- **HUD settings hints named the macOS menu bar and ⌘⇧P, and settings search offered the Dock option** on Windows. Fixed in `471cbc88`. Rechecked: both hints name the tray and Ctrl+Shift+P, and a search for `HUD` returns no Dock, ⌘ or menu-bar entry.
+- **The HUD's own hide button and click-through hints said menu bar on Windows** (found after restart; the English hide button said tray on macOS). Fixed in `af88b238` with a per-platform overlay test (RED first). Rechecked: "隱藏 HUD(從系統匣重新開啟)" and "…按 Ctrl+Shift+P 或用系統匣選單還原".
+- **An upgrade left an enrolled shell on its old hook.** The profile dot-sources `~/.redlog/shell-hook.ps1`, a copy written at install. After the `/S` upgrade it was still the first-pass hook with no `command_id`, and Settings read "已安裝". Expanding "驗證／修復" reruns the install (`RecordTerminalFlow` → `hooks.install`) and rewrote it — which is why the pairing recheck above already ran on a current copy — but nothing after an upgrade says to do that. The same holds for bash/zsh. Fixed in `22c972e0` with `test/hook-refresh.test.ts` (RED first): at launch, before any terminal opens, every copy an rc or profile already sources is rewritten when its bytes differ from the bundled hook; nothing is enrolled, a current copy is untouched. Rechecked as a real upgrade: put the pre-fix hook (`97775fd6`) back as the copy, installed CI run `40622149829` (build `4e97c897`, SHA-256 `ea6d7ab73032485b52d8e3d87211d76f9d3ee1aa18500cbc1f8836fff865e376`) with `/S` — copy still stale — then launched: the copy matched the bundled hook byte for byte. A WSL distro has no copy to refresh: its rc sources the hook inside the install directory, which an upgrade into the same directory rewrites in place. A line left pointing at another directory is T047.
+
+- **The main window stayed hidden on every launch not restored maximized.** First seen after each `/S` upgrade, then reproduced with no installer: a force kill and a relaunch, a saved state with `isMaximized:false`, and no state file at all all stayed hidden; `isMaximized:true` showed. So the upgrade and the unclean exit were incidental — the launches that showed were maximized, and Electron's `maximize()` shows a window itself. Over CDP the hidden renderer had loaded the project picker but recorded no paint entry, and `requestAnimationFrame` never ran, so `ready-to-show`, which the window waited on, never fired. `--disable-gpu` showed the window; `--disable-features=CalculateNativeWinOcclusion` did not. Host GPU: Intel Iris Xe 32.0.101.7088, GPU compositing and DirectComposition on, Windows 11 26300. Fixed in `905c49b7` with `test/window-show.test.ts` (RED first): still shown on `ready-to-show`, and also 500 ms after the page finishes loading if still hidden. Rechecked on CI run `40625462219` (build `515c74f8`, SHA-256 `f8b9c1ab231ed4d50ec3e2a94ccc868dfa063593cc27e500351e2a71a56a9ef8`): a `/S` upgrade then a launch with `isMaximized:false`, and a launch with no state file, both showed the rendered project picker by themselves. Whether other Windows hosts never paint a hidden window is not known; the fallback does not depend on it.
+
+### Local gates for the fixes
+
+Typecheck, `verify:specs`, `verify:architecture`, `verify:i18n` passed on each commit. Full unit on Windows after #449: **4,266 passed / 1 failed** and **4,265 / 4**; every failing file passed alone (96/96) and none was touched here. `mark-assets` failed in both full runs but never alone: load-sensitive, not counted as a pass. With the hook refresh: **4,273 passed / 0 failed / 147 skipped**; with the window fix, **4,277 / 0 / 147**. CI's first run of `hook-refresh` failed on ubuntu only because ext4 returned a set mtime as `…529.999` ms; fixed in `79f71856`, and 2,000 whole-second round-trips on ext4 in WSL had no mismatch.
+
+### NOT RUN
+
+Uninstall on this machine; the Windows output pack (PowerShell stdout/stderr); Claude Code/Codex capture on this host (it would read real transcripts); HTTP capture through the managed proxy; the formal T004/T008 Windows rows (UX-01–05, UX-13/14); a 100% or 150% display; e2e for the integrated head beyond CI.
+## 2026-10-28 — bounded Reader / source-settings closeout (T046)
+
+Base: merged main `b9284706`; closeout branch `codex/ui-closeout`.
+
+- Saved-content controls show the explicit scope/redaction boundary before Save.
+  Opening the saved Reader hides the inline output only; command and exit status
+  remain visible, and closing the Reader restores the inline output.
+- Commands and terminals exclude mitmproxy. Browser and HTTP capture retains its
+  optional setup and teardown, read failure/retry and existing preparation flow.
+  Settings search indexes the relocated manual controls as well as their label.
+- Ordered typecheck, Spec, architecture and i18n gates passed. Full unit suite:
+  **4,387 passed / 31 skipped**, 435 passing files / 6 skipped (126.03s).
+  The initial restricted run stalled in terminal fixtures and was stopped; only
+  the subsequent unrestricted run is counted. Log:
+  `/private/tmp/redlog-ui-closeout-unit-native-20261028.log`.
+- Production build passed. Two affected Electron journeys passed **2/2 (14.7s)**:
+  saved-content search/byte-for-byte 17 MiB Save/Reader toggle/command and exit
+  preservation at native 800×700 and 1600×1000; settings in both locales at
+  800px and zoom 1/1.5/2, including relocated proxy setup and teardown. Desktop
+  and narrow captured screenshots were inspected. Only the native destination
+  picker was stubbed; IPC, content validation and file writes were real. Log:
+  `/private/tmp/redlog-ui-closeout-e2e-20261028.log`. Node SQLite was restored and
+  an in-memory query passed after the Electron run.
+- This closes the three requested issues only. No refreshed installation package,
+  Windows/Linux native-dialog acceptance or wider Spec parity completion is
+  claimed. No real shell profile, CA trust or system proxy setting was changed.
+
+### PR #452 — responsive test synchronization
+
+Initial head `8f9222ee` passed macOS/Ubuntu/Windows unit/build and Linux/Windows
+installation smoke. Full Ubuntu E2E passed 159 cases with 7 prerequisite skips,
+but the settings journey selected the old compact dropdown while Normal scale's
+ResizeObserver update replaced it with the category list. The trace identifies
+the detached control, not a source/Reader failure. That transition now waits for
+the real category control before navigation; no product code, timeout, assertion
+or skip changed. The sole affected local journey passed **1/1 (7.3s)** in both
+locales at all original zooms. Log:
+`/private/tmp/redlog-ui-closeout-responsive-e2e-20261028.log`.
+
+## 2026-10-28 — WSL hook line for another build (T047)
+
+A WSL distro is enrolled with `# RedLog WSL hook` and `source "<install dir>/resources/hooks/shell-<shell>-hook…"` in its rc. That file is the bundled hook itself, outside `app.asar` (checked in `dist/win-unpacked/resources/hooks/`), so an upgrade into the same directory updates what the distro runs; there is no copy for T044 to refresh. What could go stale is the path. Status and install both asked only whether the rc mentioned `shell-<shell>-hook`, so a line for a build that lived elsewhere — another install location, a dev checkout — read as installed, and install (also what 驗證／修復 runs) answered "already installed" without touching it.
+
+Both now compare the whole line with the current path; a line for another build is not-installed, and install removes it and writes the current one, leaving the rest of the rc as it was. `test/wsl-hook-rc.test.ts` (RED first: 2 of 4 failed, `installed` for the other build's line and the old line left in place) runs every `wsl.exe` call in a real bash against a temporary HOME.
+
+Probing that path found a second fault before it shipped. After `wsl.exe -d <distro> --` the rest of the command line is parsed again by the distro's default shell, so `$1` and `$HOME` are expanded before the inner bash runs — from Node on Ubuntu 26.04, `bash -c 'echo $1' redlog one` printed nothing behind `--` and `one` behind `-e`. The scripts take their rc, path and shell as positional arguments, so they run with `-e`, and the test pins that flag because its fake cannot reproduce the outer shell.
+
+Real distros: the shipped scripts, spawned as `wsl-manager` spawns them, against a throwaway rc under `~/.redlog-rc-check/` (the distro's own rc files untouched; directory removed afterwards), with an old line whose path holds a quote and a space (`/mnt/c/Users/o'brien/Old RedLog/…`). On **Ubuntu 26.04** and **kali-linux** (default shell zsh): status `not-installed` → install `installed` → one `# RedLog WSL hook` and the current `source` line, the alias and `EDITOR` lines kept → status `installed` → a second install `present` with the rc unchanged.
+
+Not covered: enrolling through the app's own UI in a distro, and zsh rc lines (same scripts, `$3` selects the name).
+
+Gates: typecheck, `verify:specs`, `verify:architecture`, `verify:i18n` passed. Full unit on Windows: **4,283 passed / 1 failed / 147 skipped**; the failure was `mark-assets`, which then passed alone (35/35) — the load-sensitive file noted above, not touched here.
+
+## 2026-10-28 — search coverage / T012, T013, T048
+
+Scope: C2／CT-03–04、FR-015–021／047。Spec 064 保持 Draft。此批只完成搜尋覆蓋，不代勾 T015 的整體 S2 效能／驗收、C3/C4 全閱讀面／轉換座標、來源平台與五人任務。
+
+### Implemented / boundaries
+
+- 已保存 UTF-8 附件可全文搜尋並以共用 Reader 讀回，核對專案副本 size／SHA-256；不追讀外部原路徑。AI JSONL 只讀來源 Event 確認的專案 prefix，各 dataset 每檔只索引最新確認版本；capture-start／未確認尾端 pending，binary 不解析。小型 inline base64 與 Reader 共用解碼，超過既定 16 KiB encoded 邊界明示 limited。
+- 來源覆蓋區分 events／body／artifact／raw 的表示、版本、bytes、條件及精度。Raw 缺逐訊息 metadata 的條件排除原文匹配並回 unsupported；原 Event 仍正常求值。詳細條件與限制見 C2 契約及 canonical `docs/domain/SPEC-search-query-semantics.md`。
+- Event／Activity 文字查詢固定 dataset／coverage revision；翻頁與 count 同邊界，範圍外新資料不混入，範圍內來源失效要求 refresh。Cast 分開保留自己的 revision／byte coverage，既有 50 筆顯示上限與條件排除仍明示，不列入 Event count。
+- Cast 僅索引完整行、版本綁確認 prefix 與實體 part raw byte range。開啟命中核對版本；同大小改寫、缺檔及清理移除舊全文，保留無全文的 unavailable metadata。剛建立／第一行尚未完成是 pending；完整壞 JSON／UTF-8 為 failed，超限 unsupported。保留既有 60 MiB 檔案上限，單行緩衝超過 1 MiB 亦 unsupported。
+- 更新雙語搜尋範圍說明及 CHANGELOG；完整覆蓋不新增常駐說明列。
+
+### RED → GREEN
+
+- 保存附件／確認 raw prefix、來源改寫／未確認尾端、inline base64、raw retention、累積 snapshot 去重與舊 dataset 先以真實暫存檔／SQLite 重現，後接共用驗證讀取及現有 FTS。
+- Cast 同大小改寫、跨實體 part 的版本讀回、CRLF／中文 offsets、未完成尾端、跨 chunk AND、frame 切點誤造 token 邊界先失敗。完整回歸亦找到循環 import 初始化讀取 `BODY_REF_FIELDS` 的問題，已延後到呼叫時求值；附件／匯出相關三檔重跑通過。
+- 缺檔清理後 coverage 假就緒：`/private/tmp/redlog-search-cast-missing-red.log`；保留 unavailable metadata 後相關回歸通過。空檔／未完成第一行誤報 failed：`/private/tmp/redlog-search-cast-start-red.log`，修正 pending 後通過。
+- 最終相關回歸 **7 files／333 passed**：http-body-search、cast-index、activity-query、search-pagination、read-state、query-text-matching、query-page。Log：`/private/tmp/redlog-search-coverage-final-focused.log`。
+- Ordered typecheck → verify:specs → verify:architecture → verify:i18n 通過；build 通過。全套先於最後邊界修正通過 **4402 passed／31 skipped**（435 passed files／6 skipped），log `/private/tmp/redlog-search-coverage-verified-unit.log`。
+- 最終候選全套 **4402 passed／1 failed／31 skipped**（`/private/tmp/redlog-search-coverage-final-all-unit.log`）：唯一失敗是未修改的 bash-redlog-command PTY 出現 `child setpgid: Operation not permitted` 額外訊息，符合 CLAUDE.md 已知偶發形狀。依規範單獨重跑整檔 **13 passed**（`/private/tmp/redlog-search-coverage-pty-rerun.log`）；不將重跑結果寫成全套第一次即綠。
+
+### Operational verification
+
+- 最終 source build 的 macOS Electron 同一 App 流程 **1 passed／16.1s**，log `/private/tmp/redlog-search-coverage-final-e2e.log`。除既有 17 MiB body／Reader／Session export 成品讀回外，實際走 UI 匯入文字附件 → 搜尋 → Reader 原文；以合成 raw snapshot 確認 hash／bytes → 確認字串命中並讀回完整 prefix → 未確認尾端零命中但 pending；合成 cast 完整 frame 命中／開啟 → 未完成 frame 不命中 → 改寫後開啟新版本。
+- 展開新的範圍說明，原生 800×700 無整頁橫向 overflow；既有流程亦涵蓋 1600×1000 與高縮放。已查看 `test-results/http-body-search-Search-op-c05e0-ce-without-losing-the-query/` 下 raw／cast／narrow coverage 截圖。
+- 只替代 OS 檔案選擇對話框；copy、query、IPC、來源驗證、Reader 與 disk 實際執行。API seeded AI／cast fixture 不宣稱真實 AI 客戶端或 PTY producer 擷取驗證。測試 home 與檔案獨立，不改正式專案／profile／CA／proxy。
+- Electron 後已還原 Node SQLite。此批未重新打包、未做其他 OS／安裝版驗收，也未提交／push／建立 PR／合併；分支 `codex/search-coverage`，單一 primary worktree。
+
+### Workflow gates / convergence
+
+- Specify／Plan／Tasks：沿既有 064 的 C2 與使用者「先做搜尋覆蓋」，補增量計畫及 T048，未加入新引擎／producer／文件解析器。
+- Clarify：無新產品歧義，採既定已保存／確認 prefix、unsupported filters、binary 無 OCR 邊界。Checklist：沿 requirements 16／16 品質檢查，不當產品完成率。
+- Analyze：交叉核對 8 項 FR、CT-03／04、canonical query／Reader／retention 及四項增量設計；不改來源 Event 意義、不讓查詢／計數或 Reader 讀取不同版本。Constitution I–IV、VI–IX 已核對，V 的既有 export 選取流程未改。
+- Scoped Converge：執行 prerequisites，讀 spec／plan／tasks／constitution，核對 T012／T013／T048 的來源種類、版本、條件、分頁、清理及 UI 證據，**converged，無新增任務**。其餘已記錄未完成項目不重複開 task；這不是整份 Spec 064 converged。`.specify/extensions.yml` 不存在，沒有 hooks。
+
+## 2026-10-28 — uninstall removes enrolments; tray language (T049)
+
+**Uninstall left every enrolment behind.** The uninstaller keeps `~/.redlog`, so the PowerShell profile went on dot-sourcing the hook copy there for an app that was gone, and a WSL rc went on sourcing a hook file the uninstaller had just deleted. The NSIS `customUnInstall` macro (`resources/installer.nsh`) now runs the installed app once with `--remove-hooks` before the files go, and skips it when the uninstall is the hand-off of an upgrade (`isUpdated`). That run takes no window and no single-instance lock, removes every rc/profile line that sources a RedLog hook — judged by the line, not by whether the copy it names still exists, because the operator may have cleared `~/.redlog` first — and, in every WSL distro, this build's `source` line and its marker. Lines for another build, and the operator's own content, stay. RED first: `test/uninstall-removes-hooks.test.ts` (functions absent; then 1 of 4 for the deleted-copy case) and three removal cases in `test/wsl-hook-rc.test.ts`.
+
+Real run on this machine with a locally packaged installer from this branch (`npm run build` + `electron-builder --win nsis`, `npmRebuild=false`). `USERPROFILE` pointed at a throwaway home for the installer, the upgrade and the uninstaller — NSIS resolves the per-user Programs folder through it, so the app itself was installed there — with both PowerShell profiles holding a line of the operator's own plus RedLog's two lines, and Ubuntu 26.04's real `~/.bashrc` (byte copy taken first) holding the marker and the `source` line for that install directory:
+
+| Step | PowerShell profiles | Ubuntu `~/.bashrc` RedLog lines |
+|---|---|---|
+| enrolled | own line + RedLog's two | 2 |
+| `/S` install | unchanged | 2 |
+| `/S` install over it (old uninstaller runs with `--updated`) | unchanged | 2 |
+| `/currentuser /S` uninstall | own line only | 0 |
+
+Afterwards `~/.bashrc` was restored and hashed identical to before, the operator's real pwsh profile still hashed `34DCFF6F…`, no `Documents\WindowsPowerShell` appeared in the real profile, and no RedLog Uninstall entry remained. CI's Windows install smoke now writes the same profile lines before its uninstall and fails if they survive or the operator's line does not.
+
+**The tray menu was English in every language**, so a zh-TW operator chose "Quit" and then read a Chinese dialog. It now follows the text the renderer sends (`app:setTrayText`, as the quit dialog already did) and keeps the recording item's state when it rebuilds. The quit confirmation sets `noLink`, so Windows draws two plain buttons instead of command links; staying stays first, default and Escape. The first tray quit in T043 that did not quit was not reproduced and its cause is not known; this removes two ways to misread that dialog, not a proven fault.
+
+Not covered: the tray menu in the installed app (unit-tested only); zsh rc lines in a real distro; uninstall in a distro that is stopped and slow to start (each `wsl.exe` call is bounded at 10 s).
+
+Gates: typecheck, `verify:specs`, `verify:architecture`, `verify:i18n` passed. Full unit on Windows: **4,293 passed / 1 failed / 147 skipped**; the failure was `mark-assets` timing out at 15 s under load, 35/35 alone.
+
+## 2026-10-30 — the capture browser trusts the managed CA by itself (T050)
+
+**HTTPS in the capture browser needed a root certificate in the OS trust store.** On the installed v0.18.4, `https://example.com/` in RedLog's capture browser failed with `net::ERR_CERT_AUTHORITY_INVALID` and recorded nothing until the operator ran `certutil -addstore`. The capture browser is the one client RedLog launches itself, so it now trusts the managed proxy's CA by its public key: `--ignore-certificate-errors-spki-list=<base64 SHA-256 of the DER SPKI>` (`readCaSpki` in `managed-http-proxy.ts`), passed only for RedLog's own profile and only when the browser goes through the managed proxy. Chrome honours the switch only with `--user-data-dir`, which only that profile passes. Every other certificate is still checked, the operator's own profile is never pinned, and nothing is added to any trust store. RED first: `test/capture-browser-ca-pin.test.ts` (3 of 4 failed; the pin is checked against openssl's, not this code's).
+
+Real run on this machine from the source build (`npm run build`, Electron with `out/main/index.js`, a throwaway `HOME`/`USERPROFILE`, so mitmproxy generated a CA no store had ever seen): Chrome 156 launched with the pin, `https://example.com/` returned **HTTP 200** "Example Domain", and the record held `http_request_start` + `http_response` for `/` and `/s.js`, each pair under one `flow_id`. The CA was not added to the Windows store.
+
+**A check passed in the capture browser stopped proving trust.** Until now only `ignoreCertErrors` let the capture browser through without OS trust, and the caveat keyed on it alone — so with the pin, a capture-browser check would have read "✓ Verified" while curl still refused the CA. The attempt now records that it was opened in the capture browser; the caveat (reworded to the new reason) and the "Captured · CA unverified" label from `6ae52b1f` follow it. A check opened in the operator's own browser is unchanged. RED first: `test/capture-browser-check-caveat.test.tsx` (1 of 2 failed: verified, no caveat).
+
+Gates: typecheck, `verify:specs`, `verify:architecture`, `verify:i18n` passed (i18n: the two removed caveat strings are asserted nowhere). Full unit on Windows: **4,362 passed / 1 failed / 148 skipped**; the failure was `mark-assets` timing out at 15 s under load, 35/35 alone.
+
+Not covered: whether Chrome shows an "unsupported command-line flag" bar for the switch (the page screenshot does not include the browser's own toolbar); the installed package; macOS and Linux.
+
+## 2026-10-30 — capture gaps keep their project; HAR keeps stream-only flows (T051–T053)
+
+**A HAR dropped flows that had segments and no request or response (#461).** Entries were built from requests and responses alone, so approved SSE chunks or WebSocket messages for a flow whose request and response were never saved left the file with nothing said. A HAR entry cannot hold them without an invented method, status and timing, so they go in `log._redlog.partialFlows`: flow id, a URL only if a segment carried one, first observation, and the ordered chunks or messages with event ids and bytes, all incomplete. RED first: two orphan cases in `test/har-export.test.ts`, plus three that already held (request + chunks with no response; WebSocket with no end; no field when there is nothing to put in it). Through a real plan in `test/filtered-export.test.ts`: a time-range HAR resolved, a chunk added after the preview, executed, file read back — the chunk and a binary WebSocket message are there byte for byte, the later chunk is not. That test fails on the old exporter.
+
+**An event sent after its flow took the project active at send time (#459).** The pending-request table held time, method and URL, not identity, so the TTL sweep's `http_request_dropped` was bound by `_send_to_redlog` to whichever project was active then; `cookie_change` and a DNS answer, both sent after their flow, did the same. The pending entry now carries the flow's identity, and those three use their flow's; an empty one is sent empty, so a flow that began with no project is refused rather than bound later. RED first: `test/fixtures/mitm-identity-check.py` runs the production `RedLogAddon` without mitmproxy — A starts a request, B becomes active, the sweep runs — and the marker was B's. Now it is A's and nothing reaches B; a same-project marker still goes through; a project-less one is refused.
+
+**A refusal at the full send queue left only a log line (#460).** It is now counted per project and written to the spool, not the full queue, as `capture_gap` / `queue-full`: window start and end, exact refused events, body bytes the events declared (a lower bound), no URL, header or body. First refusal on disk at once, then at most one record a second, each counting only its own refusals; an open window is written when the queue recovers and on the addon's `done`; a write that fails is logged. RED first: `test/fixtures/mitm-queue-gap-check.py` (65th send refused, no record). Read back through the app's own path: the files the production functions wrote, replayed by `replaySpoolDirectory` into `ingest` on a real project database — deferred for project B, then in A with 1,004 refused events counted exactly and none of the URL, header or body.
+
+Gates: typecheck, `verify:specs`, `verify:architecture`, `verify:i18n` passed. Full unit on Windows: **4,387 passed / 0 failed / 148 skipped**.
+
+Not covered: the end-to-end fault injection both #459 and #460 ask for — a producer that outlives a project switch, or a queue held full under real load and then killed — in the running app; how the Timeline shows a `queue-full` gap; the ExportPlan preview text for partial flows.
+
+## 2026-10-30 — capture gaps reach the operator; acceptance against the real mitmdump (T054–T057)
+
+**A queue-full gap was recorded but not seen (#460).** A gap the addon could not write left a log line no screen read; the Timeline titled the gap `[capture_gap]`; a gap counted while recording was paused was replayed as a loss. The managed proxy now reads its own output for `capture gap not saved: N event(s)`, line-buffered across chunks, and keeps the count across restarts; the Capture Health card shows it on the HTTP(S) row and a system `capture_gap` (`gap-unsaved`) goes on the Timeline. Titles say "[gap] N HTTP events refused at a full proxy queue" or "delivery not confirmed". The spool drain judges a `queue-full` gap against the `recording_paused`/`recording_resumed` intervals: inside one pause it is dropped, across a boundary it is kept and marked `overlaps_pause`. RED first: `test/queue-gap-visibility.test.tsx`.
+
+**A HAR shipped changed sidecar bytes and left stream-only flows out silently (#461).** A sidecar body was read back without checking its recorded sha256; one changed on disk after the preview was exported as the event's own bytes. It now fails the export as `source-unavailable`. The only HAR the interface offers comes from the HTTP view, built from requests and responses, so a stream-only flow is in neither; its preview now counts the ones the view's filter would reach. A time-range HAR's preview counts the stream-only flows it carries, and do-not-export and scope masking apply to them. RED first, in `test/filtered-export.test.ts`.
+
+**Fault injection, mitmdump 12.2.3 on Windows (`e2e/capture-gap-acceptance.spec.ts`).**
+
+- #459. The app's own proxy is gone after an A → B switch; its late answer reached the client as a reset. An external mitmdump with the same addon outlives the switch; its late answer (body and `Set-Cookie` carrying a marker) reached the client with 200. A TTL sweep after the switch (`REDLOG_PENDING_TTL_SEC=3`) found an unanswered A request. B then held none of A's events, none of 11 files under B's project directory held the marker, and nothing was spooled for B. Both producers still delivered B's own requests. A same-project timeout left `http_request_dropped` in A. Answers refused at the switch are not recorded in A either: A keeps only `http_request_start` for them.
+- #460. Setup: send queue of 64 slots and 4 workers, an API held so the queue fills, 120 concurrent flows per phase.
+  - Paused: 176 refused → 3 gap files, 176 units, all dropped on replay.
+  - Spool unwritable: 176 refused → the proxy counted 176 from the real output.
+  - Recording, producer killed hard: 176 refused → 155 and 133 units written in two runs; 21 and 43 lost with the open window.
+  - Every client flow completed (200) in every phase. After reopen only the killed phase's gaps were on the project.
+  - A hard kill also loses the up to 64 events accepted into the queue but not yet delivered. Nothing records them.
+
+**Real app.**
+
+- Spool records in the addon's format were replayed on reopen. The Timeline shows both gap titles and no `[capture_gap]`.
+- The HTTP-view HAR preview shows "Stream-only HTTP flows not in this HAR (they stay on the Timeline) 1".
+- With the app's own mitmdump pointed at a held API and an unwritable spool, 120 flows all completed. The status reported `unsavedGapEvents: 176`, the card read "176 HTTP events lost at a full proxy queue and not recorded as a gap", and the Timeline got two `gap-unsaved` rows (175 + 1).
+
+## 2026-10-30 — an answer refused at a project switch is a gap in its own project (T058)
+
+**A had no record of what it was refused (#459).** Since T052 an event pinned to A and sent after B was opened is refused by `_identity_matches_active`, so nothing of A's reaches B. The refusal left nothing: A kept `http_request_start` and no word of why the answer was missing. It now leaves A a `capture_gap` with reason `project-switched`, written with `_write_spool_record` and never through the send queue, pinned to the event's own identity, with `gap_started_at`/`gap_ended_at`, `skipped_units` and the declared `skipped_body_bytes`, and no URL, header or body. It shares the `queue-full` batching (the first refusal at once, then one record a window per project and reason), with one difference: a send that succeeds ends a `queue-full` window, because the queue has recovered, but leaves a `project-switched` window to run, so B's traffic does not turn A's refusals into a file each. An event pinned to no project leaves nothing. An unsaved one logs `project-switch gap not saved`, which the managed proxy does not count against the project open now. The Timeline titles it "[gap] N HTTP events refused after another project was opened". RED first: `test/fixtures/mitm-switch-gap-check.py` (run by `test/mitm-switch-gap.test.ts`, which also replays its spool through the app's drain: none for B, 1005 units for A) and a title case in `test/queue-gap-visibility.test.tsx`.
+
+**Real mitmdump, `e2e/capture-gap-acceptance.spec.ts` #459, mitmdump 12.2.3 on linux (WSL kali, xvfb).** At the RED commit it failed on "nothing spooled for A". At the fix: A held 3 `project-switched` gaps for 3 refused events after it reopened, none carrying the marker, `owner=a-` or the host; B held no gap, none of A's events, and nothing in the spool. Both #460 cases still passed. On Windows the test could not start the app's proxy: Burp Suite held the default port 8080.
+
+## 2026-10-30 — a stream's end is judged by what was saved (T059)
+
+**A killed stream read as unverified, the same as a finished one (#291).** Every streamed response showed "completeness is unverified", whether its close was seen and every chunk saved, or the producer died mid-stream. A stream whose producer died before any close had no line at all: the line was on the response row, and there was no response row. The addon already reports what it observed at the close (`stream_chunks_observed`, `message_count_observed`, `stream_state`, `stream_not_queued_bytes`). It cannot know what was saved (`capture_delivery: "unknown"`), but RedLog can count it. `src/core/stream-completion.ts` puts the two together:
+- **end-observed**: an `ended` close whose observed count equals the distinct chunks or messages saved.
+- **known-partial**: an interrupted close, unqueued or truncated bytes, or fewer saved than observed. The line says how many are missing.
+- **completion-unknown**: no close row at all. The stream may still be open, or its producer was stopped first; the saved rows cannot tell which.
+
+Nothing new is stored. `queryStreamSegments` counts distinct `seq` and `message_count`, so a retried row is counted once. It reads through a new partial index on stream rows instead of scanning every scanner row. `HttpDetail` shows one line for the whole flow, on the request as well as the response, and falls back to the row-only wording if the lookup fails. Tests: `test/stream-completion.test.ts`, `test/stream-segments-query.test.ts` (which also checks the index is used) and four cases in `test/http-detail-tabs.test.tsx`.
+
+**Real app, the app's own mitmdump on Windows.** Two SSE streams of three events each went through the proxy. `/done` ended; `/open` was still open when mitmdump was killed with `taskkill /F /T`.
+- `/done` returned `end-observed`, 3 saved, and its detail read "Stream ended; all 3 segments saved."
+- `/open` kept its three chunks and its request but no response. It returned `completion-unknown` with `closed: false`, and its detail read "No stream end recorded. It may still be open, or capture stopped first."
+
+Not covered:
+- The up to 64 queued events a hard kill loses (T054–T057) are still not counted.
+- A stream whose chunks were all lost and whose close never came leaves only its request, so it has no line.
+
+## 2026-11-01 — what the send queue held when the proxy stopped (T060)
+
+**Events admitted to the send queue and not yet delivered were lost with no record (#291).** The addon admits up to 64 events (4 workers). On Windows every managed stop was `child.kill()`, which is TerminateProcess: an experiment with mitmdump 12.2.3 showed the addon's `done()` never runs, with or without `SIGINT`. On POSIX `done()` ran but only flushed the gap windows; the daemon workers dropped what was queued. Writing the events ahead is not an option: an unacknowledged event may only be spooled as a content-free gap.
+
+- **A bound on disk.** While anything is in flight the addon keeps `~/.redlog/inflight/<pid>-<ns>.json`. It holds pid, heartbeat, and per project the identity, an upper bound, and the first and last admission times. It holds no content. The marker is written before the event is queued, so a kill at any later point leaves a bound that covers it. The bound is rounded up to 8: 10 admissions write it twice. A 1 s heartbeat lowers it to the real count and removes the marker when nothing is in flight. The spool drain turns a marker whose pid is gone (or whose heartbeat is ten minutes old) into a `capture_gap` / `delivery-interrupted` / `capture_delivery: unknown` spool record for its project, then removes the marker. Replay then delivers it to that project only.
+- **An exact count when told.** `done()`, and a new private `/__redlog_stop` guarded by its own `REDLOG_PROXY_CONTROL_TOKEN` (the readiness token is served to anyone who asks), stop admitting. Events still queued are recorded exactly as `proxy-stopped` / `not-sent` and are not sent afterwards. The stop waits up to 2 s for sends under way, records the rest as `delivery-interrupted` (they may have arrived), and removes the marker. The managed proxy's stop now asks first. It kills at once on a refusal (an addon without the path answers 404), or after 3.5 s with no exit; `released()` still waits for the exit. Quitting the app still kills outright: a child left running would hold the port, and the marker covers it.
+- Both reasons are judged against pauses like `queue-full`, since RedLog refuses what arrives while paused. The Timeline titles are "[gap] N HTTP events not sent: the proxy stopped first" and "[gap] Up to N HTTP events may be missing: the proxy stopped while sending them".
+
+An adversarial review found four confirmed faults, each reproduced, and each now fixed with a test that fails without the fix:
+- A told stop recorded the queued events exactly but left the full bound on disk while it waited. A kill in that wait counted them twice. Now the bound drops to what is still sending as soon as the exact record is written.
+- The reaper wrote spool records before removing the marker, under a time-based name. A marker it could not remove, for example in a directory a root-run producer created, was reaped again every 30 s. Now the marker is claimed by a rename first, an unclaimable one is left alone, and spool names come from the marker.
+- A bound whose write failed was still taken as written in memory. A reader holding the file on Windows is enough to make the write fail. Now it is only remembered once it is on disk.
+- No test could catch a worker sending, during the stop's wait, an event already recorded as not sent. The fixture now takes one in that window. It also asserts at every enqueue that the bound on disk covers what is in flight.
+
+A quit inside an asked stop's grace now kills the child that is leaving: the timer that would have killed it dies with the app. Past the grace the kill is SIGKILL. On POSIX a SIGTERM only asks again for a shutdown already under way, so the 3.5 s bound did not hold if that shutdown hung.
+
+The e2e now keeps its own record at the API. At `1c237618`, in every run, the kill left 64 in flight: 4 POSTs reached the API and were never answered, and 60 were never sent. RedLog persisted this as one gap of "up to 64". Queue-full refusals still in the open window at the kill were not persisted (the #460 limit, unchanged): 4 of 176 on Windows, and 175, 0 and 78 of 176 in three Linux runs. With an asked stop, the 4 unconfirmed equalled the API's unanswered POSTs. One of four Linux runs of #459 failed at A's first start, before any stop, because port 6661 was held by something outside the test. The other three passed.
+
+RED first: `test/fixtures/mitm-stop-gap-check.py` (run by `test/mitm-stop-gap.test.ts`, which also covers the app-side reaper, its liveness rules and the pause judgment), four graceful-stop cases in `test/managed-http-proxy.test.ts`, and a title case in `test/queue-gap-visibility.test.tsx`. The four fixtures that load `_send_to_redlog` now load the in-flight functions too.
+
+**Real mitmdump 12.2.3, `e2e/capture-gap-acceptance.spec.ts` #291.** The API was held so all 64 slots filled, with 120 concurrent flows per phase.
+
+| | Windows | Linux (WSL kali, xvfb) |
+|---|---|---|
+| Hard kill | marker bound 64, reaped as one up-to-64 gap | same |
+| Asked to stop | 60 not sent + 4 unconfirmed, exited in 2,326 ms, marker removed | 60 + 4, 2,335–2,616 ms |
+| Signalled (`child.kill()`) | nothing ran; marker left with bound 64 | `done()` ran: 60 + 4, marker removed |
+
+The #459 and #460 cases still pass on Linux. #459 now finds the app's own proxy alive right after the switch: it is inside the asked stop's grace. A's late answer still reached the client as a hang-up, and B still held none of A's events.
+
+Not covered:
+- The rounded bound is an upper bound by design: a kill with one event in flight reads "up to 8" until the next heartbeat lowers it.
+- A marker is read only by a drain, which runs while a project is open. A gap for a project that is never reopened stays in the spool, like every other record.
+- The ingest path for a reaped gap in the running app is covered through `replaySpoolDirectory` in the unit tests. It is not covered by an app-level e2e.

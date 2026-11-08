@@ -1,0 +1,2173 @@
+import { resolveAgentCapture, agentTranscriptRoot } from '../core/agent-capture-policy'
+import { createOfficialAgentPluginManager } from '../core/plugins/official-agents'
+import { app, BrowserWindow, ipcMain, Menu, Tray, globalShortcut, dialog, screen, session, shell, protocol, powerMonitor } from 'electron'
+import { electronApp, is } from '@electron-toolkit/utils'
+import path from 'path'
+import { homedir } from 'os'
+import { createMainWindow, createOverlayWindow } from './windows'
+import { visibleWindowBounds } from './window-bounds'
+import { loadOverlayPosition, saveOverlayPosition } from './services/overlay-position'
+import { createTray, setTrayRecording, setTrayText } from './tray'
+import { AlertRuntime, type IPStatusShape } from './services/alert-runtime'
+import yaml from 'js-yaml'
+import { loadConfig, saveConfig, snapshotScope, readScopeFile, mergeInitialConfig, DEFAULT_CONFIG, RedLogConfig } from '../core/config'
+import { isPackMemberOn, isPackOn } from '../core/capture-packs'
+import { debugLog, debugLogPath, isDebugLogEnabled, setDebugLogEnabled } from '../core/debug-log'
+import { unsavedGapForProject } from '../core/unsaved-gap'
+import { diffSecurityConfig, describeOpsecDelta } from './config-audit'
+import { initDB, closeDB, getProjectDir, bindDBEngagement } from '../core/db/index'
+import { mkdirPrivate, restrictRedlogHome } from '../core/private-fs'
+import { insertEvent, queryEvents, queryEventById, getLootCount, lastRecordingSubtype, recordingStateRows, type RedLogEvent } from '../core/db/events'
+import { pivotsMayChange, type LastPivotAnswer } from './pivot-refresh'
+import { readActivePivots, type ActivePivot } from './active-pivots'
+import { isPauseJudgedGap, pauseIntervals, queueGapAgainstPauses } from '../core/queue-gap'
+import { inflightMarkerDirectory, reapInflightMarkers } from '../core/inflight-marker'
+import {
+  createBookmark, updateBookmark, getBookmark, listBookmarks, deleteBookmark, egressContext
+} from '../core/db/bookmarks'
+import { getActiveBrowserTab, setCdpPort, configureCdpMonitor, stopCdpMonitor, openBrowserTab } from './services/cdp-connector'
+import { isVerifyNonce, verifyUrl, clientLabel } from '../core/http-verify'
+import { httpVerificationState, type HttpVerificationContext, type HttpVerificationEvidence } from '../core/http-verification-evidence'
+import { HttpVerificationHistory } from './services/http-verification-history'
+import { QUICK_MARK_ACCELERATOR, HUD_PASSTHROUGH_ACCELERATOR, QUICK_SHOT_ACCELERATOR } from '../core/shortcuts'
+import fs from 'fs'
+import { eventBus } from '../core/event-bus'
+import { ScreenshotAgent } from './services/screenshot-agent'
+import { LootDetector, listLootRules } from '../core/loot-detector'
+import { startAnchorLoop, stopAnchorLoop, verifyRandomSample } from '../core/chain-anchor'
+import { startNtpLoop, stopNtpLoop } from '../core/clock'
+import { configureRedaction, redactFields } from '../core/redaction'
+import { readProfileFile } from '../core/profile-file'
+import type { ProfileImportResult } from '../core/profile-import'
+import { runScopeRecompute,queryScopeObservationRows, queryLastScopeRecompute } from '../core/scope-recompute-run'
+import { activeObservationCount, invalidateObservationCount } from '../core/scope-observation-count'
+import { getVisibilitySignals, resetVisibilitySignalsCache } from '../core/visibility-signals'
+import { alertFloorFor } from '../core/alert'
+import type { ScopeSnapshot } from '../core/alert/policies'
+import { sweepRetention, sweepLoggedTier, sweepBodyStore, sweepBookmarks, sweepArtifactStore } from '../core/retention'
+import { resetBodiesDirCache } from '../core/http-body-store'
+import {
+  listProjects, listProjectEntries, projectsRoot, summarizeProjectScopes, createProject, openProject, deleteProject, renameProject,
+  getProjectDir as getProjectPath, ProjectMeta
+} from '../core/project-manager'
+import { startApiServer, stopApiServer, configureApi, setPrimaryOperator, getApiToken, setAppVersion, getApiPort, setCastProbe, onApiProjectOpen, onApiProjectClose } from '../core/api-server'
+import {
+  killAllTerminals, detachTerminalRecordings, resumeTerminalRecordings, setTerminalWindow, configureTerminal, configureTerminalProxy, recoverOrphanSessions, discoverShells,
+  getCastPosition, listTerminals, countProxiedTerminals
+} from './terminal-manager'
+import { markerForOpen } from '../core/recording-state-marker'
+import { quitImpact, quitDialog, defaultQuitText, parseQuitText, allowQuit, isQuitAllowed, type QuitText } from './quit-guard'
+import { runPreflight, type PreflightCommand } from '../core/runtime-preflight'
+import { readExecutionPolicy } from '../core/powershell-policy'
+import { shouldAutoStartHttpCapture } from '../core/http-autostart'
+import { isOnPath } from '../core/command-lookup'
+import { installDependency } from './services/dependency-installer'
+import { detectHooks, detectHooksAsync, getCachedHooks, getCaptureHookPath, invalidateHooksCache as invalidateHooksDetectCache, installHook, refreshInstalledHooks, removeInstalledHooks, uninstallHook } from '../core/hooks-manager'
+import { readTerminalMode, readClassOverlay, readTerminalApp, writeTerminalApp } from '../core/terminal-enrollment'
+import { compileClassPolicy, knownProfiles } from '../core/terminal-class'
+import { createToolDetector, rescanTrigger } from '../core/tool-detection'
+import { readContributedProfiles } from '../core/terminal-profiles'
+import { listWslDistros, getNetworkMode, installHook as wslInstallHook, uninstallHook as wslUninstallHook, runDiagnostics as wslRunDiagnostics, removeWslHooks } from '../core/wsl-manager'
+import { configureClipboardMonitor, startClipboardMonitor, stopClipboardMonitor } from './clipboard-monitor'
+import { configureFileWatcher, stopFileWatcher } from './services/file-watcher'
+import { configureProcessMonitor, stopProcessMonitor } from './services/process-monitor'
+import { configureConnectionMonitor, stopConnectionMonitor } from './services/connection-monitor'
+import { configurePowershellTranscript, stopPowershellTranscript } from './services/powershell-transcript'
+import { configureAgentTailer, stopAgentTailer, describeAgentSources } from './services/agent-tailer'
+import { readHookConfig, saveHookConfig } from './services/hook-config'
+import { configureOpsecMonitor, startOpsecMonitor, stopOpsecMonitor, setVpnAdapters, OpsecStateDelta } from './services/opsec-state'
+import { initPlugins, listPlugins } from '../core/plugins'
+import { configureIngest, ingest, ingestEvent } from '../core/ingest'
+import { resetCausesResolver } from '../core/causes-resolver'
+import { setTailerContributionSink, type TailerLike } from '../core/plugins/tailer-registry'
+import { registerAdapter as registerTailerAdapter, unregisterAdapter as unregisterTailerAdapter, registerSessionId, getRegisteredSessions, listAgentSessions, type TailerAdapter } from './services/tailer-host'
+import { applyLoginPath } from './login-path'
+import { getCaptureHealth, invalidateHooksCache, noteSampleBroken, clearSampleBroken, configureCaptureHealth, configureManagedProxyHealth, noteDbError, pendingSpoolDirectory, clearUnattributedCommands } from '../core/capture-health'
+import { launchBrowser, stopBrowser, isBrowserRunning, detectBrowser, onBrowserExit } from './services/browser-launcher'
+import { DEFAULT_BROWSER } from '../core/browser-defaults'
+import { managedHttpProxy, readCaSpki, type ManagedProxyStatus } from './services/managed-http-proxy'
+import { managedProxyUrl, isManagedProxy, proxyAlreadyOn, type CaptureEndpoint } from '../core/managed-proxy-url'
+import { whoHoldsPort, reclaimOrphanProxy, recordProxyOwner, orphanDepsFor, proxyOwnerFile } from './services/port-holder'
+import { detectLink, linkForDisplay, type NetworkLink } from './services/network-info'
+import { checkForUpdates, setUpdaterAirgap, setUpdateImpactProvider, getUpdateStatus, onUpdateStatus, cancelUpdateDownload, installReadyUpdate, setUpdateOutcome, takeUpdateOutcome, autoCheckEnabled, setAutoCheck, restoreUnfinishedUpdate } from './services/updater'
+import { readUpdateMarker, clearUpdateMarker, judgeUpdateOutcome } from './services/update-marker'
+import { recordUpdateOutcome } from '../core/update-anchor'
+import { isInsideDir } from '../core/paths'
+import { contentSecurityPolicy } from '../core/csp'
+import { backfillCastIndex, closeCastIndex } from '../core/cast-index'
+import { ProjectRuntime, type ProjectContext } from '../core/project-runtime'
+import { applyOperatorChange } from './operator-change'
+import { closeHttpBodyIndex } from '../core/http-body-index'
+import { drainInSlices, replaySpoolDirectory } from '../core/spool-replay'
+import { registerContextMenuIpc } from './context-menu'
+import { registerClipboardIpc } from './ipc/clipboard'
+import { registerDataExportIpc } from './ipc/data-export'
+import { RecentExportStore } from './services/recent-export'
+import {
+  registerOverlayIpc, setOverlayPassThrough, bindOverlayReleaseShortcut, stopOverlayMouseTracking,
+  configureOverlayState, handleIpExposedChange, startOverlayMouseTracking,
+  applyOverlayPassThrough, applyOverlayOpacity, isOverlayPassThrough
+} from './ipc/overlay'
+import { registerTerminalIpc } from './ipc/terminal'
+import { registerPluginsIpc } from './ipc/plugins'
+import { registerOperatorsIpc } from './ipc/operators'
+import { registerEventsIpc } from './ipc/events'
+import { registerChainIpc } from './ipc/chain'
+import { registerMarkersIpc, MARKER_TEXT_FIELDS, hudMarkerFields, hudDraftBelongsHere } from './ipc/markers'
+import { registerTargetContextIpc } from './ipc/target-context'
+import { registerArtifactsIpc } from './ipc/artifacts'
+import type { IpcContext } from './ipc/types'
+
+// macOS routes ⌘C/⌘V/⌘Q through the application menu, so the default menu has
+// to stay there. Windows and Linux don't — and RedLog draws its own title bar
+// (titleBarStyle 'hidden'), so Electron's default File/Edit/View menu bar would
+// sit inside the client area under it. Dropping it also skips building that
+// menu at startup (Electron performance checklist item 8).
+if (process.platform !== 'darwin') Menu.setApplicationMenu(null)
+
+// Windows text rendering: DirectComposition improves font clarity on low-DPI
+// screens; DirectWrite uses the native font rasterizer for crisper CJK glyphs.
+if (process.platform === 'win32') {
+  app.commandLine.appendSwitch('enable-features', 'DirectComposition,DirectWriteAntiAliasing')
+  app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion')
+}
+
+let mainWindow: BrowserWindow | null = null
+let overlayWindow: BrowserWindow | null = null
+let tray: Tray | null = null
+let forceQuit = false
+// One owned install per dependency, including the wait for login PATH.
+const dependencyInstalls = new Map<PreflightCommand, AbortController>()
+// Which open a timer or a late `.then` belongs to, and the stop that reaches
+// all of them. The chain sample, the logged-tier sweep and the spool drain
+// are its timers; stopProject closes it first. docs/DESIGN-project-runtime.md.
+// It is also the one place an event's identity comes from: `current()` is the
+// open's context, read when writing, so an operator changed in Settings is
+// the one recorded from the next write on. Once stopProject has closed it,
+// nothing here writes. And it is which project is open: `project()`, where a
+// module variable of its own used to be set and cleared at moments of its own.
+const projectRuntime = new ProjectRuntime()
+
+/** The open project's directory, or null when none is open. */
+function openProjectDir(): string | null {
+  const project = projectRuntime.project()
+  return project ? getProjectPath(project) : null
+}
+
+function managedProxyPort(config: RedLogConfig): number {
+  const fallback = DEFAULT_CONFIG.httpCapture.port
+  const port = Number(config.httpCapture?.port ?? fallback)
+  return Number.isInteger(port) && port >= 1024 && port <= 65535 ? port : fallback
+}
+
+function managedProxyHost(config: RedLogConfig): string {
+  const host = String(config.httpCapture?.listenHost ?? '').trim()
+  return host === '' ? DEFAULT_CONFIG.httpCapture.listenHost : host
+}
+
+function managedProxyEndpoint(config: RedLogConfig): CaptureEndpoint {
+  return { host: managedProxyHost(config), port: managedProxyPort(config) }
+}
+
+function publishManagedProxyEvent(subtype: 'http_proxy_started' | 'http_proxy_stopped' | 'http_proxy_failed', status: ManagedProxyStatus): void {
+  const open = projectRuntime.current()
+  if (!open) return
+  ingestEvent('system', {
+    subtype,
+    source: 'managed-http-proxy',
+    state: status.state,
+    proxy: status.url,
+    pid: status.pid ?? null,
+    error: status.error ?? null
+  }, open)
+}
+
+// One start at a time. Opening a project auto-starts capture, and a start from
+// the operator or the capture browser can arrive while that one is still
+// probing the port. The probe binds the port to test it, so two at once each
+// found the port held — by the other's probe — and both failed with no holder
+// named. Queued, the second finds the first's proxy up and returns it.
+let managedStartQueue: Promise<unknown> = Promise.resolve()
+function startManagedHttpCapture(): Promise<ManagedProxyStatus> {
+  const run = managedStartQueue.then(startManagedHttpCaptureNow, startManagedHttpCaptureNow)
+  managedStartQueue = run.catch(() => undefined)
+  return run
+}
+
+async function startManagedHttpCaptureNow(): Promise<ManagedProxyStatus> {
+  // Every failure below goes through `noteStartFailure`, so it reaches the
+  // status every surface polls. These used to return a failed status object
+  // that nothing recorded: the proxy's snapshot stayed `stopped`, and the
+  // dashboard, the capture card and the status strip all reported "not
+  // running" for an attempt that had been made and had a reason.
+  //
+  // It was survivable while starting capture was a button — press it, see
+  // nothing happen, press it again. It stopped being survivable when capture
+  // began taking itself up at project open: a port already in use now means
+  // an engagement that records no HTTP and never says why.
+  const projectDir = openProjectDir()
+  if (!projectDir) return managedHttpProxy.noteStartFailure('No project open')
+  // Each await below can outlast the project that asked: mitmdump takes
+  // seconds to come up. A switch in between stops the proxy, which resolves
+  // this start as `stopped`, and that used to be published as the next
+  // project's `http_proxy_failed` — a start it never attempted.
+  const opening = projectRuntime.current()
+  const stillOpen = (): boolean => opening !== null && projectRuntime.isCurrent(opening)
+  // mitmdump is spawned by bare name; look it up on the operator's PATH.
+  await loginPathReady
+  // A proxy just stopped — closing the last project stops it, and opening the
+  // next one auto-starts this — can still hold the port for a few hundred
+  // milliseconds, and the probe below would report our own outgoing process
+  // as the holder.
+  await managedHttpProxy.released()
+  if (!stillOpen()) return managedHttpProxy.status()
+  const addonPath = getCaptureHookPath('mitmproxy')
+  if (!addonPath) return managedHttpProxy.noteStartFailure('mitmproxy capture addon is disabled or missing')
+  const config = loadConfig(projectDir)
+  const current = managedHttpProxy.status()
+  const before = current.state
+  const endpoint = managedProxyEndpoint(config)
+  // Say what is holding the port before mitmdump does. Its own message is a
+  // multi-line startup dump that ends in a localised winsock error and a
+  // suggestion to pass `--mode regular@8082` — a mitmproxy flag, not a RedLog
+  // setting — so the operator was told neither what took the port nor that
+  // the port is theirs to change.
+  //
+  // #226: unless the answer is us. Starting capture and then launching the
+  // capture browser — which starts capture again, because that is how it
+  // guarantees the proxy is up before pointing a browser at it — reported
+  // RedLog's own mitmdump as the intruder and refused to launch the browser.
+  // `managedHttpProxy.start()` below already returns cleanly when it is
+  // running or starting; this probe just ran first and failed before reaching
+  // it.
+  if (!proxyAlreadyOn(current, endpoint)) {
+    let holder = await whoHoldsPort(endpoint)
+    // The holder may be RedLog's own mitmdump left behind by a force-quit or
+    // crash. That one is stopped, and the record says so; any other holder
+    // keeps the message below.
+    if (holder) {
+      const reclaimed = await reclaimOrphanProxy(endpoint, orphanDepsFor(proxyOwnerFile(homedir())))
+      if (reclaimed) {
+        if (opening && stillOpen()) {
+          ingestEvent('system', {
+            subtype: 'http_proxy_orphan_reclaimed',
+            source: 'managed-http-proxy',
+            proxy: `${endpoint.host}:${endpoint.port}`,
+            pid: reclaimed.pid,
+            description: `Stopped a mitmdump left running by an earlier RedLog (PID ${reclaimed.pid}) that held ${endpoint.host}:${endpoint.port}`
+          }, opening)
+        }
+        holder = await whoHoldsPort(endpoint)
+      }
+    }
+    if (!stillOpen()) return managedHttpProxy.status()
+    if (holder) {
+      // The event was already written here; what was missing is the status.
+      // An operator reading "stopped" has no reason to look for an event.
+      const status = managedHttpProxy.noteStartFailure(holder)
+      publishManagedProxyEvent('http_proxy_failed', status)
+      return status
+    }
+  }
+  const status = await managedHttpProxy.start({
+    addonPath,
+    port: endpoint.port,
+    listenHost: endpoint.host,
+    caPath: path.join(homedir(), '.mitmproxy', 'mitmproxy-ca-cert.pem')
+  })
+  if (!stillOpen()) return status
+  if (status.state === 'running') {
+    // The proof a later launch needs before it may stop this process as ours.
+    if (before !== 'running' && status.pid) {
+      void recordProxyOwner(proxyOwnerFile(homedir()), { pid: status.pid, host: endpoint.host, port: endpoint.port, addonPath })
+    }
+    if (before !== 'running') publishManagedProxyEvent('http_proxy_started', status)
+  } else {
+    publishManagedProxyEvent('http_proxy_failed', status)
+  }
+  return status
+}
+
+function stopManagedHttpCapture(record = true, graceful = true): ManagedProxyStatus {
+  const before = managedHttpProxy.status()
+  const status = managedHttpProxy.stop({ graceful })
+  if (record && before.state === 'running') publishManagedProxyEvent('http_proxy_stopped', status)
+  return status
+}
+
+const httpVerificationHistory = new HttpVerificationHistory()
+
+function verificationContext(config: RedLogConfig, status: ManagedProxyStatus): HttpVerificationContext {
+  return {
+    projectId: projectRuntime.project()?.id ?? '',
+    endpoint: managedProxyUrl(managedProxyEndpoint(config)),
+    caFingerprint: status.caFingerprint?.sha256 ?? null,
+    routing: JSON.stringify([config.httpCapture?.routeTerminals === true, config.browser?.proxy ?? '', config.browser?.ignoreCertErrors ?? DEFAULT_BROWSER.ignoreCertErrors]),
+    sourceInstance: status.sourceInstance ?? null,
+    running: status.state === 'running', failed: status.state === 'failed',
+    // The addon observes UA, not a trustworthy process/client identity.
+    clientIdentity: null
+  }
+}
+
+function httpCaptureStatus(): ManagedProxyStatus {
+  const status = managedHttpProxy.status()
+  const projectDir = openProjectDir()
+  if (!projectDir) return status
+  const context = verificationContext(loadConfig(projectDir), status)
+  try {
+    const evidence = httpVerificationHistory.read(projectDir).filter(row => row.projectId === context.projectId).at(-1) ?? null
+    return { ...status, verificationEvidence: evidence, verificationState: httpVerificationState(evidence, context) }
+  } catch {
+    return { ...status, verificationEvidence: null, verificationState: 'unknown' }
+  }
+}
+
+configureManagedProxyHealth(httpCaptureStatus)
+managedHttpProxy.onStatusChange((next, previous) => {
+  if (previous.state === 'running' && next.state === 'failed') {
+    publishManagedProxyEvent('http_proxy_failed', next)
+  }
+})
+// The addon could not write the gap itself, so its log line is all there is.
+// Put the loss on the Timeline too, where an export will carry it — in the
+// project the line says owns it, and only if that is the one open now (#507).
+managedHttpProxy.onUnsavedGap((gap) => {
+  const open = projectRuntime.current()
+  const data = unsavedGapForProject(gap, open)
+  if (!open || !data) {
+    console.warn(`[http-proxy] a ${gap.reason} gap of ${gap.units} event(s) for engagement ${gap.engagementId} could not be saved and its project is not open`)
+    return
+  }
+  ingestEvent('system', data, open)
+})
+
+const SPOOL_IDENTITY_PATH = path.join(homedir(), '.redlog', 'active-identity.json')
+
+// Rewritten on an operator change as well as at open: the shell hooks and the
+// HTTP addon stamp what they capture with whatever this file says.
+function writeSpoolIdentity({ engagementId, operatorId }: ProjectContext): void {
+  try {
+    mkdirPrivate(path.dirname(SPOOL_IDENTITY_PATH))
+    fs.writeFileSync(SPOOL_IDENTITY_PATH, JSON.stringify({ engagementId, operatorId }), { mode: 0o600 })
+  } catch { /* best-effort */ }
+}
+
+function clearSpoolIdentity(): void {
+  try { fs.unlinkSync(SPOOL_IDENTITY_PATH) } catch { /* already gone */ }
+}
+
+function readSpoolIdentity(): { engagementId: string; operatorId: string } | null {
+  try {
+    const raw = JSON.parse(fs.readFileSync(SPOOL_IDENTITY_PATH, 'utf8'))
+    if (typeof raw.engagementId === 'string' && typeof raw.operatorId === 'string') return raw
+  } catch { /* missing or malformed */ }
+  return null
+}
+
+// Timers and pty callbacks keep firing while the app tears down, and a
+// destroyed BrowserWindow is still non-null — send through here so a quit
+// mid-poll can't raise "Object has been destroyed".
+// Rest args, not one payload: `overlay:passThrough` sends (on, opacity) and the
+// second was being dropped silently, so the HUD never received the configured
+// pass-through opacity and fell back to its default.
+function send(win: BrowserWindow | null, channel: string, ...payload: unknown[]): void {
+  if (!win || win.isDestroyed()) return
+  try { win.webContents.send(channel, ...payload) } catch { /* window tearing down */ }
+}
+
+function toggleRecording(): boolean {
+  if (eventBus.paused) eventBus.resume('ui')
+  else eventBus.pause('ui')
+  return !eventBus.paused
+}
+
+// The marker fields an operator types or pastes, and therefore the ones that can
+// carry a credential — a URL with a session token in its query string is the
+// case this list exists for as much as a password in a note. Layer 4 can only mask a field that carries
+// detection spans (src/core/sanitize.ts skips an event whose `data.redactions`
+// is empty), so every marker producer runs `redactFields` over these before the
+// insert — otherwise `redlog-cli sanitize` reports success on a marker note and
+// ships the secret anyway.
+// MARKER_TEXT_FIELDS imported from ./ipc/markers
+
+// Opens the marker dialog in the main window — shared by the global shortcut,
+// the tray menu, and the HUD's "detailed" button. Steals focus by design: the
+// operator is about to type a title and notes.
+function triggerBookmark(): void {
+  // When the operator is in another app, what they want recorded is on screen
+  // NOW, before RedLog comes forward. Hold that frame; the marker claims it on
+  // save, and an abandoned marker leaves nothing behind (UI/UX audit F2).
+  // From inside RedLog there is nothing worth holding — the save hides
+  // RedLog's windows for its own capture instead.
+  const fromElsewhere = !BrowserWindow.getFocusedWindow()
+  const hold = fromElsewhere ? screenshotAgent.holdFrame().catch(() => null) : Promise.resolve(null)
+  void hold.then((heldFrame) => {
+    send(mainWindow, 'shortcut:marker', heldFrame ? { heldFrame } : {})
+    mainWindow?.show()
+    mainWindow?.focus()
+  })
+}
+
+// The HUD's "Add marker" form. Drops a marker straight into the chain without
+// raising the main window — a heads-up display should not pull the operator out
+// of what they are doing. The marker's time is `at`, taken when the operator
+// CLICKED "Add marker", not when the form was saved: filling in a title takes
+// seconds, and the marker is about the moment they reached for it. An empty
+// title is allowed and gets the time as its name, which is what a bare mark
+// has always been called.
+function addHudMarker(input: { title?: string; notes?: string; at?: number; bind?: string }): { ok: boolean; id?: string; reason?: 'project-changed' } {
+  const open = projectRuntime.current()
+  if (!projectRuntime.project() || !open) return { ok: false }
+  // A draft written while another project was open must not land in this one.
+  if (!hudDraftBelongsHere(input.bind, open.engagementId)) return { ok: false, reason: 'project-changed' }
+  try {
+    const f = hudMarkerFields(input, Date.now())
+    const event = insertEvent('marker', redactFields({
+      title: f.title,
+      notes: f.notes,
+      severity: 'info',
+      category: 'custom',
+      source_timestamp: f.source_timestamp,
+      source: f.source
+    }, MARKER_TEXT_FIELDS), open)
+    if (event) eventBus.publish(event, { bypassPause: true })
+    return { ok: !!event, id: event?.id }
+  } catch (e) {
+    noteDbError('hud-add-marker', e)
+    return { ok: false }
+  }
+}
+
+const WINDOW_STATE_PATH = path.join(homedir(), '.redlog', 'window-state.json')
+
+function loadWindowState(): { bounds?: Electron.Rectangle; isMaximized?: boolean } | null {
+  try { return JSON.parse(fs.readFileSync(WINDOW_STATE_PATH, 'utf-8')) } catch { return null }
+}
+
+/** True for an http(s) URL whose host is not loopback, link-local (incl. the
+ *  169.254.169.254 cloud-metadata endpoint) or an RFC1918 private range. Gate
+ *  for the plugin `net.fetch` egress (SSRF). Hostname-only — does not resolve
+ *  DNS, so a name pointing at a private IP is not caught, but the literal
+ *  metadata/loopback/private targets an attacker reaches for are. */
+function isPublicHttpUrl(u: string): boolean {
+  let url: URL
+  try { url = new URL(u) } catch { return false }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return false
+  const h = url.hostname.toLowerCase().replace(/^\[|\]$/g, '')
+  if (h === 'localhost' || h.endsWith('.localhost') || h === '::1' || h === '0.0.0.0') return false
+  const m = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/)
+  if (m) {
+    const a = Number(m[1]), b = Number(m[2])
+    if (a === 0 || a === 127) return false                 // this-host / loopback
+    if (a === 10) return false                             // 10/8
+    if (a === 169 && b === 254) return false               // link-local + metadata
+    if (a === 172 && b >= 16 && b <= 31) return false       // 172.16/12
+    if (a === 192 && b === 168) return false                // 192.168/16
+  }
+  return true
+}
+
+function saveWindowState(win: BrowserWindow): void {
+  try {
+    const isMaximized = win.isMaximized()
+    const bounds = isMaximized ? undefined : win.getBounds()
+    fs.mkdirSync(path.dirname(WINDOW_STATE_PATH), { recursive: true })
+    fs.writeFileSync(WINDOW_STATE_PATH, JSON.stringify({ bounds, isMaximized }))
+  } catch {}
+}
+
+let saveTimer: ReturnType<typeof setTimeout> | null = null
+function debouncedSaveWindowState(win: BrowserWindow): void {
+  if (saveTimer) clearTimeout(saveTimer)
+  saveTimer = setTimeout(() => saveWindowState(win), 500)
+}
+
+// v0.12.0: single alert runtime replaces the paired IPMonitor + ScopeMonitor.
+// Constructed with placeholder ids; real engagement/operator ids land on the
+// first `openProjectHandler` call via `alertRuntime.configure(...)`.
+const alertRuntime = new AlertRuntime({ engagementId: '', operatorId: '' })
+const screenshotAgent = new ScreenshotAgent()
+// In-app captures must not photograph RedLog (UI/UX audit F2): take every
+// visible RedLog window — main and HUD — off screen for the grab, then put
+// them back without stealing focus from where it was.
+screenshotAgent.setWindowHider(async () => {
+  const shown = BrowserWindow.getAllWindows().filter((w) => !w.isDestroyed() && w.isVisible() && !w.isMinimized())
+  const focused = BrowserWindow.getFocusedWindow()
+  for (const w of shown) w.hide()
+  // Give the compositor a frame or two to take them off the screen.
+  await new Promise((r) => setTimeout(r, 250))
+  return () => {
+    for (const w of shown) if (!w.isDestroyed()) w.showInactive()
+    if (focused && !focused.isDestroyed()) focused.focus()
+  }
+})
+const lootDetector = new LootDetector()
+
+/** Start or stop every optional capture source from the project's packs
+ *  (Spec 035): a pack runs only when the project turns it on and its bundled
+ *  plugin is active. Called on project open, on config save, and when a pack
+ *  plugin is enabled or disabled. Agent transcripts can hold unrelated work
+ *  from the operator's home directory, so nothing here defaults a pack on. */
+function applyCapturePacks(cfg: RedLogConfig): void {
+  const plugins = listPlugins()
+  // Per member, not per pack: the pack switch is the preset and `packMembers`
+  // records where the operator departed from it. An operator who wants process
+  // and connection monitoring but not their clipboard sampled all day should
+  // not have to choose between all four and none.
+  const on = (member: Parameters<typeof isPackMemberOn>[1]): boolean => isPackMemberOn(cfg, member, plugins)
+  configureClipboardMonitor({ enabled: on('clipboard') })
+  void configureFileWatcher({ enabled: on('fileWatcher') })
+  configureConnectionMonitor({ enabled: on('connectionMonitor') })
+  configureProcessMonitor({ enabled: on('processMonitor') })
+  void configurePowershellTranscript({ enabled: on('powershellTranscript') })
+  const manager = createOfficialAgentPluginManager(path.join(homedir(), '.redlog', 'plugins'))
+  const catalog = manager.list()
+  const agents = resolveAgentCapture(cfg, catalog, plugins)
+  configureAgentTailer({
+    integrations: agents.flatMap(a => {
+      const entry = catalog.find(p => p.agentKind === a.agentKind)!
+      const modulePath = manager.modulePath(a.agentKind)
+      return modulePath ? [{ agentKind: a.agentKind, modulePath, root: agentTranscriptRoot(entry, homedir(), cfg.agentTailer?.sources?.[a.agentKind]) }] : []
+    }),
+    enabled: agents.length > 0, enabledAgents: agents.map(a => a.agentKind),
+    ...(projectRuntime.current() ? { identity: projectRuntime.current()! } : {}), emitThinking: cfg.agentTailer?.emitThinking ?? false,
+    watchPathsByAgent: Object.fromEntries(agents.map(a => [a.agentKind, a.workPaths])),
+    activationStarts: Object.fromEntries(agents.map(a => [a.agentKind, a.startedAt])),
+    excludedSessionsByAgent: Object.fromEntries(agents.map(a => [a.agentKind, cfg.agentTailer?.sources?.[a.agentKind]?.excludedSessions ?? []])),
+    sessionStartsByAgent: Object.fromEntries(agents.map(a => [a.agentKind, cfg.agentTailer?.sources?.[a.agentKind]?.sessionStarts ?? {}])),
+    excludedPaths: readHookConfig().excludedPaths })
+
+}
+
+// Which command_ends need a recompute at all: see pivot-refresh.ts.
+let lastPivots: LastPivotAnswer | null = null
+function getActivePivots(): ActivePivot[] {
+  try {
+    const out = readActivePivots()
+    lastPivots = { projectId: projectRuntime.project()?.id ?? null, count: out.length }
+    return out
+  } catch { return [] }
+}
+
+// Active network link (Wi-Fi SSID / wired), read from local system tools. Cached
+// and refreshed on a timer so the (blocking-ish) shell-outs never sit on the IP
+// broadcast path; the last-known value rides along with every ip:status.
+let currentLink: { type: 'wifi' | 'wired' | 'unknown'; name: string } = { type: 'unknown', name: '' }
+// What detectLink read, before network.showWifiName decides whether the SSID
+// may reach a surface. Kept so turning the setting off applies at once.
+let detectedLink: NetworkLink = { type: 'unknown', name: '' }
+let showWifiName = false
+function publishLink(): void {
+  currentLink = linkForDisplay(detectedLink, showWifiName)
+  // Push the link into the IP producer so the next IPChangeSignal carries it —
+  // IPPolicy's `lanSafety` verdict pathway (ea G-A4) reads the signal's link.
+  alertRuntime.setLink(currentLink)
+}
+let linkTimer: ReturnType<typeof setInterval> | null = null
+
+// Whether RedLog keeps a macOS Dock icon. Showing the overlay flips the app to an
+// accessory (no Dock icon); this lets the operator choose to keep it (default) or
+// run Dock-less. Applied on overlay show and on settings change.
+let keepDockIcon = true
+function applyDock(): void {
+  if (process.platform !== 'darwin') return
+  if (keepDockIcon) app.dock?.show()
+  else app.dock?.hide()
+}
+function startLinkMonitor(): void {
+  const refresh = (): void => {
+    detectLink()
+      .then((l) => {
+        detectedLink = l
+        publishLink()
+      })
+      .catch(() => {})
+  }
+  refresh()
+  if (linkTimer) clearInterval(linkTimer)
+  linkTimer = setInterval(refresh, 20_000)
+}
+
+// Broadcast the composed IPStatusShape to renderer + overlay on every producer
+// tick. The audit event for a verdict change is written by the ChainEmitter
+// surface — the old `system.ip_transition` write here was duplicative and
+// caused two rows per real change, so it's gone. `ip:status` stays as an IPC
+// name for compat with existing preload code.
+function broadcastIPStatus(status: IPStatusShape): void {
+  const s = { ...status, link: currentLink }
+  send(mainWindow, 'ip:status', s)
+  send(overlayWindow, 'ip:status', s)
+
+  // §8: an exposed IP is the one condition allowed to override the operator's
+  // own HUD preferences. Pass-through comes off and the window goes fully
+  // opaque, because the failure being prevented is an operator working through
+  // a HUD they had ghosted and never seeing that their real address is out.
+  handleIpExposedChange(status.ipSafety === 'exposed')
+}
+
+// Log the security-relevant fields that changed on config:save. Cosmetic changes
+// (Dock icon, HUD flash toggle) stay silent — we only record settings that would
+// affect enforcement or attribution if silently loosened.
+function logConfigDiff(oldCfg: RedLogConfig, newCfg: RedLogConfig): string | null {
+  const open = projectRuntime.current()
+  if (!open) return null
+  const changed = diffSecurityConfig(oldCfg, newCfg)
+  if (Object.keys(changed).length === 0) return null
+  try {
+    const ev = insertEvent('system', {
+      subtype: 'config_changed',
+      changed,
+      description: `Config changed: ${Object.keys(changed).join(', ')}`
+    }, open)
+    if (ev) eventBus.publish(ev)
+    // Returned so a scope recompute triggered by this save can cite the row
+    // that recorded the change, rather than appearing to happen for no reason.
+    return ev?.id ?? null
+  } catch { /* additive */ }
+  return null
+}
+
+// ─── Scope recompute scheduling (design turn 8a) ────────────────────────────
+//
+// The save is the only door. That is deliberate: TargetView's 〈+ 範圍〉 chip
+// widens scope through a toast that defers the write for eight seconds and
+// cancels on undo, so hanging the recompute off the click would re-judge the
+// corpus for a change the operator then took back.
+//
+// Three gates, and each exists because of a real edit an operator makes:
+//   • trailing debounce — Settings auto-saves on a 350 ms debounce and the
+//     scope file is a free-text field, so typing a path produces a save per
+//     keystroke burst.
+//   • project bail — a queued job must never write into the next project's
+//     chain.
+//   • hash gate — the run itself skips when the boundary did not actually move.
+const RECOMPUTE_DEBOUNCE_MS = 2000
+let recomputeTimer: NodeJS.Timeout | null = null
+let recomputePending: { projectId: string; before: ScopeSnapshot; configChangedId: string | null } | null = null
+let recomputeRunning = false
+
+function scheduleScopeRecompute(before: ScopeSnapshot, configChangedId: string | null): void {
+  const project = projectRuntime.project()
+  if (!project) return
+  // Coalesce to the EARLIEST before-state of the burst: a→b→c is one boundary
+  // move from a to c, and comparing c against b would report the wrong delta.
+  if (!recomputePending || recomputePending.projectId !== project.id) {
+    recomputePending = { projectId: project.id, before, configChangedId }
+  } else if (configChangedId) {
+    recomputePending.configChangedId = configChangedId
+  }
+  if (recomputeTimer) clearTimeout(recomputeTimer)
+  recomputeTimer = setTimeout(() => { void runPendingRecompute() }, RECOMPUTE_DEBOUNCE_MS)
+}
+
+async function runPendingRecompute(): Promise<void> {
+  const job = recomputePending
+  recomputeTimer = null
+  if (!job || recomputeRunning) return
+  // By id, not by object: renaming a project replaces the runtime's project
+  // with a fresh object for the same engagement, and a reference test would
+  // read that as a project switch and drop the queued recompute.
+  const running = projectRuntime.current()
+  const project = projectRuntime.project()
+  if (!project || project.id !== job.projectId || !running) { recomputePending = null; return }
+  recomputePending = null
+  recomputeRunning = true
+  try {
+    const config = loadConfig(getProjectPath(project))
+    const snap = snapshotScope(config)
+    await runScopeRecompute({
+      before: job.before,
+      after: { targets: snap.targets, excludeTargets: snap.excludeTargets, alertFloor: alertFloorFor(config.scope?.warnOnViolation) },
+      engagementId: config.engagement.id,
+      operatorId: config.operator.id,
+      configChangedEventId: job.configChangedId,
+      scopeFile: snap.scopeFile ? { path: snap.scopeFile, sha256: snap.scopeFileSha256, entries: snap.scopeFileEntries } : null,
+      // It yields between reading and writing; a switch in between must not
+      // land this project's re-judgement in the next one's chain.
+      signal: running.signal
+    })
+  } catch (e) {
+    // A recompute failure must never fail the save that triggered it.
+    noteDbError('scope-recompute', e)
+  } finally {
+    recomputeRunning = false
+  }
+}
+
+// Compress an OpsecStateDelta into a one-line human description for the event
+// row. Prioritized: VPN state comes first (biggest OPSEC impact), then MAC
+// (randomization signal), then DNS (leak signal), then hostname.
+function startProject(project: ProjectMeta): void {
+  // Opening is the one moment the renderer can do nothing but wait: every IPC
+  // it needs queues behind this function. A number in the log is what turns
+  // "it hung for a few seconds" into a phase to look at.
+  const openedAt = Date.now()
+  // Prepare configuration before closing the current project. A failed read
+  // or write must not leave a new binding (or discard the usable old one).
+  const projectDir = getProjectPath(project)
+  const config = loadConfig(projectDir)
+  saveConfig(projectDir, config)
+  if (projectRuntime.current()) stopProject()
+  const opening = projectRuntime.begin(project, { engagementId: config.engagement.id, operatorId: config.operator.id })
+  try {
+    initDB(projectDir)
+    bindDBEngagement(config.engagement.id)
+    startProjectResources(project, projectDir, config, opening)
+    // Publish the shell identity only after synchronous initialization succeeds.
+    writeSpoolIdentity(opening)
+    projectRuntime.activate(opening)
+  } catch (error) {
+    try { stopProject() } catch (cleanupError) {
+      console.error('[project] rollback failed:', cleanupError)
+    }
+    throw error
+  }
+  console.log(`[project] opened in ${Date.now() - openedAt}ms`)
+}
+
+function startProjectResources(project: ProjectMeta, projectDir: string, config: RedLogConfig, opening: ProjectContext): void {
+  keepDockIcon = config.overlay?.showInDock !== false
+  applyDock()
+  showWifiName = config.network?.showWifiName === true
+  screenshotAgent.configure({
+    identity: opening,
+    quality: config.screenshot.quality,
+    intervalSec: config.screenshot.intervalSec ?? 0,
+    diffThreshold: config.screenshot.diffThreshold ?? 5,
+    captureOnCommand: config.screenshot.captureOnCommand ?? false
+  })
+
+  invalidateObservationCount()
+  resetVisibilitySignalsCache()
+  recomputePending = null
+  const scopeTargets = snapshotScope(config).targets
+  // v0.12.0: one configure call for the whole alert subsystem. Drops correlation/
+  // burst history on every project open (resetOnProjectSwitch) so a stale
+  // Combined verdict from the previous engagement can't fire when the new
+  // one's first IP tick lands.
+  alertRuntime.resetOnProjectSwitch()
+  alertRuntime.configure(config, opening, scopeTargets)
+  lootDetector.configure({ identity: opening, disabledRules: config.loot?.disabledRules ?? [] })
+  configureCaptureHealth(config as unknown as Record<string, unknown>)
+  configureRedaction(config.redaction)
+  // v0.8.2: wire the `tailers` plugin contribution to the tailer host so
+  // bundled plugins can register `TailerAdapter`s via plugin.json instead
+  // of hard-coded main-init calls. Duck-typed on the core side to avoid
+  // pulling main → services into core; the cast here is safe because the
+  // contributor loader already validates `adapter.agentKind: string`.
+  {
+    const kindByPlugin = new Map<string, string>()
+    setTailerContributionSink(
+      (pluginId: string, adapter: TailerLike) => {
+        kindByPlugin.set(pluginId, adapter.agentKind)
+        registerTailerAdapter(adapter as unknown as TailerAdapter)
+      },
+      (pluginId: string) => {
+        const kind = kindByPlugin.get(pluginId)
+        if (kind) {
+          unregisterTailerAdapter(kind)
+          kindByPlugin.delete(pluginId)
+        }
+      }
+    )
+  }
+  // Load plugins after core config so their 🟢 contributions (loot/redaction/
+  // target/event-type/capture) layer on top. 🔴 code plugins only start if the
+  // trust gate already passed.
+  try {
+    const psum = initPlugins()
+    if (psum.total > 0) console.log(`[plugins] ${psum.active} active, ${psum.needsConsent} need consent, ${psum.errors} errors`)
+  } catch (e) { console.error('[plugins] init failed:', e) }
+  setVpnAdapters(config.network.vpnAdapters)
+
+  configureTerminal({ identity: opening, maxCastBytes: config.terminal?.maxCastBytes })
+  configureTerminalProxy(() => {
+    const status = managedHttpProxy.status()
+    return loadConfig(getProjectDir()).httpCapture?.routeTerminals === true && status.state === 'running' ? status.url : null
+  })
+  // v0.9.6 (T2): core/ can't import main/, so hand the live cast position in.
+  setCastProbe(getCastPosition)
+  // The unified ingest() pipeline (used by /api/events and, going forward, the
+  // in-process producers) needs the same collaborators the api-server had: the
+  // loot detector, the alert runtime for scope dispatch, and the cast probe for
+  // bracketing built-in-terminal output.
+  configureIngest({
+    lootDetector,
+    alertRuntime: { dispatchTargetHit: (input) => alertRuntime.dispatchTargetHit(input) },
+    castProbe: getCastPosition,
+    activeTarget: config.engagement.activeTarget ?? null
+  })
+
+  // Retention sweeps for every store under `config.retention` (Spec 028).
+  // All default to 0 (keep forever); a positive `keepDays` / `maxBytes` makes
+  // the sweep run on every project open and append an audit event per deletion.
+  try {
+    // v0.9.4 P0-4: statically imported. This used to be a runtime
+    // `require('../core/retention')`, which rollup cannot see through — the
+    // module was never bundled and the literal require survived into
+    // out/main/index.js, where it resolved against a non-existent out/core/.
+    // Every packaged build threw MODULE_NOT_FOUND into the catch below, so
+    // cast and screenshot keep-days silently did nothing and the
+    // cast_pruned / screenshot_pruned audit events were never written. Unit
+    // tests missed it because they import core/retention directly.
+    const swept = sweepRetention(config, opening)
+    if (swept.cast > 0 || swept.screenshots > 0 || swept.httpBodies > 0) {
+      console.log(`[retention] pruned ${swept.cast} .cast file(s) + ${swept.screenshots} screenshot(s) + ${swept.httpBodies} http body file(s)`)
+    }
+    const bookmarksPruned = sweepBookmarks(config.retention?.bookmarks, opening)
+    if (bookmarksPruned > 0) console.log(`[retention] pruned ${bookmarksPruned} bookmark(s)`)
+    // Size-pressure eviction of the body store, after the age sweep — whatever
+    // aged out has already gone, so this only reaches live-but-cold bodies.
+    const evicted = sweepBodyStore(config, opening)
+    if (evicted.evicted > 0 || evicted.shortfallBytes > 0) {
+      console.log(`[retention] evicted ${evicted.evicted} body file(s) under disk pressure` +
+        (evicted.shortfallBytes > 0 ? ` (still ${evicted.shortfallBytes} bytes over budget; in-scope bodies kept)` : ''))
+    }
+    // §3b: same scope-pinned size-pressure eviction for the cast + screenshot
+    // stores. Off by default (budget 0); when set, out-of-scope recordings go
+    // before in-scope evidence instead of purely by age.
+    for (const kind of ['cast', 'screenshot'] as const) {
+      const ev = sweepArtifactStore(kind, config, opening)
+      if (ev.evicted > 0 || ev.shortfallBytes > 0) {
+        console.log(`[retention] evicted ${ev.evicted} ${kind} file(s) under disk pressure` +
+          (ev.shortfallBytes > 0 ? ` (still ${ev.shortfallBytes} bytes over budget; in-scope ${kind}s kept)` : ''))
+      }
+    }
+    // v0.13.0: row-level logged-tier sweep (docs/DESIGN-logged-tier-retention.md).
+    // Runs on project open AND periodically — see the interval below.
+    const loggedSwept = sweepLoggedTier(config.retention?.loggedTier, opening)
+    if (loggedSwept.deleted > 0) {
+      console.log(`[retention] pruned ${loggedSwept.deleted} logged-tier row(s), freed ~${(loggedSwept.bytesFreed / 1024 / 1024).toFixed(1)} MB`)
+    }
+    // Periodic timer — the design doc's §5.1 rationale: cast/screenshot
+    // sweep runs only on project open because operators close/reopen
+    // during a long engagement, but logged-tier can grow 20-40 GB DURING
+    // a nine-hour engagement day. Every N hours we re-sweep in-process.
+    const sweepIntervalHours = config.retention?.loggedTier?.sweepIntervalHours ?? 24
+    if (sweepIntervalHours > 0) {
+      projectRuntime.setInterval(opening, () => {
+        try {
+          const tick = sweepLoggedTier(config.retention?.loggedTier, opening)
+          if (tick.deleted > 0) {
+            console.log(`[retention] periodic sweep: ${tick.deleted} logged-tier row(s) pruned, freed ~${(tick.bytesFreed / 1024 / 1024).toFixed(1)} MB`)
+          }
+        } catch (e) { console.error('[retention] periodic sweep failed:', e) }
+      }, sweepIntervalHours * 3600 * 1000)
+    }
+  } catch (e) { console.error('[retention] sweep failed:', e) }
+
+  // Recover any terminal sessions from a prior app run whose session_end never
+  // landed (crash / kill / disk full mid-write). Writes a synthetic session_end
+  // tagged recovered=true so the audit chain gets its close signal and the
+  // Timeline no longer shows a terminal that "never closed" (v0.6.86 P3).
+  try {
+    const n = recoverOrphanSessions()
+    if (n > 0) console.log(`[terminal] recovered ${n} orphan session(s)`)
+  } catch (e) { console.error('[terminal] orphan recovery failed:', e) }
+  resumeTerminalRecordings()
+
+  // Fill the shell catalog in the background so the picker opens instantly.
+  // Not awaited: on Windows it enumerates WSL, and nothing here depends on
+  // the answer (#100 is the reason that distinction matters).
+  void discoverShells().catch(() => { /* probing is best effort */ })
+
+  // Replay only records belonging to the active engagement. Mismatches remain
+  // recoverable on disk and are picked up when their owning project opens.
+  const drainSpool = (limit = Number.POSITIVE_INFINITY, after = ''): string | null => {
+    if (!projectRuntime.isCurrent(opening)) return null
+    if (eventBus.paused) return null
+    let pauses: ReturnType<typeof pauseIntervals> | null = null
+    const emit = ({ agentType, data: spooled, engagementId: spoolEngagement, operatorId: spoolOperator }: import('../core/spool-replay').SpoolReplayEvent): boolean => {
+      // A queue-full or proxy-stop gap is judged against the pauses before it
+      // lands: one counted entirely while paused is not a loss, and is done
+      // with (#460, #291).
+      const data = isPauseJudgedGap(spooled)
+        ? queueGapAgainstPauses(spooled, pauses ??= pauseIntervals(recordingStateRows()))
+        : spooled
+      if (!data) return true
+      // Through ingest(), like every other producer. This called insertEvent
+      // directly, so an event the hook had spooled because RedLog was
+      // unreachable skipped the entire pipeline: no causal links, no target
+      // extraction, no loot scan, no redaction spans, no scope verdict, and
+      // none of the housekeeping rules. Spooling is not rare — the built-in
+      // terminal sources its adapter into a fresh pty within a second of the
+      // pane opening, which is exactly when the API may not be up yet — so
+      // the events most likely to take this path were the ones arriving with
+      // the least processing.
+      const result = ingest({
+        agentType, data, engagementId: spoolEngagement, operatorId: spoolOperator,
+        envelope: { source: 'spool', mapper: { id: 'identity', version: '1' } }
+      })
+      if (result.event) return true
+      // No row, but handled: `plumbing` is deliberately never recorded and
+      // `dedup` means the row is already there. Both mean this file is done —
+      // returning false would keep it on disk and retry it every 30s forever.
+      // A pause is the one case worth keeping for later.
+      return result.skipped !== 'paused'
+    }
+    // A proxy killed while it held events left a bound on disk (#291). Into
+    // the spool with it, so its own project gets the gap and no other does.
+    if (after === '') reapInflightMarkers(inflightMarkerDirectory(homedir()), pendingSpoolDirectory(homedir()))
+    const run = replaySpoolDirectory(pendingSpoolDirectory(homedir()), opening, emit, limit, after)
+    if (run.replayed > 0) console.log(`[hook-spool] replayed ${run.replayed} spooled event(s)`)
+    return run.last
+  }
+  try { drainSpool() } catch (e) { console.error('[hook-spool] replay failed:', e) }
+
+  // The API shares this thread, so the periodic drain yields every ten files
+  // instead of holding it for all two hundred.
+  projectRuntime.setInterval(opening, drainInSlices({
+    drainOnce: drainSpool, total: 200, slice: 10, isCurrent: () => projectRuntime.isCurrent(opening)
+  }), 30_000)
+
+  alertRuntime.start()
+  startLinkMonitor()
+  configureOpsecMonitor((delta, current) => {
+    if (!projectRuntime.isCurrent(opening)) return
+    try {
+      const ev = insertEvent('system', {
+        subtype: 'opsec_state_changed',
+        changed: delta,
+        current: { vpnInterfaces: current.vpnInterfaces, primaryMac: current.primaryMac, hostname: current.hostname, dnsServers: current.dnsServers },
+        description: describeOpsecDelta(delta)
+      }, opening)
+      if (ev) eventBus.publish(ev)
+    } catch { /* additive */ }
+  })
+  startOpsecMonitor()
+  configureClipboardMonitor({
+    pollMs: config.clipboard?.pollMs ?? 1500,
+    storePreview: config.clipboard?.storePreview ?? false,
+    identity: opening, lootDetector
+  })
+  startClipboardMonitor()
+
+  // v0.6.92 W-project — file watcher + process monitor. Both opt-in; the
+  // producers just no-op when disabled so the wiring is unconditional.
+  configureFileWatcher({
+    watchPaths: config.fileWatcher?.watchPaths ?? [],
+    ignorePatterns: config.fileWatcher?.ignorePatterns ?? [],
+    identity: opening
+  })
+  configureConnectionMonitor({
+    pollMs: config.connectionMonitor?.pollMs,
+    identity: opening,
+    selfPorts: [getApiPort()]
+  })
+  configurePowershellTranscript({
+    identity: opening
+  })
+  configureProcessMonitor({
+    pollMs: config.processMonitor?.pollMs,
+    ignoreCommands: config.processMonitor?.ignoreCommands ?? [],
+    identity: opening
+  })
+  // AI capture is separately installed and authorized by this project.
+  // Shared exclusions remain local; allowed directories are per source/project.
+  {
+    const { excludedPaths } = readHookConfig()
+    configureAgentTailer({
+      identity: opening,
+      excludedPaths,
+      emitThinking: config.agentTailer?.emitThinking ?? false,
+      // v0.12.0: route agent tool_call events through the alert subsystem
+      // so a Claude / Codex session hitting an out-of-scope host
+      // registers a scope_violation the same way a shell command would.
+      scopeDispatch: (input) => alertRuntime.dispatchTargetHit(input)
+    })
+  }
+  // Spec 035: which optional sources run is decided by packs alone.
+  applyCapturePacks(config)
+
+  configureApi({
+    engagementId: opening.engagementId,
+    operatorId: opening.operatorId,
+    operatorName: config.operator.name,
+    configLoader: {
+      getConfig: () => loadConfig(projectDir),
+      getTargets: () => loadConfig(projectDir).scope.targets,
+      getExcludeTargets: () => loadConfig(projectDir).scope?.excludeTargets ?? []
+    },
+    lootDetector: lootDetector,
+    screenshotAgent: screenshotAgent,
+    alertRuntime,
+    sessionRegistry: {
+      register: registerSessionId,
+      list: getRegisteredSessions
+    },
+    // #220: capture checks go to the screen that asked for them, not to the
+    // record.
+    httpVerifySink: (report) => {
+      managedHttpProxy.noteVerification(report)
+      const status = managedHttpProxy.status()
+      if (report.scheme === 'https' && projectRuntime.isCurrent(opening) && status.httpsVerification?.receivedAt === report.receivedAt && status.httpsVerification?.nonce === report.nonce
+        && !report.rejected && status.caFingerprint && status.url && status.sourceInstance) {
+        const context = verificationContext(loadConfig(projectDir), status)
+        const evidence: HttpVerificationEvidence = {
+          version: 1, projectId: project.id, clientIdentity: null, clientLabel: clientLabel(report.userAgent),
+          endpoint: status.url, caFingerprint: status.caFingerprint.sha256, routing: context.routing,
+          sourceInstance: status.sourceInstance, verifiedAt: report.receivedAt, captureVerified: true,
+          // An unidentifiable client can prove capture without granting durable CA trust.
+          caTrustVerified: false
+        }
+        try { httpVerificationHistory.append(projectDir, evidence) }
+        catch (error) { console.error('[http-verification] history not saved:', error) }
+      }
+      send(mainWindow, 'httpCapture:verify', report)
+    }
+  })
+  onApiProjectOpen()
+
+  insertEvent('system', { subtype: 'session_start' }, opening)
+  // Pause lives in memory, not in the project: say in this record what it
+  // would otherwise leave unexplained (see core/recording-state-marker).
+  try {
+    const marker = markerForOpen(eventBus.paused, lastRecordingSubtype())
+    if (marker) {
+      const ev = insertEvent('system', { subtype: marker.subtype, description: marker.description, source: marker.source }, opening)
+      if (ev) eventBus.publish(ev, { bypassPause: true })
+    }
+  } catch { /* additive: a marker that fails to write must not stop the project opening */ }
+
+  // OPSEC air-gap: suppress every outbound request RedLog makes of its own —
+  // anchoring, NTP sync, and the update check. Capture and the local API are
+  // untouched. Record the mode so a timeline that lacks anchors is explained
+  // by a choice, not a failure.
+  const airgap = config.network?.offline === true
+  setUpdaterAirgap(airgap)
+  insertEvent('system', { subtype: 'opsec_airgap', enabled: airgap, description: airgap ? 'Air-gap ON — no outbound anchoring / NTP / update / IP lookup' : 'Air-gap OFF' }, opening)
+  if (!airgap) {
+    startAnchorLoop()
+    startNtpLoop()
+  }
+
+  // The first launch after an update restart writes down what happened, judged
+  // by the version now running, in the project that was open when it began.
+  // Additive: a record that fails to write must not stop the project opening,
+  // and the marker stays until it is written.
+  try {
+    const marker = readUpdateMarker(app.getPath('userData'))
+    if (marker && (marker.projectDir === null || marker.projectDir === getProjectDir())) {
+      const outcome = judgeUpdateOutcome(marker, app.getVersion())
+      if (marker.method === 'manual' && outcome.kind === 'not-applied') {
+        // The operator only went to the download page. Nothing was restarted,
+        // so there is no event to write for an update that did not happen; About
+        // keeps saying it is not finished until the running version moves.
+      } else if (marker.projectDir === null || recordUpdateOutcome(outcome, opening)) {
+        clearUpdateMarker(app.getPath('userData'))
+        setUpdateOutcome(outcome)
+        send(mainWindow, 'app:updateOutcomeReady')
+      }
+    }
+  } catch (e) { console.warn('[updater] could not record the update outcome:', (e as Error).message) }
+
+  // v0.6.89 P1-A: read-path sampling verify. On open, take a big (100)
+  // sample immediately so the operator sees an early signal if the chain
+  // was tampered with while the app was closed. After that, take a small
+  // (50) sample every 5 minutes for continuous silent detection.
+  //
+  // On a sample failure we (1) surface via capture-health (verdict → dark
+  // for the TTL window) and (2) chain a `system.chain_sample_broken` event
+  // so the audit trail records the detection itself. Cleared previous
+  // broken state on a clean open so a fresh project doesn't inherit the
+  // last one's dark verdict.
+  clearSampleBroken()
+  try {
+    const first = verifyRandomSample(100)
+    if (!first.ok) {
+      // v0.7.6 H3: include the broken row's own timestamp so the Dashboard
+      // can tell "6d old pre-tailer historical row" from "fresh regression."
+      const brokenRow = first.brokenAtEventId ? queryEventById(first.brokenAtEventId) : null
+      noteSampleBroken({
+        eventId: first.brokenAtEventId || '',
+        reason: first.brokenReason || 'unknown',
+        eventTimestamp: brokenRow?.timestamp
+      })
+      try {
+        const ev = insertEvent('system', {
+          subtype: 'chain_sample_broken',
+          eventId: first.brokenAtEventId,
+          reason: first.brokenReason,
+          sampled: first.sampled
+        }, opening)
+        if (ev) eventBus.publish(ev)
+      } catch { /* noteSampleBroken already surfaces via capture-health */ }
+    }
+  } catch (e) { console.error('[chain-sample] initial verify failed:', e) }
+
+  // v0.6.89 P1-A: keep sampling while the project is open; the on-demand
+  // verify button is too easy to skip.
+  projectRuntime.setInterval(opening, () => {
+    try {
+      const result = verifyRandomSample(50)
+      if (!result.ok) {
+        const brokenRow = result.brokenAtEventId ? queryEventById(result.brokenAtEventId) : null
+        noteSampleBroken({
+          eventId: result.brokenAtEventId || '',
+          reason: result.brokenReason || 'unknown',
+          eventTimestamp: brokenRow?.timestamp
+        })
+        try {
+          const ev = insertEvent('system', {
+            subtype: 'chain_sample_broken',
+            eventId: result.brokenAtEventId,
+            reason: result.brokenReason,
+            sampled: result.sampled
+          }, opening)
+          if (ev) eventBus.publish(ev)
+        } catch { /* */ }
+      }
+    } catch { /* transient sqlite errors already surface through DB error path */ }
+  }, 5 * 60 * 1000)
+
+  if (!overlayWindow) {
+    const hideHudForTest = process.env.REDLOG_E2E === '1' && process.env.REDLOG_E2E_HIDE_HUD === '1'
+    overlayWindow = createOverlayWindow(loadOverlayPosition(), { show: config.overlay?.autoShow !== false && !hideHudForTest })
+    bindOverlayReleaseShortcut(overlayWindow.webContents)
+    // §8: remember where the operator put it, per display. `moved` fires
+    // throughout a drag, so debounce to the end of it.
+    let moveTimer: ReturnType<typeof setTimeout> | null = null
+    overlayWindow.on('moved', () => {
+      if (moveTimer) clearTimeout(moveTimer)
+      moveTimer = setTimeout(() => { if (overlayWindow) saveOverlayPosition(overlayWindow) }, 400)
+    })
+    // The overlay joins all Spaces / floats over fullscreen, which flips the app
+    // to an accessory on macOS and drops the Dock icon. Re-apply the operator's
+    // Dock preference whenever the overlay appears so it isn't silently changed.
+    if (process.platform === 'darwin') {
+      overlayWindow.on('show', applyDock)
+      applyDock()
+      setTimeout(applyDock, 250)
+    }
+    configureOverlayState({
+      passThrough: !!config.overlay?.passThrough,
+      opacity: config.overlay?.passThroughOpacity ?? 0.4
+    })
+    if (tray) {
+      tray.destroy()
+      tray = createTray(mainWindow!, overlayWindow, toggleRecording, triggerBookmark, () => setOverlayPassThrough(false))
+      setTrayRecording(tray, !eventBus.paused)
+    }
+  }
+
+  // Capture starts with the project.
+  //
+  // This line used to read "capture starts only through an explicit operator
+  // action", and that rule only ever applied to HTTP: the shell hook records
+  // from the moment a project is open and has never asked. HTTP asked because
+  // starting it spawns mitmdump and binds a port — a cost to RedLog and to
+  // nothing else, because the system proxy settings are never touched. No
+  // traffic on this machine moves until the operator launches the capture
+  // browser or opts their terminals in. docs/UIUX-CONTROLS-AND-COPY.md §5.
+  //
+  // One attempt per open, after the login PATH lands (a Dock-launched app
+  // cannot see ~/.local/bin before then, and would call mitmproxy missing).
+  // A failure publishes its event and shows on the card; repeating it on every
+  // open would report the same thing to an operator who has already read it.
+  {
+    // By open, not by project id: after A → B → A the first A's attempt is
+    // not the second A's, and "one attempt per open" counts opens.
+    void loginPathReady
+      .then(() => {
+        if (!projectRuntime.isCurrent(opening)) return
+        if (!shouldAutoStartHttpCapture({
+          mitmdumpOnPath: isOnPath('mitmdump'),
+          state: managedHttpProxy.status().state
+        })) return
+        return startManagedHttpCapture().then(() => undefined)
+      })
+      .catch((e) => console.error('[http-capture] auto-start failed:', e))
+  }
+  // Bring the recording index up to date in the background. Idempotent and
+  // cheap when nothing changed — it hashes each cast and skips matches — so
+  // running it on every open is what keeps a project that was recorded by an
+  // older build, restored from a backup, or written to while RedLog was shut
+  // searchable without anyone having to know to ask.
+  //
+  // Not awaited: a first index of an engagement's worth of recordings takes
+  // real time, and holding project-open on it would trade a visible stall for
+  // an invisible one. The UI reads `casts:status` and says how much is still
+  // pending, which is the honest version of the same information.
+  void backfillCastIndex(projectDir, undefined, opening.signal)
+    .catch(() => { /* index is rebuildable; never block opening a project */ })
+}
+
+function stopProject(): void {
+  // Every cleanup must run even if an earlier source or partially initialized
+  // store throws. In particular, never retain an API/spool binding after a
+  // failed open. Preserve the first error for the caller.
+  let failed = false
+  let firstError: unknown
+  const clean = (action: () => unknown): void => {
+    try { action() } catch (error) {
+      if (!failed) { failed = true; firstError = error }
+      console.error('[project] cleanup failed:', error)
+    }
+  }
+  // First, so nothing this open started can begin anything new while the
+  // rest of it is taken down: aborts its signal and stops its timers.
+  clean(() => projectRuntime.close())
+  clean(onApiProjectClose)
+  clean(clearSpoolIdentity)
+  // The capture browser's profile is this project's (`<project>/browser-profile`):
+  // its cookies and sign-ins belong to this engagement. Left open, it sent the
+  // next project HTTP through the restarted proxy while its navigations went
+  // unrecorded. It closes with its project; the exit listener tells the UI.
+  clean(stopBrowser)
+  clean(() => stopManagedHttpCapture(false))
+  clean(stopAnchorLoop)
+  clean(stopNtpLoop)
+  if (recomputeTimer) { clearTimeout(recomputeTimer); recomputeTimer = null }
+  recomputePending = null
+  clean(() => alertRuntime.stop())
+  clean(stopClipboardMonitor)
+  clean(stopFileWatcher)
+  clean(stopProcessMonitor)
+  clean(stopConnectionMonitor)
+  clean(stopPowershellTranscript)
+  clean(stopAgentTailer)
+  clean(stopCdpMonitor)
+  clean(stopOpsecMonitor)
+  clean(() => screenshotAgent.stop())
+  clean(closeCastIndex)
+  clean(closeHttpBodyIndex)
+  // Finish each binding while its DB is still open; the shell survives.
+  clean(detachTerminalRecordings)
+  clean(closeDB)
+  clean(resetBodiesDirCache)
+  clean(resetCausesResolver)
+  clean(() => configureIngest({ activeTarget: null }))
+  if (failed) throw firstError
+}
+
+// e2e only: keep Electron's own state under the temp HOME. `HOME` does not
+// move userData on macOS (it comes from the account's Library), so every run
+// shared ~/Library/Application Support/Electron with the developer's own dev
+// app and with every earlier run. Chromium stores a per-URL zoom level there;
+// one left at 380% made every later run render at half width, under the
+// layout's narrow breakpoint, where the Settings sidebar is a <select> and
+// `[data-settings-page]` does not exist. Linux CI honours HOME and never saw it.
+// Must run before the single-instance lock, which also lives in userData.
+if (process.env.REDLOG_E2E === '1') {
+  app.setPath('userData', path.join(homedir(), '.electron-user-data'))
+}
+
+// The uninstaller runs the installed app once with this flag, before it deletes
+// the files the hooks point at (resources/installer.nsh): take every enrolment
+// out of its rc or profile, then exit. No window, no lock — whether another
+// RedLog is still running does not change what has to be removed.
+const removingHooks = process.argv.includes('--remove-hooks')
+if (removingHooks) {
+  void removeWslHooks()
+    .then((wsl) => debugLog('hooks', 'removed on uninstall', [...removeInstalledHooks(), ...wsl].join(',') || 'none'))
+    .catch((e) => debugLog('hooks', 'remove on uninstall failed', (e as Error).message))
+    .finally(() => app.exit(0))
+}
+
+// One RedLog at a time. Two instances race for port 6660 and clobber each
+// other's ~/.redlog/api-token, which breaks hooks/CLI/MCP and can wedge the UI.
+// A second launch just focuses the window that's already open.
+const gotSingleInstanceLock = !removingHooks && app.requestSingleInstanceLock()
+if (!gotSingleInstanceLock && !removingHooks) {
+  app.quit()
+}
+
+// Dock / Finder launches inherit a minimal PATH; widen it from the login shell
+// (src/main/login-path.ts) without blocking the window. Tool lookups that ran
+// before it settled are cached, so drop those caches once PATH changes.
+const loginPathReady: Promise<void> = gotSingleInstanceLock
+  ? applyLoginPath()
+    .then((changed) => { if (changed) { invalidateHooksCache(); invalidateHooksDetectCache() } })
+    .catch(() => { /* PATH stays as launched */ })
+  : Promise.resolve()
+
+// #499 PR B. Which tools this machine has: RedLog's own PATH lookup, run on a
+// trigger and never per command, joined to the reports the shells write. Read
+// by the Tool Settings panel; it feeds nothing that decides how a command is
+// recorded.
+const toolDetector = createToolDetector({
+  home: homedir(),
+  platform: process.platform,
+  env: () => process.env,
+  profiles: () => knownProfiles(undefined, readContributedProfiles()),
+  log: (line) => debugLog('tools', 'scan', line)
+})
+app.on('second-instance', () => {
+  if (mainWindow) {
+    if (mainWindow.isMinimized()) mainWindow.restore()
+    mainWindow.show()
+    mainWindow.focus()
+  }
+})
+
+// v0.6.97 B: `redlog-screenshot://` privileged scheme — MUST be registered
+// BEFORE app.whenReady() or Chromium won't grant it URL-loading permissions
+// (image src, fetch, etc). The `protocol.handle` implementation lives inside
+// the ready block below where getProjectDir() is safe to call.
+protocol.registerSchemesAsPrivileged([
+  { scheme: 'redlog-screenshot', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } }
+])
+
+app.whenReady().then(() => {
+  if (!gotSingleInstanceLock) return
+  electronApp.setAppUserModelId('com.redlog')
+  debugLog('app', 'start', `version=${typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : 'dev'} platform=${process.platform}-${process.arch} packaged=${app.isPackaged}`)
+  setAppVersion(typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : 'dev')
+
+  // Installs made before modes were passed at creation: ~/.redlog and what is
+  // under it become owner-only, and a first run creates it that way.
+  restrictRedlogHome()
+
+  // Before any terminal opens: an enrolled shell sources ~/.redlog, and an
+  // upgrade does not touch it otherwise.
+  const refreshedHooks = refreshInstalledHooks()
+  if (refreshedHooks.length) debugLog('hooks', 'refreshed', refreshedHooks.join(','))
+
+  // Behind the login PATH, and not awaited: this must never hold up startup.
+  void loginPathReady.then(() => toolDetector.rescan('startup')).catch((e) => debugLog('tools', 'startup detection failed', (e as Error).message))
+
+  startApiServer(6660).catch((err) => console.error('[api] failed to start:', err))
+
+  // v0.6.97 B: serve screenshots via a custom protocol instead of piping
+  // 33%-inflated base64 data URIs through IPC. Renderer uses
+  // `<img src="redlog-screenshot://<filename>">` and Chromium streams the
+  // bytes directly from disk. Path guarded by `isInsideDir(<project>/screenshots)`
+  // so a request for `redlog-screenshot://../../.ssh/id_ed25519` 404s.
+  protocol.handle('redlog-screenshot', async (req) => {
+    try {
+      const url = new URL(req.url)
+      // Only take the trailing path segment so `redlog-screenshot://local/foo.jpg`
+      // and `redlog-screenshot://foo.jpg` both resolve to <projectDir>/screenshots/foo.jpg.
+      // Callers pass basename only; the hostname/segment ordering depends on how
+      // Chromium normalises the URL (differs between platforms).
+      const segments = decodeURIComponent(url.pathname).split('/').filter(Boolean)
+      const basename = segments[segments.length - 1] || decodeURIComponent(url.hostname || '')
+      if (!basename || basename.includes('..') || basename.includes('/') || basename.includes('\\')) {
+        return new Response('', { status: 400 })
+      }
+      const screenshotDir = path.join(getProjectDir(), 'screenshots')
+      const resolved = path.resolve(screenshotDir, basename)
+      if (!isInsideDir(screenshotDir, resolved)) return new Response('', { status: 403 })
+      // v0.6.100 F4: async read. With v0.6.98 A lazy-loading, 500 thumbs
+      // burst-fire requests as ScreenshotsView scrolls — each 800KB-1.5MB
+      // JPEG readFileSync blocked the main thread 5-15ms (same reason
+      // v0.6.97 D moved screenshot-agent writes off main). libuv thread
+      // pool handles the syscall.
+      const buf = await fs.promises.readFile(resolved)
+      return new Response(buf, { status: 200, headers: { 'Content-Type': 'image/jpeg' } })
+    } catch { return new Response('', { status: 404 }) }
+  })
+
+  // Guarantee a Dock presence on macOS. A CLI-launched dev build (electron-vite)
+  // registers as an accessory (UIElement) and gets no Dock icon; force 'regular'
+  // so RedLog always shows in the Dock, matching the packaged app.
+  if (process.platform === 'darwin') app.dock?.show()
+
+  // Content-Security-Policy. windows.ts blocks navigation off our own origin;
+  // this caps what the loaded document may fetch/execute, so a captured link or
+  // an evidence body rendered into the DOM can't pull remote script. Delivered
+  // as a header (not a <meta> tag) so prod file:// stays locked to 'self' while
+  // dev permits Vite's inline HMR preamble + websocket. Both renderer entries
+  // share defaultSession, so one handler covers index.html and overlay.html.
+  //
+  // Stamps every response and strips any prior CSP first: stamping unconditionally
+  // guarantees the document is covered however file:// classifies its request,
+  // and a CSP header on the harmless redlog-screenshot image subresource is
+  // ignored by the browser. This is the item flagged 'needs runtime validation'
+  // — confirm the header is actually delivered on the packaged file:// load
+  // (see the verify steps), because the failure mode here is fail-open.
+  const csp = contentSecurityPolicy({ dev: is.dev, rendererUrl: process.env['ELECTRON_RENDERER_URL'] })
+  session.defaultSession.webRequest.onHeadersReceived((details, cb) => {
+    const headers: Record<string, string[]> = {}
+    for (const [k, v] of Object.entries(details.responseHeaders ?? {})) {
+      if (k.toLowerCase() === 'content-security-policy') continue
+      headers[k] = Array.isArray(v) ? v : [String(v)]
+    }
+    headers['Content-Security-Policy'] = [csp]
+    cb({ responseHeaders: headers })
+  })
+
+  // Allow the renderer's opt-in geolocation request (Settings ▸ 網路 ▸ show Wi-Fi
+  // name). Granting macOS Location Services un-redacts the SSID for `ipconfig`.
+  // Nothing else is permitted.
+  session.defaultSession.setPermissionRequestHandler((_wc, permission, cb) => {
+    cb(permission === 'geolocation')
+  })
+
+  const savedState = loadWindowState()
+  // Only onto a display that exists. The saved position outlives the monitor
+  // it was saved on — unplug one, rearrange them, or reconnect over RDP into a
+  // different desktop geometry, and the window opens off the screen: running,
+  // in the task bar, drawing nothing. See window-bounds.ts.
+  mainWindow = createMainWindow(
+    visibleWindowBounds(savedState?.bounds, screen.getAllDisplays().map((d) => d.workArea))
+  )
+  bindOverlayReleaseShortcut(mainWindow.webContents)
+  if (savedState?.isMaximized) mainWindow.maximize()
+
+  setTerminalWindow(mainWindow)
+
+  mainWindow.on('resize', () => { if (mainWindow) debouncedSaveWindowState(mainWindow) })
+  mainWindow.on('move', () => { if (mainWindow) debouncedSaveWindowState(mainWindow) })
+  mainWindow.on('close', (e) => {
+    if (!forceQuit) {
+      e.preventDefault()
+      if (mainWindow) saveWindowState(mainWindow)
+      mainWindow?.hide()
+    }
+  })
+
+  tray = createTray(mainWindow, null, toggleRecording, triggerBookmark, () => setOverlayPassThrough(false))
+
+  // Renderer-requested native menus (the terminal's right-click — xterm owns
+  // its own selection, so Chromium's context-menu event sees nothing there).
+  registerContextMenuIpc(ipcMain)
+  registerClipboardIpc(ipcMain)
+
+  // Shared context for extracted IPC handler modules.
+  const ipcCtx: IpcContext = {
+    getActiveProject: () => projectRuntime.project(),
+    getMainWindow: () => mainWindow,
+    getOverlayWindow: () => overlayWindow,
+    getCurrentEngagementId: () => projectRuntime.current()?.engagementId ?? null,
+    getCurrentOperatorId: () => projectRuntime.current()?.operatorId ?? null,
+    send,
+    triggerBookmark,
+    addHudMarker,
+    hudMarkerBinding: () => (projectRuntime.project() ? projectRuntime.current()?.engagementId ?? null : null),
+    onPluginsChanged: () => { const dir = openProjectDir(); if (dir) applyCapturePacks(loadConfig(dir)) }
+  }
+  registerOverlayIpc(ipcMain, ipcCtx)
+  registerDataExportIpc(ipcMain, ipcCtx, { recentExports: new RecentExportStore(path.join(app.getPath('userData'), 'recent-exports')) })
+  registerTerminalIpc(ipcMain, ipcCtx)
+  registerPluginsIpc(ipcMain, ipcCtx)
+  registerOperatorsIpc(ipcMain, ipcCtx)
+  registerEventsIpc(ipcMain, ipcCtx)
+  registerChainIpc(ipcMain, ipcCtx)
+  registerMarkersIpc(ipcMain, ipcCtx, screenshotAgent)
+  registerTargetContextIpc(ipcMain, ipcCtx)
+  registerArtifactsIpc(ipcMain, ipcCtx)
+
+  // --- Project management ---
+  ipcMain.handle('project:list', () => listProjects())
+  ipcMain.handle('project:scopeSummaries', () => summarizeProjectScopes(listProjectEntries()))
+  ipcMain.handle('project:root', () => projectsRoot())
+  ipcMain.handle('project:create', (_e, name: string, initialConfig?: Partial<RedLogConfig>) => {
+    const project = createProject(name)
+    // The engagement is the project. Every new project used to inherit the
+    // template's `default` / "Default Engagement", so the dashboard of a
+    // project called Review-Engagement announced a different name, and every
+    // event carried `engagement_id: default` — the same id for every project
+    // on the box. Seed both from what the operator just typed; the advanced
+    // setup (or a later edit) still overrides.
+    const projectDir = getProjectPath(project)
+    saveConfig(projectDir, mergeInitialConfig(loadConfig(projectDir), project.id, initialConfig))
+    startProject(project)
+    return project
+  })
+  ipcMain.handle('project:open', (_e, id: string) => {
+    const project = openProject(id)
+    if (!project) return null
+    startProject(project)
+    return project
+  })
+  ipcMain.handle('project:delete', (_e, id: string) => deleteProject(id))
+  ipcMain.handle('project:rename', (_e, id: string, name: string) => {
+    const updated = renameProject(id, name)
+    // Keep the open project's name in sync if it is the one renamed — the
+    // main-window title bar reads it on subsequent renders.
+    const open = projectRuntime.current()
+    if (updated && open?.projectId === id) projectRuntime.renameProject(open, updated.name)
+    // The bridge contract (env.d.ts) is `{ ok, name?, error? }`. This returned
+    // the bare ProjectMeta, so both callers read `res.ok` as undefined and
+    // treated every successful rename as a refusal.
+    return updated ? { ok: true, name: updated.name } : { ok: false, error: 'rename-refused' }
+  })
+  ipcMain.handle('project:active', () => {
+    const project = projectRuntime.project()
+    return project ? { id: project.id, name: project.name, createdAt: project.createdAt } : null
+  })
+  ipcMain.handle('project:close', () => {
+    if (projectRuntime.current()) stopProject()
+    return true
+  })
+
+  // --- IP ---
+  ipcMain.handle('ip:getStatus', () => alertRuntime.ipStatus())
+  ipcMain.handle('config:get', () => {
+    const dir = openProjectDir()
+    return dir ? loadConfig(dir) : null
+  })
+
+  // AI source metadata and shared hook exclusions. The folder picker itself
+  // does not grant capture permission.
+  ipcMain.handle('agents:sessions', () => listAgentSessions())
+  ipcMain.handle('agents:sources', (_event, roots?: Record<string, string>) => {
+    const dir = openProjectDir()
+    const config = dir ? loadConfig(dir) : {}
+    if (roots === undefined) return describeAgentSources(config)
+    // Metadata-only preview of the unsaved form: directory existence is not permission.
+    if (!roots || typeof roots !== 'object' || Array.isArray(roots) || Object.entries(roots).some(([kind, root]) => !createOfficialAgentPluginManager(path.join(homedir(), '.redlog', 'plugins')).list().some(p => p.agentKind === kind) || typeof root !== 'string' || !path.isAbsolute(root))) throw new Error('Invalid AI source directory')
+    return describeAgentSources({ agentTailer: { sources: Object.fromEntries(Object.entries(roots).map(([kind, root]) => [kind, { sourceRoot: root }])) } })
+  })
+  ipcMain.handle('hookConfig:get', () => readHookConfig())
+  ipcMain.handle('hookConfig:save', (_e, cfg: { excludedPaths?: string[] }) => {
+    try {
+      // Live-reconfigure the tailer so the new gate takes effect immediately
+      saveHookConfig(cfg)
+      const dir = openProjectDir()
+      if (dir) applyCapturePacks(loadConfig(dir))
+      return true
+    } catch { return false }
+  })
+  // Native folder picker for the Settings UI — text input is fine but a
+  // real picker matches how operators actually pick engagement folders.
+  ipcMain.handle('hookConfig:pickPath', async (_e, title?: unknown) => {
+    if (!mainWindow) return null
+    const result = await dialog.showOpenDialog(mainWindow, {
+      properties: ['openDirectory'],
+      title: typeof title === 'string' && title.trim() ? title.slice(0, 120) : 'Pick a folder'
+    })
+    if (result.canceled || result.filePaths.length === 0) return null
+    return result.filePaths[0]
+  })
+  const saveProjectConfig = (newConfig: RedLogConfig, opts?: { expectProjectId?: string }): boolean => {
+    const projectDir = openProjectDir()
+    if (!projectDir) return false
+    const oldConfig = loadConfig(projectDir)
+    // A form is bound to the project it was loaded from. Settings flushes a
+    // pending write when it unmounts, and the operator may have switched
+    // project by the time it lands; applying one engagement's settings to
+    // another is worse than losing the edit.
+    if (opts?.expectProjectId && opts.expectProjectId !== oldConfig.engagement.id) return false
+    // The project id is the durable attribution boundary used by spool replay
+    // and every Event row. Renderer state, imported profiles and direct IPC
+    // calls may update other settings, but cannot rename this identity.
+    newConfig.engagement.id = oldConfig.engagement.id
+    // Active target has a dedicated, audited IPC. A Settings form may have
+    // loaded its config before the title-bar target changed; preserving the
+    // latest stored value prevents that stale form from silently reverting
+    // attribution context on its next auto-save.
+    newConfig.engagement.activeTarget = oldConfig.engagement.activeTarget ?? null
+    // Same for HUD pass-through: overlay:setPassThrough stores it, and a form
+    // loaded before a ⌘⇧P or HUD toggle must not write the old value back.
+    if (newConfig.overlay) newConfig.overlay.passThrough = oldConfig.overlay?.passThrough === true
+    // Captured BEFORE the save so the recompute can say what the boundary was.
+    const beforeScope = snapshotScope(oldConfig)
+    // Before the save, so what is saved is the operator actually in effect (a
+    // blank or refused id keeps the old one), and before anything below
+    // writes, so the audit row and every source are already the new
+    // operator's. The sources hold `open` and need no identity passed again.
+    const open = projectRuntime.current()!
+    newConfig.operator = { ...newConfig.operator,
+      ...applyOperatorChange(projectRuntime, open, oldConfig.operator, newConfig.operator, { writeSpoolIdentity, setPrimaryOperator }) }
+    saveConfig(projectDir, newConfig)
+    configureIngest({ activeTarget: newConfig.engagement.activeTarget ?? null })
+    // Audit trail — log security-relevant setting changes so a reviewer can see
+    // when scope loosened or the IP blacklist changed. Only diffs the fields
+    // that affect enforcement or attribution; cosmetic changes stay silent.
+    const configChangedId = logConfigDiff(oldConfig, newConfig)
+    keepDockIcon = newConfig.overlay?.showInDock !== false
+    // docs/TESTING.md §5.6: turning the SSID off applies now, not at the next poll.
+    if (showWifiName !== (newConfig.network?.showWifiName === true)) {
+      showWifiName = newConfig.network?.showWifiName === true
+      publishLink()
+      broadcastIPStatus(alertRuntime.ipStatus())
+    }
+    applyDock()
+    const targets = snapshotScope(newConfig).targets
+    alertRuntime.configure(newConfig, open, targets)
+    screenshotAgent.configure({
+      quality: newConfig.screenshot.quality,
+      intervalSec: newConfig.screenshot.intervalSec ?? 0,
+      diffThreshold: newConfig.screenshot.diffThreshold ?? 5,
+      captureOnCommand: newConfig.screenshot.captureOnCommand ?? false
+    })
+    // v0.9.7: refresh the snapshot capture-health reads its on/off switches
+    // from, so toggling a source updates the card on the next poll instead of
+    // at the next project open.
+    configureCaptureHealth(newConfig as unknown as Record<string, unknown>)
+    const oldEndpoint = managedProxyEndpoint(oldConfig)
+    const newEndpoint = managedProxyEndpoint(newConfig)
+    if ((oldEndpoint.port !== newEndpoint.port || oldEndpoint.host !== newEndpoint.host)
+      && ['running', 'starting'].includes(managedHttpProxy.status().state)) {
+      stopManagedHttpCapture()
+      void startManagedHttpCapture()
+    }
+    // Re-judge what is already recorded against the boundary that now applies.
+    // Scheduled rather than awaited: the renderer's save must not wait on a
+    // scan, and the debounce collapses an editing burst into one run.
+    scheduleScopeRecompute({
+      targets: beforeScope.targets,
+      excludeTargets: beforeScope.excludeTargets,
+      alertFloor: alertFloorFor(oldConfig.scope?.warnOnViolation)
+    }, configChangedId)
+    configureTerminal({ identity: open, maxCastBytes: newConfig.terminal?.maxCastBytes })
+    lootDetector.configure({ disabledRules: newConfig.loot?.disabledRules ?? [] })
+    configureClipboardMonitor({
+      pollMs: newConfig.clipboard?.pollMs ?? 1500,
+      storePreview: newConfig.clipboard?.storePreview ?? false,
+      lootDetector
+    })
+    configureFileWatcher({
+      watchPaths: newConfig.fileWatcher?.watchPaths ?? [],
+      ignorePatterns: newConfig.fileWatcher?.ignorePatterns ?? []
+    })
+    configureConnectionMonitor({
+      pollMs: newConfig.connectionMonitor?.pollMs,
+      selfPorts: [getApiPort()]
+    })
+    configureProcessMonitor({
+      pollMs: newConfig.processMonitor?.pollMs,
+      ignoreCommands: newConfig.processMonitor?.ignoreCommands ?? []
+    })
+    applyCapturePacks(newConfig)
+    if (newConfig.redaction) configureRedaction(newConfig.redaction)
+    setVpnAdapters(newConfig.network.vpnAdapters)
+    // The HUD reads its config once at mount — push overlay settings so toggling
+    // "show Mark button" takes effect live instead of only after a restart.
+    send(overlayWindow, 'overlay:showMark', newConfig.overlay?.showMarkButton !== false)
+    send(overlayWindow, 'overlay:flashExposed', newConfig.overlay?.flashOnExposed !== false)
+    send(overlayWindow, 'overlay:scale', newConfig.overlay?.scale ?? 1.0)
+    send(overlayWindow, 'overlay:emphasizeIp', newConfig.overlay?.emphasizeExternalIp === true)
+    // A save changes the opacity only. Pass-through keeps its runtime state, so
+    // an unrelated autosave cannot re-ghost a HUD an exposure alarm just woke.
+    configureOverlayState({
+      passThrough: isOverlayPassThrough(),
+      opacity: newConfig.overlay?.passThroughOpacity ?? 0.4
+    })
+    return true
+  }
+  ipcMain.handle('config:save', (_e, newConfig: RedLogConfig, opts?: { expectProjectId?: string }) =>
+    saveProjectConfig(newConfig, opts))
+  // Widening the scope by one target. The Targets view used to read the whole
+  // config when the button was pressed and write the whole thing back when the
+  // undo window closed, seconds later: a project switch in between wrote A's
+  // settings into B, and two targets added inside the window overwrote each
+  // other. The merge belongs here, against the config as it is NOW, and the
+  // caller says which project it meant.
+  ipcMain.handle('scope:addTarget', (_e, target: unknown, opts?: { expectProjectId?: string }) => {
+    const projectDir = openProjectDir()
+    if (!projectDir || typeof target !== 'string' || !target.trim()) return false
+    const current = loadConfig(projectDir)
+    if (opts?.expectProjectId && opts.expectProjectId !== current.engagement.id) return false
+    const targets = current.scope?.targets ?? []
+    if (targets.includes(target)) return true
+    return saveProjectConfig(
+      { ...current, scope: { ...current.scope, targets: [...targets, target] } } as RedLogConfig,
+      opts
+    )
+  })
+  // Per-tick push — fires every IP check so `lastCheck`/link updates reach the
+  // UI even when the verdict doesn't flip. IPPolicy dedup ensures the CHAIN
+  // only sees actual verdict changes; this listener is UI-only.
+  alertRuntime.onIpTick(() => broadcastIPStatus(alertRuntime.ipStatus()))
+
+  // --- Events (extracted to ipc/events.ts) ---
+
+  // Coalesce event bursts into one renderer delivery per event-loop turn.
+  let batchBuffer: RedLogEvent[] = []
+  let batchScheduled = false
+  const flushBatch = (): void => {
+    batchScheduled = false
+    if (batchBuffer.length === 0) return
+    const drained = batchBuffer
+    batchBuffer = []
+    send(mainWindow, 'events:new-batch', drained)
+  }
+  eventBus.on('event', (event) => {
+    batchBuffer.push(event)
+    if (!batchScheduled) {
+      batchScheduled = true
+      setImmediate(flushBatch)
+    }
+    // keep the overlay + dashboard pivot views live — on new pivots, and on the
+    // command_end that closes a foreground tunnel so it drops from the HUD at once.
+    const d = (event.data ?? {}) as Record<string, unknown>
+    if (pivotsMayChange(event, lastPivots, projectRuntime.project()?.id ?? null)) {
+      const p = getActivePivots()
+      send(overlayWindow, 'pivots:changed', p)
+      send(mainWindow, 'pivots:changed', p)
+    }
+    // 2b/OSCP: opt-in screenshot linked to a finished command (_causes → this
+    // event). No-op unless config.screenshot.captureOnCommand is on; the agent
+    // owns the flag and the perceptual-dedup skip.
+    if (event.agentType === 'shell' && d.subtype === 'command_end') {
+      screenshotAgent.onCommandEnd(event.id).catch(() => { /* best-effort */ })
+    }
+  })
+  ipcMain.handle('pivots:getActive', () => getActivePivots())
+
+  // --- Markers + Screenshots (extracted to ipc/markers.ts) ---
+
+  // --- Scope ---
+  // Read from the chain, not from the in-process log the alert runtime keeps.
+  // That log holds 500 rows and resets on every project switch, so it could
+  // never show a retroactive row and would go on counting one that had been
+  // withdrawn — the page would contradict the record it exists to show.
+  ipcMain.handle('scope:getObservations', () => (projectRuntime.project() ? queryScopeObservationRows() : { rows: [], truncated: false }))
+  ipcMain.handle('scope:getObservationCount', () => (projectRuntime.project() ? activeObservationCount() : 0))
+  ipcMain.handle('scope:getLastRecompute', () => (projectRuntime.project() ? queryLastScopeRecompute() : null))
+  ipcMain.handle('scope:isConfigured', () => alertRuntime.scopeIsConfigured())
+  // The scope file merged into the lists, as the app enforces it. Only the
+  // path saved in this project's config is read: the renderer never supplies a
+  // path, so this cannot be used to read an arbitrary file.
+  ipcMain.handle('scope:policy', () => {
+    const projectDir = openProjectDir()
+    if (!projectDir) return null
+    const config = loadConfig(projectDir)
+    if (config.scope.scopeFile && !readScopeFile(config.scope.scopeFile).ok) throw new Error('Scope file unavailable')
+    const scope = snapshotScope(config)
+    return { targets: scope.targets, excludeTargets: scope.excludeTargets }
+  })
+  ipcMain.handle('scope:fileInForce', () => {
+    const projectDir = openProjectDir()
+    if (!projectDir) return null
+    const file = loadConfig(projectDir).scope?.scopeFile
+    return file ? { path: file, ...readScopeFile(file) } : null
+  })
+
+  // §22: which nouns this engagement has the data for. Read-only, and the
+  // flags are monotonic, so a mature project costs no queries at all.
+  ipcMain.handle('visibility:signals', () => (projectRuntime.project() ? getVisibilitySignals() : null))
+
+  // --- Evidence Chain + Clock (extracted to ipc/chain.ts) ---
+
+  // --- Loot ---
+  ipcMain.handle('loot:getCount', () => projectRuntime.project() ? getLootCount() : 0)
+  ipcMain.handle('loot:rules', () => listLootRules())
+
+  // --- Bookmarks ---
+  ipcMain.handle('bookmarks:list', () => projectRuntime.project() ? listBookmarks() : [])
+  ipcMain.handle('bookmarks:get', (_e, id: string) => projectRuntime.project() ? getBookmark(id) : null)
+  ipcMain.handle('bookmarks:create', async (_e, data: { title: string; url?: string; note?: string }) => {
+    const opening = projectRuntime.current()
+    if (!projectRuntime.project() || !opening) return null
+    // Asking the browser can take two seconds. A bookmark saved in one project
+    // must not land in the one opened meanwhile.
+    const browser = await getActiveBrowserTab()
+    if (!projectRuntime.isCurrent(opening)) return null
+    const context = {
+      browserUrl: browser.url || undefined,
+      browserTitle: browser.title || undefined,
+      ...egressContext(alertRuntime.ipProducer.getState())
+    }
+    return createBookmark({
+      title: data.title || browser.title || 'Untitled',
+      url: data.url || browser.url || undefined,
+      note: data.note,
+      context
+    })
+  })
+  ipcMain.handle('bookmarks:update', (_e, id: string, data) => projectRuntime.project() ? updateBookmark(id, data) : false)
+  ipcMain.handle('bookmarks:delete', (_e, id: string) => projectRuntime.project() ? deleteBookmark(id) : false)
+
+  // --- Saved Timeline views (extracted to ipc/views.ts) ---
+
+  // --- Proxied browser ---
+  ipcMain.handle('httpCapture:status', httpCaptureStatus)
+  ipcMain.handle('httpCapture:start', () => {
+    const status = startManagedHttpCapture()
+    debugLog('httpCapture', 'start', `state=${(status as { state?: string }).state ?? '?'}`)
+    return status
+  })
+  // The panes opened while routing was on keep a proxy URL in their
+  // environment, which no longer answers. Say how many, so the operator is
+  // told to reopen them rather than left to a pane where every request fails.
+  ipcMain.handle('httpCapture:stop', () => {
+    const result = { ...stopManagedHttpCapture(), staleTerminals: countProxiedTerminals() }
+    debugLog('httpCapture', 'stop', `staleTerminals=${result.staleTerminals}`)
+    return result
+  })
+  ipcMain.handle('browser:detect', () => detectBrowser())
+  ipcMain.handle('browser:status', () => ({ running: isBrowserRunning() }))
+  ipcMain.handle('browser:launch', () => launchCaptureBrowser())
+  // #220: load the verification page in the capture browser — a new tab if
+  // it is already open, which a second launch would refuse.
+  ipcMain.handle('httpCapture:verifyInBrowser', async (_e, nonce: unknown) => {
+    if (!isVerifyNonce(nonce)) return { ok: false, error: 'invalid verification nonce' }
+    const url = verifyUrl('http', nonce)
+    if (isBrowserRunning()) {
+      return (await openBrowserTab(url)) ? { ok: true } : { ok: false, error: 'Could not open a tab in the RedLog browser' }
+    }
+    return launchCaptureBrowser(url)
+  })
+  async function launchCaptureBrowser(startUrl?: string): Promise<{ ok: boolean; error?: string }> {
+    const open = projectRuntime.current()
+    const projectDir = openProjectDir()
+    if (!projectDir || !open) return { ok: false, error: 'No project open' }
+    const cfg = loadConfig(projectDir)
+    const browserCfg = { ...DEFAULT_BROWSER, ...(cfg.browser ?? {}), ...(startUrl ? { startUrl } : {}) }
+    // Through RedLog's own proxy the browser trusts that proxy's CA by its key,
+    // so HTTPS works without a root certificate in the OS trust store.
+    let trustSpki: string | null = null
+    if (isManagedProxy(browserCfg.proxy, managedProxyEndpoint(cfg))) {
+      const proxy = await startManagedHttpCapture()
+      if (proxy.state !== 'running') {
+        return { ok: false, error: proxy.error || 'HTTP capture proxy is not running' }
+      }
+      browserCfg.proxy = proxy.url ?? browserCfg.proxy
+      trustSpki = proxy.caPath ? readCaSpki(proxy.caPath) : null
+    }
+    // The proxy start can outlast the project that asked: a browser launched
+    // now would carry this project's profile into the next one.
+    if (!projectRuntime.isCurrent(open)) return { ok: false, error: 'The project changed while the browser was starting' }
+    const result = launchBrowser(browserCfg, projectDir, { trustSpki })
+
+    if (result.ok) {
+      setCdpPort(browserCfg.cdpPort)
+      // Start polling the browser for URL changes so every navigation lands in
+      // the timeline as an http_navigation event. Silent no-op once the browser
+      // exits — the poll fails, no event fires.
+      configureCdpMonitor({ identity: open, enabled: true })
+      const event = insertEvent('system', {
+        subtype: 'browser_launched',
+        binary: result.binary,
+        proxy: browserCfg.proxy || null,
+        cdpPort: browserCfg.cdpPort,
+        isolatedProfile: browserCfg.isolateProfile,
+        pid: result.pid
+      }, open)
+      if (event) eventBus.publish(event)
+    }
+    return result
+  }
+  ipcMain.handle('browser:stop', () => { stopCdpMonitor(); return { stopped: stopBrowser() } })
+  // However the browser ends -- the button here, or the operator closing the
+  // window, which is the ordinary way -- the same two things must happen:
+  // stop polling a port that no longer answers, and tell the renderer, which
+  // otherwise read `browser:status` once on mount and never again.
+  onBrowserExit(() => {
+    stopCdpMonitor()
+    send(mainWindow, 'browser:exited')
+  })
+
+  // --- CDP ---
+  ipcMain.handle('cdp:getTab', () => getActiveBrowserTab())
+  ipcMain.handle('cdp:setPort', (_e, port: number) => { setCdpPort(port); return true })
+
+  // --- Config Profile Export/Import ---
+  ipcMain.handle('config:exportProfile', async () => {
+    const project = projectRuntime.project()
+    if (!project) return null
+    const projectDir = getProjectPath(project)
+    const config = loadConfig(projectDir)
+    const profile = { version: 1, ...config }
+    const result = await dialog.showSaveDialog(mainWindow!, {
+      defaultPath: `redlog-profile-${project.name.replace(/[^a-z0-9]/gi, '-')}.yaml`,
+      filters: [
+        { name: 'REDLOG Profile', extensions: ['yaml', 'yml'] },
+        { name: 'JSON', extensions: ['json'] }
+      ]
+    })
+    if (result.canceled || !result.filePath) return null
+    const ext = path.extname(result.filePath).toLowerCase()
+    if (ext === '.json') {
+      fs.writeFileSync(result.filePath, JSON.stringify(profile, null, 2))
+    } else {
+      fs.writeFileSync(result.filePath, `# REDLOG Profile — share with your team\n${yaml.dump(profile, { lineWidth: 120 })}`)
+    }
+    return result.filePath
+  })
+
+  ipcMain.handle('config:importProfile', async () => {
+    const result = await dialog.showOpenDialog(mainWindow!, {
+      filters: [
+        { name: 'REDLOG Profile', extensions: ['yaml', 'yml', 'json'] }
+      ],
+      properties: ['openFile']
+    })
+    // Cancelling is its own answer. It used to share `null` with a file that
+    // could not be read, so the operator got no reason for either (#297).
+    if (result.canceled || !result.filePaths[0]) return { status: 'cancelled' } satisfies ProfileImportResult
+    return readProfileFile(result.filePaths[0])
+  })
+
+  // --- Hooks ---
+  ipcMain.handle('hooks:detect', async () => {
+    const cached = getCachedHooks()
+    if (cached) {
+      detectHooksAsync().catch(() => {})
+      return cached
+    }
+    return detectHooksAsync()
+  })
+  ipcMain.handle('capture:health', () => projectRuntime.project() ? getCaptureHealth() : null)
+  // #255. `upTo` is the newest write time the card was showing: the operator
+  // confirmed deleting what they were shown, not whatever has arrived since.
+  ipcMain.handle('capture:clearUnattributedSpool', (_e, upTo: unknown) => {
+    if (typeof upTo !== 'number' || !Number.isFinite(upTo)) return { removed: 0, failed: 0 }
+    return clearUnattributedCommands(upTo)
+  })
+  // Spec 052 T034. Settings shows what the SHELL will do — the machine's mode
+  // and the effective class lists, defaults with the operator's `redlog class`
+  // edits on top. Read on demand rather than cached: `redlog mode manual`
+  // happens in a terminal RedLog knows nothing about, and a panel showing a
+  // stale `auto` is worse than one showing nothing.
+  // `profiles` are the ones the compiler read, so a card can name the tool a
+  // mode came from; one read of the snapshot serves both.
+  ipcMain.handle('hooks:terminalPolicy', () => {
+    const contributed = readContributedProfiles()
+    return {
+      mode: readTerminalMode(),
+      app: readTerminalApp(),
+      ...compileClassPolicy(readClassOverlay(), undefined, contributed),
+      profiles: knownProfiles(undefined, contributed)
+    }
+  })
+  // #499 PR B. `detection` only reads; `rescan` is the one way the renderer can
+  // cause a lookup, and only for the two reasons it can have.
+  ipcMain.handle('tools:detection', () => toolDetector.snapshot())
+  ipcMain.handle('tools:rescan', (_e, reason: unknown) => {
+    const trigger = rescanTrigger(reason)
+    return trigger ? toolDetector.rescan(trigger) : toolDetector.snapshot()
+  })
+  ipcMain.handle('hooks:setTerminalApp', (_e, value: unknown) => writeTerminalApp(value))
+  // Installing or removing a capture hook changes what the record contains
+  // from then on, so the record says when it happened.
+  const auditHookChange = (hookId: string, installed: boolean, r: { success: boolean; message: string }): void => {
+    debugLog('hooks', installed ? 'install' : 'uninstall', `id=${hookId} success=${r.success}`)
+    const open = projectRuntime.current()
+    if (!r.success || !open) return
+    try {
+      const ev = insertEvent('system', {
+        subtype: 'config_changed',
+        changed: { [`hook.${hookId}.installed`]: { from: !installed, to: installed } },
+        description: r.message
+      }, open)
+      if (ev) eventBus.publish(ev)
+    } catch { /* additive */ }
+  }
+  ipcMain.handle('hooks:install', (_e, hookId: string) => {
+    invalidateHooksCache(); invalidateHooksDetectCache()
+    const r = installHook(hookId)
+    auditHookChange(hookId, true, r)
+    return r
+  })
+  ipcMain.handle('hooks:uninstall', (_e, hookId: string) => {
+    invalidateHooksCache(); invalidateHooksDetectCache()
+    const r = uninstallHook(hookId)
+    auditHookChange(hookId, false, r)
+    return r
+  })
+  // Wait for the login shell's PATH (login-path.ts): a Dock-launched app starts
+  // with a minimal PATH, and probing before it lands reports installed tools
+  // (python3, curl, mitmdump in ~/.local/bin or /opt/homebrew/bin) as missing.
+  // The PowerShell execution policy rides along rather than living in
+  // runPreflight: that function is documented as spawning nothing, so it stays
+  // safe to call from the main thread on every onboarding render. This handler
+  // is already async, and the probe is the one question on Windows whose
+  // answer cannot be read off the filesystem.
+  ipcMain.handle('runtime:preflight', async () => {
+    await loginPathReady
+    const result = runPreflight()
+    const shell = result.platform === 'win32' ? result.shell?.name : null
+    return shell ? { ...result, powershell: await readExecutionPolicy(shell) } : result
+  })
+  // The operator's PATH has to be resolved first, or uv/brew installed outside
+  // launchd's minimal PATH are invisible and the install ENOENTs.
+  // An install changes what is on PATH, and `commandExists` caches a miss for
+  // the session — so without this a mitmdump installed from the first-run card
+  // stayed "not installed" in the health row while the proxy ran it (#254).
+  ipcMain.handle('runtime:install', async (e, id: PreflightCommand) => {
+    if (dependencyInstalls.has(id)) return { success: false, message: `An installation for ${id} is already running` }
+    const controller = new AbortController()
+    dependencyInstalls.set(id, controller)
+    const cancelOwned = (): void => controller.abort()
+    // A renderer reload does not run React unmount cleanup. Never leave a
+    // hidden installer behind when its requesting frame reloads or crashes.
+    e.sender.once('did-start-loading', cancelOwned)
+    e.sender.once('destroyed', cancelOwned)
+    e.sender.once('render-process-gone', cancelOwned)
+    try {
+      await loginPathReady
+      return await installDependency(id, { signal: controller.signal })
+    } finally {
+      e.sender.removeListener('did-start-loading', cancelOwned)
+      e.sender.removeListener('destroyed', cancelOwned)
+      e.sender.removeListener('render-process-gone', cancelOwned)
+      if (dependencyInstalls.get(id) === controller) dependencyInstalls.delete(id)
+      invalidateHooksCache(); invalidateHooksDetectCache()
+    }
+  })
+  ipcMain.handle('runtime:cancelInstall', (_e, id: PreflightCommand) => {
+    const controller = dependencyInstalls.get(id)
+    if (!controller) return false
+    controller.abort()
+    return true
+  })
+
+  // --- WSL ---
+  ipcMain.handle('wsl:listDistros', () => listWslDistros())
+  ipcMain.handle('wsl:getNetworkMode', () => getNetworkMode())
+  ipcMain.handle('wsl:installHook', (_e, distro: string, shell: string) =>
+    wslInstallHook(distro, shell as 'bash' | 'zsh'))
+  ipcMain.handle('wsl:uninstallHook', (_e, distro: string, shell: string) =>
+    wslUninstallHook(distro, shell as 'bash' | 'zsh'))
+  ipcMain.handle('wsl:runDiagnostics', (_e, distro: string) =>
+    wslRunDiagnostics(distro))
+
+  // --- Recording ---
+  ipcMain.handle('recording:get', () => !eventBus.paused)
+  ipcMain.handle('recording:toggle', () => toggleRecording())
+  eventBus.on('recording', (recording: boolean, source?: string) => {
+    send(mainWindow, 'recording:changed', recording)
+    send(overlayWindow, 'recording:changed', recording)
+    if (tray) setTrayRecording(tray, recording)
+    // Log the toggle so a reviewer can explain gaps in the timeline — "no events
+    // for 20 min" reads very differently as "recording was paused" vs "idle".
+    // Bypass the paused gate for this one write: pause events must always land.
+    const open = projectRuntime.current()
+    if (open) {
+      try {
+        const ev = insertEvent('system', {
+          subtype: recording ? 'recording_resumed' : 'recording_paused',
+          description: recording ? 'Recording resumed' : 'Recording paused',
+          // v0.9.5: who flipped it. With pause now actually suppressing
+          // capture, these two rows are the entire record of the gap.
+          source: source || 'unknown'
+        }, open)
+        if (ev) eventBus.publish(ev, { bypassPause: true })
+      } catch { /* additive */ }
+    }
+  })
+
+  // --- Quick mark (global shortcut + tray + overlay all route here) ---
+  globalShortcut.register(QUICK_MARK_ACCELERATOR, triggerBookmark)
+  // §8: the way back out of click-through. Without it, turning pass-through on
+  // makes the control that turns it off unclickable — the HUD is ghosted, so
+  // the button is behind it — and the only escape is Settings, which the
+  // operator has to know exists.
+  globalShortcut.register(HUD_PASSTHROUGH_ACCELERATOR, () => setOverlayPassThrough(false))
+  // Screenshot now, from whatever tool the operator is in. RedLog's own
+  // windows (the HUD included) are taken off screen for the grab. A chord
+  // another app already owns is not an error worth refusing to start over;
+  // the palette and the title-bar button still capture.
+  if (!globalShortcut.register(QUICK_SHOT_ACCELERATOR, () => {
+    void screenshotAgent.captureNow('manual', undefined, { hideOwnWindows: true })
+      .then((file) => send(mainWindow, 'screenshot:shortcutResult', { ok: !!file }))
+  })) console.warn(`[shortcuts] ${QUICK_SHOT_ACCELERATOR} is taken by another application`)
+
+  // --- Updates ---
+  ipcMain.handle('app:checkForUpdates', () => checkForUpdates({ manual: true }))
+  ipcMain.handle('app:updateStatus', () => getUpdateStatus())
+  ipcMain.handle('app:cancelUpdate', () => cancelUpdateDownload())
+  ipcMain.handle('app:installUpdate', () => installReadyUpdate())
+  ipcMain.handle('app:takeUpdateOutcome', () => takeUpdateOutcome())
+  ipcMain.handle('app:setAutoUpdateCheck', (_e, on: unknown) => { setAutoCheck(on === true); return getUpdateStatus() })
+  onUpdateStatus((status) => send(mainWindow, 'app:updateStatusChanged', status))
+  // --- Debug log (machine-wide switch; see core/debug-log.ts) ---
+  ipcMain.handle('debug:status', () => ({ enabled: isDebugLogEnabled(), path: debugLogPath() }))
+  ipcMain.handle('debug:set', (_e, on: unknown) => {
+    setDebugLogEnabled(on === true)
+    return { enabled: isDebugLogEnabled(), path: debugLogPath() }
+  })
+  ipcMain.handle('debug:reveal', () => {
+    const file = debugLogPath()
+    if (fs.existsSync(file)) shell.showItemInFolder(file)
+    else void shell.openPath(path.dirname(file))
+  })
+  ipcMain.on('app:setQuitText', (_e, raw: unknown) => {
+    const parsed = parseQuitText(raw)
+    if (parsed) quitText = parsed
+  })
+  ipcMain.on('app:setTrayText', (_e, raw: unknown) => { setTrayText(tray, raw) })
+  // The OS going down is not the operator choosing to quit.
+  powerMonitor.on('shutdown', () => { allowQuit() })
+  // Renderer needs a way to open a URL in the operator's real browser (marks
+  // page, plugin homepage, etc.). Only http/https allowed — Electron's
+  // openExternal can dispatch file:/// and other schemes with unbounded side
+  // effects, and untrusted plugin content might reach this handler.
+  ipcMain.handle('app:openExternal', async (_e, url: string) => {
+    try {
+      const u = new URL(url)
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') return { ok: false, error: 'scheme not allowed' }
+      await shell.openExternal(url)
+      return { ok: true }
+    } catch (e) {
+      return { ok: false, error: (e as Error).message }
+    }
+  })
+  // Silent check shortly after launch (packaged builds only).
+  // The operator may have switched it off; air-gap overrides it either way.
+  restoreUnfinishedUpdate()
+  setTimeout(() => { if (autoCheckEnabled()) checkForUpdates().catch(() => {}) }, 5000)
+
+  app.on('activate', () => {
+    mainWindow?.show()
+  })
+})
+
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') {
+    app.quit()
+  }
+})
+
+// The renderer sends its current language's wording; until it does the dialog
+// follows the system language.
+let quitText: QuitText | null = null
+let quitPrompt: Promise<void> | null = null
+
+/** When a command last arrived from a terminal outside RedLog, or null. A
+ *  failed health read means "unknown", which must not block a quit. */
+function externalShellLastEventAt(): number | null {
+  if (!projectRuntime.project()) return null
+  try {
+    const terminal = getCaptureHealth().sources.find((s) => s.id === 'terminal')
+    return terminal?.ownShellLastEventAt ?? null
+  } catch { return null }
+}
+
+/** What quitting would stop right now. Read when asked, never cached: the
+ *  update restart question and the quit dialog both depend on it being current. */
+function currentQuitImpact(): ReturnType<typeof quitImpact> {
+  return quitImpact({
+    terminals: listTerminals().length,
+    proxyState: managedHttpProxy.status().state,
+    project: projectRuntime.project()?.name ?? null,
+    externalLastEventAt: externalShellLastEventAt()
+  })
+}
+setUpdateImpactProvider(currentQuitImpact)
+
+/** A quit that stops live sources is the operator's call (#346). Returns true
+ *  when the quit should be held for the dialog. */
+function holdQuitForConfirmation(): boolean {
+  if (forceQuit || isQuitAllowed()) return false
+  // The e2e harness closes the app with live terminals; nothing is there to ask.
+  if (process.env.REDLOG_E2E === '1') return false
+  const impact = currentQuitImpact()
+  if (!impact) return false
+  if (!quitPrompt) {
+    mainWindow?.show()
+    const options = quitDialog(impact, quitText ?? defaultQuitText(app.getLocale()))
+    const win = mainWindow
+    quitPrompt = (win ? dialog.showMessageBox(win, { type: 'question', ...options }) : dialog.showMessageBox({ type: 'question', ...options }))
+      .then((answer) => {
+        if (answer.response === 1) { forceQuit = true; app.quit() }
+      })
+      .catch((e) => console.warn('quit confirmation failed:', (e as Error).message))
+      .finally(() => { quitPrompt = null })
+  }
+  return true
+}
+
+app.on('before-quit', (event) => {
+  if (holdQuitForConfirmation()) { event.preventDefault(); return }
+  forceQuit = true
+  for (const controller of dependencyInstalls.values()) controller.abort()
+})
+
+app.on('will-quit', () => {
+  // Killed, not asked: see ManagedHttpProxy.stop.
+  stopManagedHttpCapture(false, false)
+  stopBrowser()
+  globalShortcut.unregisterAll()
+  stopOverlayMouseTracking()
+  killAllTerminals()
+  stopProject()
+  stopApiServer()
+  tray?.destroy()
+})

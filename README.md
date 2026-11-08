@@ -1,0 +1,520 @@
+# RedLog
+
+Red Team Operation Log — an Electron desktop app that records a penetration test engagement into a tamper-evident, per-project timeline database: the commands you run and the HTTP(S) traffic that goes through its proxy, plus the optional sources you turn on.
+
+![Electron](https://img.shields.io/badge/Electron-44-47848F?logo=electron&logoColor=white)
+![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=white)
+![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white)
+![SQLite](https://img.shields.io/badge/SQLite-WAL-003B57?logo=sqlite&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-green)
+[![Latest release](https://img.shields.io/github/v/release/guan4tou2/REDLOG?label=download&logo=github)](https://github.com/guan4tou2/REDLOG/releases/latest)
+
+## Install
+
+Install RedLog on **your operator machine** (the Kali box or laptop you attack
+from), not on a target. It records what you do; it is not an implant.
+
+Grab the installer for your platform from the
+[**releases page**](https://github.com/guan4tou2/REDLOG/releases/latest) — current version **v0.18.6**.
+Builds do not yet carry a trusted publisher identity (macOS is ad-hoc signed, not notarised). First launch may require an OS trust decision; managed machines may block it.
+
+| Platform | File | Install |
+|----------|------|---------|
+| Kali / Debian / Ubuntu (x64) | [`redlog_0.18.6_amd64.deb`](https://github.com/guan4tou2/REDLOG/releases/download/v0.18.6/redlog_0.18.6_amd64.deb) | `sudo apt install ./redlog_*.deb` |
+| Windows (x64 installer) | [`RedLog.Setup.0.18.6.exe`](https://github.com/guan4tou2/REDLOG/releases/download/v0.18.6/RedLog.Setup.0.18.6.exe) | Run it; at SmartScreen choose **More info → Run anyway** |
+| macOS (Apple Silicon) | [`RedLog-0.18.6-arm64.dmg`](https://github.com/guan4tou2/REDLOG/releases/download/v0.18.6/RedLog-0.18.6-arm64.dmg) | Drag to `/Applications`, then see below |
+| macOS (Intel) | — | No installer; [build from source](#development) |
+
+Official downloads are installed packages: NSIS on Windows, DEB on Kali /
+Debian / Ubuntu, and DMG on Apple Silicon macOS. Portable Windows and AppImage
+packages are no longer published. The macOS ZIP is a supplementary app archive;
+the guided installation path uses the DMG.
+
+**macOS** — this app is ad-hoc sealed but has no Developer ID or notarization;
+Gatekeeper may block the first launch. Right-click
+`RedLog.app` → **Open**, or open **System Settings ▸ Privacy & Security**,
+scroll to the blocked-app notice and choose **Open Anyway**. If macOS instead
+says *"RedLog is damaged and can't be opened"* (the quarantine flag on an
+unsigned download), clear the flag as a last resort:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/RedLog.app
+```
+
+For an internal test, use the specifically supplied candidate, not the public
+release link above. Copy the full version/build line from **Settings ▸ About**
+when reporting a problem; equal version numbers can contain different commits.
+
+### Verify the download
+
+Every release carries a `SHA256SUMS.txt` covering each installer. Download it
+next to your installer and check:
+
+```sh
+sha256sum -c SHA256SUMS.txt --ignore-missing        # Linux
+shasum -a 256 -c SHA256SUMS.txt --ignore-missing    # macOS
+```
+
+On Windows, compare `Get-FileHash .\RedLog.Setup.*.exe -Algorithm SHA256` with
+the matching line in `SHA256SUMS.txt`.
+
+### Runtime requirements
+
+- **`python3` and `curl`** — Bash/Zsh command capture uses both. RedLog checks
+  the detected environment before installing the adapter; do not assume every
+  Mac already has Python. Without working capture dependencies, the terminal
+  can remain usable without producing command evidence.
+- **mitmproxy** *(optional, for HTTP(S) capture)* — `uv tool install mitmproxy`
+  (or `pipx install mitmproxy`). On macOS and Linux RedLog reads your login
+  shell's `PATH` at startup (plus `~/.local/bin` and Homebrew), so tools are
+  found even when it is launched from the Dock or a desktop launcher; if one
+  still shows as missing, add its directory to `PATH` in your shell profile.
+
+## Quick Start
+
+The first engagement, in the order that proves capture works:
+
+1. **Create a project.** Enter its name. Set web scope, exclusions and private
+   traffic in **Settings ▸ Scope rules** when needed. Empty scope does not stop
+   recording; export preview states that web traffic has not been scope-filtered.
+   Web scope does not filter command evidence.
+2. **Connect your normal shell.** On the Dashboard's first-run screen choose
+   **Record my Zsh / Bash / PowerShell terminal**. Confirm the detected shell
+   or select another supported shell, install its adapter, open a **new**
+   terminal and run the displayed canary, then the visible output check. The screen verifies arriving evidence,
+   not merely the installation. Existing terminal tabs do not reload themselves.
+   Ordinary Bash and Zsh commands automatically record bounded stdout/stderr,
+   exit code, duration and working directory. Interactive/native exceptions
+   remain explicit; PowerShell uses its own output integration. The built-in
+   terminal is an expandable fallback, with `.cast` screen recording.
+3. **Connect web capture when needed.** **Settings ▸ Browser & HTTP capture**
+   prepares/starts RedLog's local mitmproxy. Choose your browser and follow the
+   proxy/CA steps, or use the isolated capture browser. Verify HTTPS with the
+   displayed nonce from the actual client you will use. A listening proxy or
+   a browser ignoring certificate errors does not prove CA trust in other
+   clients. HTTP is retained alongside HTTPS.
+4. **Check the record.** Find the canary and a real request, inspect their output
+   or bodies, then preview and export the intended selection. Reopen the project
+   to confirm it is saved. Daily repair goes directly to **Settings ▸ Commands
+   & terminal** or **Browser & HTTP capture**, including from Capture Health.
+
+`redlog status` reports this terminal's identity and recording state;
+`redlog stop` stops this terminal and `redlog start` resumes when its identity
+allows it. `redlog class list` shows deliberate capture exceptions.
+
+*Route new terminals through HTTP capture* is off by default and applies to
+built-in terminals opened afterwards. Proxy-aware tools still need the right
+trust configuration; client support for proxy variables varies. Raw TCP, SMB,
+LDAP, RDP and nmap SYN scans do not become HTTP evidence through this switch.
+
+Optional host monitoring, clipboard and AI capture
+are configured under **Settings ▸ Other capture sources**. Clipboard has its
+own opt-in. Windows output is beside terminal setup under **Commands & terminal**. AI integrations are individually uninstalled by default; install,
+select project working directories and explicitly enable the chosen integration.
+
+> **Windows / WSL users** — see [docs/windows-setup.md](docs/windows-setup.md) for PowerShell hooks and WSL integration.
+
+## Screenshots
+
+<table>
+<tr>
+<td width="50%"><a href="docs/screenshots/dashboard.jpg"><img src="docs/screenshots/dashboard.jpg" alt="Dashboard" /></a><br/><b>Dashboard</b> — capture health as an exception report, external / internal IP with the live pivot topology, session counters, engagement metadata</td>
+<td width="50%"><a href="docs/screenshots/timeline.jpg"><img src="docs/screenshots/timeline.jpg" alt="Timeline" /></a><br/><b>Attack Timeline</b> — 18 lanes banded into commands / traffic / artifacts / signals, density minimap, cluster popups, per-command and full-session <code>.cast</code> replay</td>
+</tr>
+</table>
+
+## Why RedLog
+
+Penetration testers need a tamper-evident record of what they did during an engagement. RedLog runs in the background and records it into a per-project SQLite database, timestamped and hash-chained. What it records, and what it does not, is stated rather than implied:
+
+- **Commands** from a connected shell: command, exit code, duration and working directory. Ordinary **Bash and Zsh** commands also record bounded output automatically. Native/interactive exceptions remain metadata-only; explicit `redlog-session` records a PTY session with merged streams. PowerShell output uses its transcript integration.
+- **Deliberate exceptions:** `nc`, `ncat`, editors, pagers and the `claude` and `codex` CLIs retain native terminal behavior, with metadata instead of captured output. The AI conversation is recorded from its local transcript only when AI conversation capture is enabled (see below); otherwise only the launch command is. Zsh routes `ssh`, `socat` and `pwncat-cs` through a separate PTY recorder; Bash requires an explicit `redlog-session` for that class. PTY streams are merged and local suspension differs. `redlog class list` shows the effective rules, including operator overrides.
+- **HTTP(S)** that goes through RedLog's proxy — the capture browser, or a tool pointed at the proxy. Traffic that does not use the proxy (raw TCP, SMB, nmap SYN scans) is not recorded as HTTP.
+- **Optional sources**, off until you turn them on: process, connection and file monitoring; the clipboard (its own opt-in); AI agent transcripts; periodic screenshots.
+
+Markers, bookmarks and findings are still yours to write. RedLog keeps the record; it does not write the report.
+
+**Key differentiators:**
+
+- **Optional AI conversations** — Claude Code and Codex integrations record supported local messages and tool calls/results for explicitly authorized project directories; shell hooks record terminal commands separately
+- **Scope-aware** — root-domain matching alerts you when tools touch out-of-scope targets without false positives on unrelated hosts
+- **Operator identity** — every event carries an operator id resolved from the API token
+- **Evidence chain + OpenTimestamps** — append-only SHA-256 chain, hourly anchored to public OpenTimestamps calendars, one-command `.ots` bundle export for third-party `ots verify` ([details](docs/audit-trail.md))
+- **Ghostwriter-compatible event schema** — first-class `dns`, `credential_use`, `c2_checkin`, `file_transfer` types plus standard `dest_ip / dest_host / mitre_ttp / description` keys ([details](docs/event-schema.md))
+- **Signed evidence bundle** — `redlog-cli export bundle` produces a self-contained directory with SHA-256 manifest ready for delivery
+- **Entropy-based redaction** — high-entropy tokens and per-project allow/denylist patterns are auto-redacted from captured output
+- **Clock hardening** — every event carries wall-clock, monotonic, and NTP offset
+- **asciinema terminal recording** — every RedLog terminal pane produces a `.cast` file with SHA-256 stored on session end; the timeline exposes both **per-command replay** (▶ Replay stdout) and **full-session replay** (▶ Replay entire session) — critical when the operator ssh'd into a remote host and the local `ssh` command_end is the only chain entry from that stretch
+- **One-click proxied browser** — launches Chromium through your mitmproxy with CDP enabled and a project-local profile, so captured traffic and QuickMarks work without touching your daily browser ([details](docs/agent-integration.md#proxied-browser))
+- **Internal-pivot awareness** — auto-detects ligolo-ng / chisel / `ssh -D/-L/-R` / sshuttle / proxychains from shell commands and records a first-class `pivot` event (intermediate node, route, SOCKS port, MITRE T1090/T1572) so the timeline shows the lateral-movement topology; plain `ssh user@host` also fires a pivot so the timeline reflects "attention moved to a remote host" ([details](docs/event-schema.md#pivot-events))
+- **VPS deployment** — `hooks/vps-deploy.sh install user@vps && hooks/vps-deploy.sh tunnel user@vps` copies the shell hook to a remote box and opens a reverse-tunnel session, so every command run on the VPS lands in the local chain in real time
+- **Pause means pause** — while recording is paused RedLog writes nothing except its own audit trail (`system`) and explicit markers. The gate sits at the single DB write point, so every source is covered — the shell hook and the mitmproxy addon included — and no derived event (scope violation, loot, pivot) leaks the content either. The paused API answers `200 {recording:false, skipped}` so the hook doesn't spool and replay it later. Each `recording_paused` / `recording_resumed` row records whether the toggle came from the `ui` or the `api`
+- **AI project boundaries** — transcript capture requires an installed integration, explicit project working directories and activation. Exclusions can narrow that permission; they cannot grant it. The shell hook has a separate recording control and does not inherit the AI directory scope
+- **Extensible plugin system** — 🟢 declarative packs (loot/redaction/target patterns, event types, capture integrations) load automatically; 🔴 code plugins (exporters, monitors) run in an isolated process behind a content-hash-pinned, capability-scoped trust gate ([details](docs/plugin-development.md))
+- **Team sync** — export/import project config profiles so everyone starts with identical scope and settings
+
+## Features
+
+### Recording Engine
+
+| Module | What it captures | Notes |
+|--------|-----------------|-------|
+| Shell hook (bash/zsh preexec) | Every command with pid, exit code, duration | Auto-installed for the built-in terminal; opt-in `source` for external shells |
+| Built-in terminal (node-pty) | Terminal-pane lifecycle + asciinema `.cast` recording | SHA-256'd, automatic segments (default 50 MiB per file) |
+| Pivot auto-detector | ssh -D/-L/-R, chisel, ligolo, sshuttle, proxychains, socat → structured `pivot` events | Foreground close detected via `command_end`; 30-min recency window fallback |
+| Cleanup auto-detector | `history -c`, `journalctl --vacuum`, `wevtutil cl`, `shred`, `touch -t`, `chattr +i` → `cleanup` events | NIST SP 800-86 anti-forensics tracking |
+| File-transfer auto-detector | `curl -o`, `wget -O`, `scp`, `rsync`, `python -m http.server` → `file_transfer` events | T1105 ingress / T1041 exfil |
+| Browser CDP monitor | Every URL change in the built-in browser → `http_navigation` (T1071.001) | Filters `chrome://`, `about:`, `devtools:`, `view-source:` |
+| Clipboard monitor *(opt-in)* | SHA-256 + length + line count always; loot detector runs on content; 120-char redacted preview optional | Off by default — clipboard is sensitive |
+| Screenshot agent | Periodic + on-demand desktop captures | SHA-256 in event, quality configurable |
+| IP monitor | External IP + safety hysteresis (safe/exposed/unknown) | `system.ip_transition` on every state or IP change |
+| OPSEC state monitor | VPN interfaces (utun/tun/tap/wg/ppp/…), DNS resolvers, primary MAC, hostname | `system.opsec_state_changed` on any drift (30 s poll) |
+| Scope monitor | Command targets vs allowed scope | Own `scope` lane; `warn` (violation) or `log` (silent record) enforcement |
+| Loot detector | AWS keys, JWTs, tokens, password hashes, flags, PII | Regex + entropy; plugin-extensible via `lootPatterns` |
+| Config diff | Security-relevant setting changes on save | `system.config_changed` with from→to diff on scope / blacklist / enforcement |
+| Recording toggle | Every pause/resume | `system.recording_paused` / `recording_resumed` so timeline gaps are explainable |
+
+### Timeline & UI
+
+- **Swim-lane Timeline** — 18 lanes (shell, agent, http_navigation, scanner, browser, dns, pivot, screenshot, clipboard, file_transfer, credential_use, c2_checkin, marker, loot, cleanup, scope, process, system) banded into four collapsible groups: commands / traffic / artifacts / signals. Empty lanes auto-collapse — only what this engagement touched
+- **Housekeeping filter** — RedLog's own lifecycle (api_started, session_start, terminal-pane open/close, the "silent" hook auto-source) stays in the DB for the record but is hidden from the timeline
+- **Command pair collapse** — a `shell.command_start` disappears once its matching `command_end` lands (same pid+cmd); still-running commands keep showing
+- **Cursor-anchored zoom** — trackpad pinch and wheel zoom stay locked to what's under the cursor
+- **Cluster popover** — a burst of events on one lane collapses into a dot; click to expand and jump to any event
+- **Focus jumps** — clicking a loot/mark scrolls the timeline to that event and highlights it
+- **Density minimap** — drag-to-zoom over a time range
+- **Pause / Resume** — status-bar indicator; every toggle lands as an event so the timeline gap is explainable
+- **Global Search** — full-text across all event types
+- **Target View** — auto-cataloged targets with per-target evidence drill-down
+- **Loot Panel** — detected credentials/secrets by type, with source (command/host) and jump-to-timeline
+- **Scope Status** — violation log with enforcement mode (warn / log)
+- **Screenshot Gallery** — thumbnail grid with lightbox
+- **Multi-tab Terminal** — concurrent PTY sessions; asciinema recording per pane
+- **Error Boundary** — per-view crash recovery
+
+### HUD (heads-up overlay)
+
+- **IP Widget** — always-on-top floating display: external IP (primary), internal IP + Wi-Fi/wired name, detected relay nodes, recording state, capture health
+- **EXPOSED alarm** — when the external IP hits the blacklist, the whole frame flashes red (toggle in Settings ▸ Overlay); default on
+- **Live pivot chain** — active internal-network pivot nodes (tool · node · route); listed as detected, without claiming which node forwards to which or that a channel is up
+- **macOS Dock icon** — configurable (Settings ▸ Overlay); opening the HUD otherwise flips the app to accessory activation and drops the Dock icon
+- **Click-through Mode** — passes mouse events through to windows below; hover to reactivate
+- **Draggable** — grab the overlay to reposition
+- **Menubar / tray** — red pulsing dot while recording (no text label — keeps the menu-bar compact)
+
+### Scope Engine
+
+RedLog's scope monitor uses root-domain matching for smart violation detection:
+
+- **In scope**: `admin.example.com` when scope includes `*.example.com` — no alert
+- **Out of scope, same root**: `staging.example.com` when scope only lists `api.example.com` — **warning**
+- **Unrelated host**: `google.com` — silently ignored (no false positive)
+- **IP targets**: CIDR matching with `/24`, `/16`, etc.
+- **Excluded targets**: explicitly excluded IPs/hosts always flagged
+
+### Project Management
+
+- Per-project isolation (config, database, screenshots, terminal recordings)
+- Advanced setup at creation: pre-configure scope targets, IP whitelist/blacklist, enforcement mode
+- Config profile export/import (YAML or JSON) for team synchronization
+- Hot-reload on config save — no restart needed
+
+### Plugins
+
+Trust-tiered plugin system for shop-specific patterns (see [docs/plugin-development.md](docs/plugin-development.md)):
+
+- 🟢 **Declarative** (no code): `lootPatterns`, `redaction`, `commandTags` (stamp MITRE / custom fields onto shell events), `targetExtractors`, `eventTypes`, `capture` integrations
+- 🔴 **Privileged** (code): `tailers` only, from bundled plugins only — content-hash pinned and inert until the operator grants trust. Tailer code runs in the main process; it is not sandboxed.
+
+RedLog ships with **no** `commandTags` installed — MITRE tagging is opinionated per shop, so either drop a plugin into `~/.redlog/plugins/` (Settings ▸ Plugins ▸ Open folder) or let your SIEM tag downstream. Hot-reload from Settings ▸ Plugins ▸ Reload.
+
+### i18n
+
+Built-in English and Traditional Chinese (zh-TW). Locale files in `src/renderer/src/i18n/`.
+
+## AI Agent Integration
+
+Claude Code is the first conversation workflow, followed by Codex. Install the selected RedLog capture integration in **Settings ▸ Other capture sources ▸ AI conversations**, select its project working directories, then enable new conversations. Installation alone does not start capture or import history. Supported local transcripts supply user messages, AI replies and tool calls/results. This does not cover Claude desktop/web conversations or promise hidden reasoning and image attachments.
+
+**What the raw copy holds.** Besides the structured events, RedLog keeps each authorized conversation byte for byte in `agent-transcripts/*.jsonl`. That copy is the agent's transcript as written, not the redacted event preview. It may include thinking, unredacted credentials, tool input and output, and the contents of files outside the working directory that the agent read. **Include thinking blocks** only decides whether thinking becomes a structured event; the raw copy keeps it either way. Nothing is saved while capture is paused or disabled, and resuming does not backfill what was skipped. Saving, display and export are authorized separately. No export screen includes the raw copy today; the bundle writer accepts it only as a separate opt-in, and refuses it alongside a plan-approved selection or time/session range, because a transcript is a whole file that cannot be trimmed to selected events, and alongside scope masking, a snapshot, personal domains or any event marked Exclude from export, because the raw copy is neither masked nor trimmed. When it is included, the bundle manifest lists every transcript with its SHA-256 and byte count under `rawAgentTranscripts`, marked `redacted: false`.
+
+Shell hooks record terminal commands separately; a shell hook alone does not capture the AI conversation. The API supplies explicit events when needed. See [Capture priority](docs/agent-integration.md#how-ai-conversations-are-recorded).
+
+### Layer 1: Terminal Hooks (Automatic Capture) — start here
+
+Connect your interactive terminal to record its commands and supported output. Non-interactive shells spawned by AI tools may not load shell hooks; use the optional AI transcript integration for their conversation and source-reported tool results.
+
+> **RedLog captures nothing until a source is wired up — being open is not enough.** Install the adapter for each interactive shell. AI capture integrations for Claude Code and Codex are individually optional and uninstalled by default. Parser packages ship as inert offline resources; only the chosen package is installed and loaded after project authorization. Install the desired integration in Settings ▸ Other capture sources ▸ AI conversations, add project working directories, then explicitly enable it to record new supported messages and tool calls/results. The Dashboard's **Capture Health** card warns you when nothing is feeding. See [Set up capture](docs/agent-integration.md#set-up-capture--do-this-first).
+
+**Any agent via shell hook (zsh/bash):**
+
+```bash
+# Add the matching adapter to the shell profile
+source /path/to/redlog/hooks/shell-zsh-hook.zsh  # ~/.zshrc
+source /path/to/redlog/hooks/shell-bash-hook.sh  # ~/.bashrc
+```
+
+The Bash/Zsh adapters record command metadata and automatically capture bounded
+output for ordinary commands. Interactive/native exceptions stay explicit.
+For an explicitly recorded PTY session on macOS/Linux, run
+`redlog-session` to enter a recorded shell, or `redlog-session -- ssh user@host`
+for one command. Python 3 is required. Output is bounded and searchable; see
+[external session recording](docs/external-session-recording.md) for pause,
+project isolation, truncation and platform limits.
+
+### Layer 2: HTTP API (Universal)
+
+Direct REST API for scripts and custom agents.
+
+```bash
+TOKEN=$(cat ~/.redlog/api-token)
+PORT=$(cat ~/.redlog/api-port)
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:$PORT/api/status
+```
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/health` | Health check (no auth) |
+| GET | `/api/status` | System status |
+| GET | `/api/config` | Project configuration |
+| GET | `/api/scope` | Scope targets + violations |
+| GET | `/api/recording` | Recording state |
+| POST | `/api/recording` | Control recording (`pause`/`resume`/`toggle`) |
+| POST | `/api/events` | Insert event |
+| GET | `/api/events` | Query events (filter by `agent_type`, `target_id`, `limit`, `since`) |
+| GET | `/api/events/search` | Full-text search (`?q=...&limit=N&cursor=...`, pages with `hasMore` / `nextCursor`) |
+| GET | `/api/events/count` | Event count |
+| POST | `/api/marker` | Create a marker event |
+| GET | `/api/bookmarks` | List bookmarks |
+| POST | `/api/bookmarks` | Create bookmark |
+| POST | `/api/loot/scan` | Scan text for secrets |
+| POST | `/api/screenshot` | Trigger manual capture |
+| GET | `/api/whoami` | Operator identity for this token |
+| GET | `/api/operators` | List operators (attribution) |
+| GET | `/api/chain` | Chain length + last anchor |
+| GET/POST | `/api/anchors` | List / trigger OpenTimestamps anchoring |
+| GET | `/api/anchors/verify` | Fast integrity check |
+
+### Layer 3: Shell Functions
+
+```bash
+source /path/to/redlog/shell/redlog-agent.sh
+
+redlog_status                           # check connection
+redlog_mark "Found SQLi" "Blind" "high" # create marker
+redlog_event "agent" '{"subtype":"scan_complete"}'
+redlog_search "password"                # search events
+redlog_scope                            # check scope
+redlog_loot "root:x:0:0:..."           # scan for creds
+redlog_bookmark "Interesting endpoint" "https://..."
+redlog_screenshot                       # manual capture
+```
+
+### Codex / OpenAI Function Calling
+
+See [`docs/codex-tools.json`](docs/codex-tools.json) for OpenAI-compatible function definitions usable with Codex, GPT, or any OpenAI-API-compatible model.
+
+### More reading
+
+- [操作者手冊 (User guide, zh-TW)](docs/USER-GUIDE.md) — first engagement in ten minutes: what to wire up, what each screen answers, how to export
+- [Docs index](docs/README.md) — operator, engineering, specs and historical records
+- [Work plan](docs/WORK-PLAN.md) — remaining work, dependencies and acceptance owners
+- [Spec index](specs/README.md) — feature status and existing implementation to reconcile
+- [Agent integration](docs/agent-integration.md) — full REST + hook reference
+- [Audit trail](docs/audit-trail.md) — hash chain + OpenTimestamps + full re-walk + bundle export
+- [Event schema](docs/event-schema.md) — standard agent_type + data keys (Ghostwriter-compatible)
+- [Plugin development](docs/plugin-development.md) — extend RedLog: 🟢 declarative packs + 🔴 trust-gated code plugins
+- [Skill: redlog-pentest](docs/skills/redlog-pentest.md) — ready-to-copy Claude Code skill
+
+## Architecture
+
+The renderer calls an explicit preload bridge; Electron main owns native
+capabilities and project lifecycle, while `src/core/` owns ingest, storage,
+query, content and export policies. Capture sources share the same ingest
+path. See [Architecture](docs/ARCHITECTURE.md) for the current responsibilities,
+project-open rollback, content interfaces and placement rules.
+
+## Project Structure
+
+```text
+src/
+  core/                     domain policies, evidence, query, content and export
+    db/                     schema, writes, event/activity queries and bookmarks
+    query/                  shared query contract
+    alert/                  alert policy and projection
+    plugins/                manifest, trust and contribution handling
+  main/                     Electron app and project lifecycle
+    ipc/                    handlers grouped by behaviour
+    services/               native capture and integration adapters
+  preload/                  renderer bridge
+  renderer/src/             UI, pure view logic, locales and styles
+hooks/                      external shell and capture transport
+plugins/                    bundled declarations and producers
+optional-plugins/           opt-in Claude Code and Codex integrations
+cli/                        command-line integration
+shell/                      shell helpers
+specs/                      numbered feature contracts, tasks and verification
+docs/                       operator guides, standards and engineering entry points
+  domain/                   stable domain contracts
+  records/YYYY-MM-DD/       dated cross-feature reviews and acceptance evidence
+  archive/                  superseded proposals and planning snapshots
+test/                       unit, database and contract tests
+e2e/                        real Electron and installed-package journeys
+scripts/                    build and verification commands
+tools/                      offline verifier and asset tools
+design/                     design sources and icon masters
+resources/                  packaged resources and generated icon outputs
+```
+
+`out/`, `dist/` and test reports are generated artifacts; they are not source
+or documentation. The [work plan](docs/WORK-PLAN.md) and [spec index](specs/README.md)
+point to existing work without creating parallel implementations.
+
+## Data Model
+
+Project event metadata is stored in SQLite (`~/.redlog/projects/<id>/timeline.db`); saved content also lives in referenced files. `events` is the chained tier, while `events_logged` is the logged tier. The following table is an overview; [the schema](src/core/db/index.ts) and [Architecture](docs/ARCHITECTURE.md#3-data-model) define the current model:
+
+### events table
+
+| Column | Type | Description |
+|--------|------|-------------|
+| id | TEXT PK | UUID |
+| timestamp | INTEGER | Unix ms |
+| engagement_id | TEXT | Engagement identifier |
+| session_id | TEXT | App session UUID |
+| operator_id | TEXT | Operator identifier |
+| agent_type | TEXT | shell, screenshot, clipboard, file_transfer, marker, loot, system |
+| hostname | TEXT | Machine hostname |
+| source_ip | TEXT | Source IP (nullable) |
+| target_id | TEXT | Auto-detected target (nullable) |
+| data | TEXT | JSON payload (varies by agent_type) |
+| hash | TEXT | SHA-256 of event content |
+| created_at | INTEGER | Unix ms |
+
+### Per-project directory
+
+```
+~/.redlog/projects/<id>/
+  config.yaml          engagement config
+  timeline.db          SQLite database
+  screenshots/         JPEG captures
+  casts/               asciicast v2 recordings and bounded parts
+  http-bodies/         saved HTTP/content sidecars
+  agent-transcripts/   explicitly enabled AI source bytes
+```
+
+## Configuration
+
+```yaml
+engagement:
+  id: pentest-2026-001
+  name: "Example Corp External Pentest"
+operator:
+  id: op-1
+  name: "Operator"
+network:
+  vpnIPs: ["203.0.113.42"]
+  dailyIPs: ["114.24.97.0/24"]
+  checkInterval: 10
+scope:
+  enforcement: warn    # warn | log
+  targets: ["*.example.com", "10.0.0.0/8"]
+  excludeTargets: ["10.0.0.1"]
+```
+
+Changes are hot-reloaded — no restart needed.
+
+### Team Config Sync
+
+Export your project config as a `.yaml` or `.json` profile:
+
+1. **Export**: Settings → Team Profile Sync → Export Profile
+2. **Import**: Project Picker → New project → Import Profile. Importing replaces what an earlier import set (fields the file leaves out return to the defaults); a file that cannot be used is refused with the reason and leaves your current choice as it was; **Clear imported settings** drops it
+3. Share the file with teammates — they import it when creating a new project
+
+## Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
+| Cmd+1..8 | Switch views |
+| Cmd+Shift+M | Add marker (opens the marker dialog) |
+| Cmd+/ | Search |
+
+## Security Model
+
+- **Sandbox**: `contextIsolation: true`, `nodeIntegration: false`, `sandbox: true`
+- **contextBridge**: explicit API surface — renderer cannot access Node.js
+- **Path validation**: screenshot reads validated within project directory
+- **Clipboard redaction**: passwords, API keys, private keys auto-redacted
+- **API auth**: Bearer token (random 32 bytes), file permission 0600
+- **API binding**: 127.0.0.1 only — not exposed to network
+
+## Tech Stack
+
+| Layer | Technology |
+|-------|-----------|
+| Runtime | Electron 44 + electron-vite |
+| Database | better-sqlite3 (WAL mode) |
+| UI | React 19 + Tailwind CSS 4 |
+| Timeline | Custom HTML/CSS swim-lane (zero dependencies) |
+| Screenshot capture | electron `desktopCapturer` + SHA-256 dedup (hash-suffix key) |
+| Terminal | node-pty + @xterm/xterm; asciinema `.cast` recording per pane |
+| DNS logging | dns2 |
+| Config | js-yaml |
+| i18n | Custom React context |
+| Build | electron-builder |
+| AI integration | Optional local transcripts + shell hooks + HTTP API |
+
+## Development
+
+Building from source is for contributors and for platforms without an
+installer (Intel Macs). Requires Node 20 or 22 and Python 3 plus a C/C++
+toolchain for the native `better-sqlite3` module.
+
+```bash
+npm install
+npm run rebuild        # rebuild better-sqlite3 for Electron's ABI
+npm run dev            # run the app with hot reload
+npm run build          # production build of main + renderer
+```
+
+If `npm run dev` stops with `Electron uninstall`, the install skipped Electron's
+download step (for example `npm install --ignore-scripts`): run
+`node node_modules/electron/install.js`. A built-in terminal that opens but
+fails with `posix_spawnp failed` lost the execute bit on node-pty's
+`spawn-helper`; RedLog restores it the first time a terminal starts, or run
+`chmod +x node_modules/node-pty/prebuilds/*/spawn-helper`.
+
+### Packaging
+
+```bash
+npx electron-builder --mac      # DMG + zip, arm64 (Intel Mac: add --x64)
+npx electron-builder --win      # NSIS installer
+npx electron-builder --linux    # DEB installer
+```
+
+Built artifacts go to `dist/`. Tagged releases are built by
+[`.github/workflows/release.yml`](.github/workflows/release.yml), which also
+publishes `SHA256SUMS.txt`.
+
+## Cloud share backend (optional)
+
+The **Share (bundle)** button in Settings ships with a local `file://` stub —
+it exercises the whole redaction-gate + zip flow without any backend. If you
+want a real shareable URL, deploy the companion Cloudflare Worker in
+[`redlog-share-worker/`](redlog-share-worker/) to your own Cloudflare account
+(free tier fits most single-operator use) and point RedLog at it via
+**Settings ▸ Cloud share ▸ Advanced: HTTPS backend**. The RedLog project does
+not host a default tier — every operator BYO-buckets, so sanitized evidence
+never leaves accounts you control. See
+[`redlog-share-worker/README.md`](redlog-share-worker/README.md) for the
+deploy walkthrough.
+
+## Release notes
+
+Per-version summary lives in [`CHANGELOG.md`](CHANGELOG.md); full commit
+messages via `gh release view v0.6.x`.
+
+## License
+
+MIT

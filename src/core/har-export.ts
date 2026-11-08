@@ -1,0 +1,342 @@
+import { capturedContentIsPartial } from './content-contract'
+import { queryEvents, queryEventById, type RedLogEvent } from './db/events'
+import { BODY_REF_FIELDS, readBodyForDelivery, type BodyRef } from './http-body-store'
+import { eventIdsReferencingBody } from './http-body-index'
+import { redactEventForExport, redactEventsForExport, type RedactExportOpts } from './redact-export'
+import { isOutOfScope, isUnclassifiedScope, type ScopeForSanitize } from './scope-sanitize'
+import type { ExportSnapshot } from './export-plan'
+
+interface HarWebSocketMessage {
+  eventId: string
+  seq: unknown
+  direction: unknown
+  messageType: unknown
+  observedSize: unknown
+  truncated: boolean
+  body: ReturnType<typeof resolveBody>
+}
+
+interface HarStreamChunk {
+  eventId: string
+  seq: unknown
+  offset: unknown
+  contentEncoding: unknown
+  body: ReturnType<typeof resolveBody>
+}
+
+interface HarFlowSegments {
+  webSocketMessages?: HarWebSocketMessage[]
+  streamChunks?: HarStreamChunk[]
+}
+
+/** A flow with saved segments and neither its request nor its response
+ *  (#461). Only what was observed: no method, status or timing is invented. */
+interface HarPartialFlow extends HarFlowSegments {
+  flowId: string
+  requestEventId: null
+  responseEventId: null
+  incomplete: true
+  url: string | null
+  firstObservedAt: string
+}
+
+interface HarEntry {
+  _redlog: { flowId: string; requestEventId: string | null; responseEventId: string | null; incomplete: boolean } & HarFlowSegments
+  startedDateTime: string
+  time: number
+  request: {
+    method: string
+    url: string
+    httpVersion: string
+    cookies: unknown[]
+    headers: { name: string; value: string }[]
+    queryString: { name: string; value: string }[]
+    postData?: { mimeType: string; text: string }
+    headersSize: number
+    bodySize: number
+  }
+  response: {
+    status: number
+    statusText: string
+    httpVersion: string
+    cookies: unknown[]
+    headers: { name: string; value: string }[]
+    content: { size: number; mimeType: string; text?: string; encoding?: string }
+    redirectURL: string
+    headersSize: number
+    bodySize: number
+  }
+  cache: Record<string, never>
+  timings: { send: number; wait: number; receive: number; connect?: number; ssl?: number }
+}
+
+interface HarCookie {
+  name: string
+  value: string
+  path?: string
+  domain?: string
+  expires?: string
+  httpOnly?: boolean
+  secure?: boolean
+}
+
+function requestCookiesToHar(raw: unknown): HarCookie[] {
+  if (!Array.isArray(raw)) return []
+  return (raw as { name?: string; value?: string }[])
+    .filter(c => c.name)
+    .map(c => ({ name: String(c.name), value: String(c.value ?? '') }))
+}
+
+function responseCookiesToHar(raw: unknown): HarCookie[] {
+  if (!Array.isArray(raw)) return []
+  return (raw as Record<string, unknown>[])
+    .filter(c => c.name)
+    .map(c => ({
+      name: String(c.name),
+      value: String(c.value ?? ''),
+      ...(c.path ? { path: String(c.path) } : {}),
+      ...(c.domain ? { domain: String(c.domain) } : {}),
+      ...(c.expires ? { expires: String(c.expires) } : {}),
+      ...(c.httponly ? { httpOnly: true } : {}),
+      ...(c.secure ? { secure: true } : {})
+    }))
+}
+
+function findHeader(headers: unknown, name: string): string | undefined {
+  if (!Array.isArray(headers)) return undefined
+  const lower = name.toLowerCase()
+  for (const pair of headers as string[][]) {
+    if (Array.isArray(pair) && pair[0]?.toLowerCase() === lower) return pair[1]
+  }
+  return undefined
+}
+
+function headersToHar(raw: unknown): { name: string; value: string }[] {
+  if (Array.isArray(raw)) {
+    return (raw as string[][]).map(([n, v]) => ({ name: n, value: v }))
+  }
+  if (raw && typeof raw === 'object') {
+    return Object.entries(raw as Record<string, string>).map(([name, value]) => ({ name, value }))
+  }
+  return []
+}
+
+function resolveBody(
+  inlineBody: { data?: string; encoding?: string; size?: number } | undefined,
+  bodyRef: BodyRef | undefined
+): { text: string; encoding?: string; size: number } | null {
+  if (inlineBody?.data) {
+    return {
+      text: inlineBody.data,
+      encoding: inlineBody.encoding === 'base64' ? 'base64' : undefined,
+      size: inlineBody.size ?? inlineBody.data.length
+    }
+  }
+  if (bodyRef) {
+    const content = readBodyForDelivery(bodyRef)
+    if (content !== null) {
+      return {
+        text: content,
+        encoding: bodyRef.encoding === 'base64' ? 'base64' : undefined,
+        size: bodyRef.size
+      }
+    }
+  }
+  return null
+}
+
+function flowSegments(chunks: RedLogEvent[] | undefined, messages: RedLogEvent[] | undefined): HarFlowSegments {
+  return {
+    ...(messages ? { webSocketMessages: [...messages]
+      .sort((a, b) => Number(a.data.message_count) - Number(b.data.message_count)).map(event => ({
+        eventId: event.id, seq: event.data.message_count, direction: event.data.direction, messageType: event.data.message_type, observedSize: event.data.size,
+        truncated: Boolean((event.data.ws_body as { truncated?: boolean } | undefined)?.truncated || (event.data.ws_body_ref as BodyRef | undefined)?.truncated),
+        body: resolveBody(event.data.ws_body as { data?: string; encoding?: string; size?: number }, event.data.ws_body_ref as BodyRef | undefined)
+      })) } : {}),
+    ...(chunks ? {
+      streamChunks: [...chunks]
+        .sort((a, b) => Number(a.data.seq) - Number(b.data.seq)).map(event => ({
+          eventId: event.id, seq: event.data.seq, offset: event.data.offset, contentEncoding: event.data.content_encoding ?? 'identity',
+          body: resolveBody(event.data.response_body as { data?: string; encoding?: string; size?: number }, event.data.response_body_ref as BodyRef | undefined)
+        }))
+    } : {})
+  }
+}
+
+function parseQueryString(url: string): { name: string; value: string }[] {
+  try {
+    const u = new URL(url)
+    const result: { name: string; value: string }[] = []
+    u.searchParams.forEach((value, name) => result.push({ name, value }))
+    return result
+  } catch {
+    return []
+  }
+}
+
+export function exportHar(opts?: {
+  since?: number
+  before?: number
+  targetId?: string
+  limit?: number
+  /** When set, out-of-scope hosts' bodies are masked; the layer-4 sanitize
+   *  swap applies regardless (see redact-export.ts). */
+  scope?: ScopeForSanitize
+  doNotExportIds?: Set<string>
+  snapshot?: ExportSnapshot
+  /** The plan's approved events. A selection's predicates (method, status,
+   *  text) cannot be expressed as since/before/targetId, so without this the
+   *  HAR would carry every flow in the snapshot — which is the widening
+   *  spec 056 exists to stop. */
+  includeEventIds?: ReadonlySet<string>
+}): string {
+  const rOpts: RedactExportOpts = { scope: opts?.scope, doNotExportIds: opts?.doNotExportIds }
+  const selected = opts?.includeEventIds
+  const events = redactEventsForExport(queryEvents({
+    agentType: 'scanner',
+    tier: 'logged',
+    // A plan has already decided which events are in the export, and its
+    // preview reports that full count. A default cap here dropped the oldest
+    // events silently — scanner rows include DNS, connections and C2 check-ins,
+    // which spend the same budget as HTTP. Only the ad-hoc call keeps a cap.
+    limit: opts?.limit ?? (selected ? -1 : 50000),
+    since: opts?.since,
+    before: opts?.before,
+    snapshot: opts?.snapshot,
+    ...(opts?.targetId ? { targetId: opts.targetId } : {})
+  }).filter((event) => !selected || selected.has(event.id)), rOpts)
+
+  const requests = new Map<string, RedLogEvent>()
+  const responses = new Map<string, RedLogEvent>()
+  const streamChunks = new Map<string, RedLogEvent[]>()
+  const webSocketMessages = new Map<string, RedLogEvent[]>()
+
+  for (const ev of events) {
+    const d = ev.data as Record<string, unknown> | undefined
+    if (!d) continue
+    const flowId = d.flow_id as string | undefined
+    if (typeof flowId !== 'string' || !flowId) continue
+    if (d.subtype === 'ws_message') {
+      const messages = webSocketMessages.get(flowId) ?? []
+      messages.push(ev); webSocketMessages.set(flowId, messages)
+    }
+    if (d.subtype === 'http_response_chunk') {
+      const chunks = streamChunks.get(flowId) ?? []
+      chunks.push(ev); streamChunks.set(flowId, chunks)
+    }
+    if (d.subtype === 'http_request_start') requests.set(flowId, ev)
+    else if (d.subtype === 'http_response' && !responses.has(flowId)) responses.set(flowId, ev)
+  }
+
+  const entries: HarEntry[] = []
+
+  for (const flowId of new Set([...requests.keys(), ...responses.keys()])) {
+    const reqEv = requests.get(flowId)
+    const respEv = responses.get(flowId)
+    const rd = (reqEv?.data ?? {}) as Record<string, unknown>
+    const rsd = respEv?.data as Record<string, unknown> | undefined
+
+    const reqBody = resolveBody(
+      rd.request_body as { data?: string; encoding?: string; size?: number } | undefined,
+      rd.request_body_ref as BodyRef | undefined
+    )
+    const respBody = resolveBody(
+      rsd?.response_body as { data?: string; encoding?: string; size?: number } | undefined,
+      rsd?.response_body_ref as BodyRef | undefined
+    )
+
+    const timing = rsd?.timing as Record<string, number> | undefined
+
+    const entry: HarEntry = {
+      _redlog: { flowId, requestEventId: reqEv?.id ?? null, responseEventId: respEv?.id ?? null, incomplete: !reqEv || !respEv || rsd?.streamed === true || webSocketMessages.has(flowId) || capturedContentIsPartial(rd) || capturedContentIsPartial(rsd ?? {}),
+        ...flowSegments(streamChunks.get(flowId), webSocketMessages.get(flowId)) },
+      startedDateTime: new Date(reqEv?.timestamp ?? respEv!.timestamp).toISOString(),
+      time: (rsd?.duration_ms as number) ?? -1,
+      request: {
+        method: String(rd.method ?? rsd?.method ?? ''),
+        url: String(rd.url ?? rsd?.url ?? ''),
+        httpVersion: String(rd.http_version ?? rsd?.http_version ?? 'HTTP/1.1'),
+        cookies: requestCookiesToHar(rd.cookies),
+        headers: headersToHar(rd.request_headers),
+        queryString: parseQueryString(String(rd.url ?? '')),
+        ...(reqBody ? { postData: { mimeType: findHeader(rd.request_headers, 'content-type') ?? 'application/octet-stream', text: reqBody.text } } : {}),
+        headersSize: -1,
+        bodySize: reqBody?.size ?? -1,
+      },
+      response: {
+        status: (rsd?.status as number) ?? 0,
+        statusText: '',
+        httpVersion: String(rsd?.http_version ?? rd.http_version ?? 'HTTP/1.1'),
+        cookies: responseCookiesToHar(rsd?.set_cookies),
+        headers: headersToHar(rsd?.response_headers),
+        content: {
+          size: (rsd?.content_length as number) ?? 0,
+          mimeType: String(rsd?.content_type ?? 'application/octet-stream'),
+          ...(respBody ? { text: respBody.text, ...(respBody.encoding ? { encoding: respBody.encoding } : {}) } : {})
+        },
+        redirectURL: '',
+        headersSize: -1,
+        bodySize: (rsd?.content_length as number) ?? -1,
+      },
+      cache: {},
+      timings: {
+        send: timing?.send_ms ?? -1,
+        wait: timing?.wait_ms ?? -1,
+        receive: timing?.receive_ms ?? -1,
+        ...(timing?.connect_ms !== undefined ? { connect: timing.connect_ms } : {}),
+        ...(timing?.tls_ms !== undefined ? { ssl: timing.tls_ms } : {})
+      }
+    }
+
+    entries.push(entry)
+  }
+
+  entries.sort((a, b) => a.startedDateTime.localeCompare(b.startedDateTime))
+
+  // #461: segments whose request and response were never saved. Building
+  // entries from requests and responses alone dropped these, approved events
+  // and all, and a HAR entry cannot hold them without an invented request and
+  // status — so they sit beside the entries, in RedLog's own field.
+  const partialFlows: HarPartialFlow[] = []
+  for (const flowId of new Set([...streamChunks.keys(), ...webSocketMessages.keys()])) {
+    if (requests.has(flowId) || responses.has(flowId)) continue
+    const segments = [...(streamChunks.get(flowId) ?? []), ...(webSocketMessages.get(flowId) ?? [])]
+    const url = segments.map(event => event.data.url).find((u): u is string => typeof u === 'string')
+    partialFlows.push({
+      flowId, requestEventId: null, responseEventId: null, incomplete: true, url: url ?? null,
+      firstObservedAt: new Date(Math.min(...segments.map(event => event.timestamp))).toISOString(),
+      ...flowSegments(streamChunks.get(flowId), webSocketMessages.get(flowId))
+    })
+  }
+  partialFlows.sort((a, b) => a.firstObservedAt.localeCompare(b.firstObservedAt))
+
+  const har = {
+    log: {
+      version: '1.2',
+      creator: { name: 'RedLog', version: '1.0.0' },
+      entries,
+      ...(partialFlows.length ? { _redlog: { partialFlows } } : {})
+    }
+  }
+
+  return JSON.stringify(har, null, 2)
+}
+
+/** Whether the HAR export would deliver this body-store file under `scope`:
+ *  true when at least one event that references it survives the export's own
+ *  redaction with the reference intact. `/api/http-body/<sha>` asks this so a
+ *  hash read from an event cannot fetch what the export masks.
+ *
+ *  The scope predicates are checked directly as well as through the redaction:
+ *  a reference with no preview field beside it is not masked by
+ *  `redactEventForExport`, so its out-of-scope row would otherwise pass. */
+export function bodyDeliverableUnderScope(sha256: string, scope: ScopeForSanitize): boolean {
+  const file = `${sha256}.body`
+  for (const id of eventIdsReferencingBody(sha256)) {
+    const event = queryEventById(id)
+    if (!event || isOutOfScope(event.targetId, scope) || isUnclassifiedScope(event.targetId, scope)) continue
+    const exported = redactEventForExport(event, { scope })
+    if (exported && BODY_REF_FIELDS.some(field => (exported.data[field] as BodyRef | undefined)?.file === file)) return true
+  }
+  return false
+}

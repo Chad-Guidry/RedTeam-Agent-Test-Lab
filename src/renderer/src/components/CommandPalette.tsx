@@ -1,0 +1,411 @@
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
+import { flushSync } from 'react-dom'
+import { SectionLabel } from './SectionLabel'
+import {
+  Gauge, ChevronRight, Rows3, AlignLeft, Image, Crosshair, Ban, Gem, Bookmark, ArrowLeftRight,
+  Settings as SettingsIcon, Search, Play, Pause, FolderOpen, Rows2, UserRound, type LucideIcon,
+  Globe, FilePlus
+} from 'lucide-react'
+import { useI18n } from '../i18n'
+import type { HostAggregate } from '../../../core/db/events'
+import { useFocusTrap } from '../lib/useFocusTrap'
+import { DEFAULT_ORDER, primaryLabelKey, NUMBERED_SLOTS } from '../lib/sidebarOrder'
+import { applyDensity, resolveDensity, storedDensity, DENSITY_KEY } from '../lib/density'
+import { formatTime } from '../lib/time'
+import { parseQuery } from '../../../core/query/contract'
+import { toast } from './Toast'
+import { addArtifactsWithFeedback } from '../lib/addArtifacts'
+import { flushPendingSaves } from '../lib/pendingSaves'
+import { confirmLeaveProject } from '../lib/leaveProject'
+import { captureScreenshotWithFeedback } from '../lib/captureScreenshot'
+import { toggleRecordingWithFeedback } from '../lib/recordingToggle'
+import { MOD } from '../lib/platform'
+
+// ⌘K — the jumper.
+//
+// ⌘K used to mean two different things depending on where you were: the
+// Timeline's own fuzzy palette there, the Search page everywhere else. So an
+// operator had to know which surface they were on to know what the key did,
+// while navigation, project switching and every app-level action had no
+// keyboard route at all. This is the same palette on every view.
+//
+// It is deliberately *not* the search surface. A dropdown is the right shape
+// for "take me to that one thing" and the wrong shape for "show me everything
+// matching, let me filter it and read it" — which is what after-action review
+// actually asks: which files did the agent touch, what happened on this host,
+// which commands failed in those two hours. Those are not jumps. The Search
+// view is the explorer; ⌘K reaches it like anything else.
+//
+// In-page filtering is ⌘F, the convention every other desktop app has already
+// taught.
+
+type Section = 'nav' | 'action' | 'view' | 'project' | 'operator' | 'host' | 'search'
+
+interface Item {
+  id: string
+  section: Section
+  icon: LucideIcon
+  label: string
+  /** Right-hand detail: a shortcut, a timestamp, a path. */
+  hint?: string
+  run: () => void
+}
+
+// ⌘9 is Settings', so the sidebar's numbered run stops at seven — read from
+// sidebarOrder so the palette cannot advertise a chord the sidebar does not.
+// Same detection App uses; read defensively because this module is imported
+// in tests where the preload bridge may be absent.
+
+
+// One icon per view id, the same ones the sidebar draws — a view that fell
+// back to the dashboard gauge here (search, HTTP, bookmarks did) told the
+// operator they were about to open the dashboard.
+const NAV_ICONS: Record<string, LucideIcon> = {
+  dashboard: Gauge, terminal: ChevronRight, timeline: Rows3, transcript: AlignLeft,
+  screenshots: Image, targets: Crosshair, scope: Ban, loot: Gem, bookmarks: Bookmark,
+  search: Search, http_history: ArrowLeftRight
+}
+
+const SECTION_KEY: Record<Section, string> = {
+  nav: 'palette.sectionNav',
+  action: 'palette.sectionAction',
+  view: 'palette.sectionView',
+  project: 'palette.sectionProject',
+  operator: 'palette.sectionOperator',
+  host: 'palette.sectionHost',
+  search: 'palette.sectionSearch'
+}
+
+/** Newest event matches the palette lists; Search has them all. */
+const EVENT_LIMIT = 40
+
+/** Case-insensitive substring score: earlier match wins, then shorter
+ *  haystack. Deliberately not a fuzzy matcher — these are literal identifiers (view names, hosts, commands)
+ *  and gap tolerance only adds noise. */
+function score(haystack: string, needle: string): number {
+  if (!needle) return 1
+  const i = haystack.toLowerCase().indexOf(needle.toLowerCase())
+  if (i < 0) return 0
+  return 1000 - i * 10 - Math.min(haystack.length, 99) / 100
+}
+
+export interface CommandPaletteProps {
+  open: boolean
+  onClose: () => void
+  onNavigate: (view: string) => void
+  onOpenEvent: (id: string, ts: number) => void
+  recording: boolean
+  onProjectClosed?: () => void
+}
+
+
+// Switching project from the palette has the same obligations as closing one
+// from the title bar (#223): write pending settings to THIS project first,
+// and say so when the switch cannot happen instead of reloading regardless.
+//
+// And the same question first. Opening another project closes this one through
+// the same `stopProject()` — the panes go with it — so a switch that is one
+// keystroke away in a fuzzy list is the entry point that most needed asking,
+// not the one that could skip it.
+async function switchProject(
+  target: { id: string; name: string },
+  t: (k: string, v?: Record<string, string | number>) => string,
+  onProjectClosed?: () => void
+): Promise<void> {
+  const current = await window.redlog.project.active().catch(() => null)
+  // No active project means nothing is being stopped; the picker's own flow
+  // does not ask either.
+  if (current && !(await confirmLeaveProject(t, { projectName: current.name, to: target.name }))) return
+  if (!(await flushPendingSaves())) { toast(t('app.closeSaveFailed'), 'error'); return }
+  try {
+    const opened = await window.redlog.project.open(target.id)
+    if (!opened) { toast(t('project.openMissing'), { type: 'error', why: t('project.openMissingWhy') }); return }
+    window.location.reload()
+  } catch (err) {
+    // Main may have closed the old DB before the new one failed. Reflect the
+    // rollback in the workspace while keeping the error toast visible.
+    if (await window.redlog.project.active().catch(() => undefined) === null) {
+      // Mount the picker's toast container before publishing the failure.
+      flushSync(() => onProjectClosed?.())
+    }
+    toast(t('project.openFailedTitle'), { type: 'error', why: t('project.openFailedWhy'), detail: err instanceof Error ? err.message : String(err) })
+  }
+}
+
+export function CommandPalette({
+  open, onClose, onNavigate, onOpenEvent, recording, onProjectClosed
+}: CommandPaletteProps): JSX.Element | null {
+  const { t } = useI18n()
+  const [query, setQuery] = useState('')
+  const [cursor, setCursor] = useState(0)
+  const [events, setEvents] = useState<RedLogEvent[]>([])
+  // An empty result list means three different things, and only one of them
+  // is "nothing matched". The palette says which.
+  const [searchState, setSearchState] = useState<'idle' | 'answered' | 'failed' | 'unparsable'>('idle')
+  // Constitution IV: the palette lists the newest EVENT_LIMIT matches and says
+  // so when the store has more.
+  const [eventsHasMore, setEventsHasMore] = useState(false)
+  const [projects, setProjects] = useState<ProjectMeta[]>([])
+  const [operators, setOperators] = useState<OperatorInfo[]>([])
+  const [hosts, setHosts] = useState<HostAggregate[]>([])
+  const panel = useRef<HTMLDivElement | null>(null)
+  const field = useRef<HTMLInputElement | null>(null)
+  const debounce = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useFocusTrap(panel, open, field)
+
+  // Reset on every open: a palette that remembers last time's query makes the
+  // operator delete something before they can type.
+  useEffect(() => {
+    if (!open) return
+    setQuery('')
+    setCursor(0)
+    setEvents([])
+    window.redlog.project.list().then(setProjects).catch(() => {})
+    // §10 lists operator among what ⌘K covers. It needs no aggregation and no
+    // loaded timeline — `operators:list` is a plain registry read, which is
+    // why this half could land ahead of host search.
+    window.redlog.operators.list().then(setOperators).catch(() => {})
+    // §10 host search: distinct hosts, aggregated in SQL (#65's pattern).
+    window.redlog.events.distinctHosts().then(setHosts).catch(() => {})
+  }, [open])
+
+  // Event search is the only part that costs anything, so it is the only part
+  // that waits.
+  useEffect(() => {
+    if (!open) return
+    if (debounce.current) clearTimeout(debounce.current)
+    const q = query.trim()
+    if (q.length < 2) { setEvents([]); setSearchState('idle'); return }
+    debounce.current = setTimeout(() => {
+      // Spec 026: the same query language as Search and the Transcript, so a
+      // query learned there means the same thing here. A half-typed condition
+      // never becomes a store query; a failed query is not an empty result.
+      const outcome = parseQuery(q)
+      if (!outcome.ok) { setEvents([]); setSearchState('unparsable'); return }
+      window.redlog.events.runQuery({ parsed: outcome.parsed, limit: EVENT_LIMIT })
+        .then((page) => { setEvents(page.items); setEventsHasMore(page.hasMore); setSearchState('answered') })
+        .catch(() => { setEvents([]); setSearchState('failed') })
+    }, 140)
+    return () => { if (debounce.current) clearTimeout(debounce.current) }
+  }, [query, open])
+
+  const items = useMemo<Item[]>(() => {
+    const q = query.trim()
+    const out: Item[] = []
+
+    for (const [i, view] of DEFAULT_ORDER.entries()) {
+      const label = t(primaryLabelKey(view))
+      out.push({
+        id: `nav:${view}`, section: 'nav', icon: NAV_ICONS[view] ?? Gauge, label,
+        // Only primary workspaces are numbered. ⌘9 belongs to Settings, which is
+        // pinned outside the reorderable run — the ninth sidebar row has no
+        // chord, and claiming one here would advertise a key that does
+        // something else.
+        hint: i < NUMBERED_SLOTS ? `${MOD}${i + 1}` : undefined,
+        run: () => onNavigate(view)
+      })
+    }
+    for(const view of ['transcript','scope','loot','bookmarks'])out.push({id:`nav:${view}`,section:'nav',icon:NAV_ICONS[view],label:t(`sidebar.${view}`),run:()=>onNavigate(view)})
+    out.push({
+      id: 'nav:settings', section: 'nav', icon: SettingsIcon,
+      label: t('sidebar.settings'), hint: `${MOD}9`, run: () => onNavigate('settings')
+    })
+
+    out.push({
+      id: 'action:recording', section: 'action', icon: recording ? Pause : Play,
+      label: recording ? t('palette.pauseRecording') : t('palette.resumeRecording'),
+      hint: `${MOD}.`,
+      run: () => { void toggleRecordingWithFeedback(t) }
+    })
+    out.push({
+      id: 'action:screenshot', section: 'action', icon: Image,
+      label: t('screenshots.captureNow'),
+      run: () => { void captureScreenshotWithFeedback(t) }
+    })
+
+    out.push({
+      id: 'action:addArtifact', section: 'action', icon: FilePlus,
+      label: t('artifacts.add'),
+      run: () => { void addArtifactsWithFeedback(t, onOpenEvent) }
+    })
+
+    const density = resolveDensity(1, storedDensity())
+    out.push({
+      id: 'view:density', section: 'view', icon: Rows2,
+      label: density === 'tight' ? t('palette.densityComfortable') : t('palette.densityTight'),
+      run: () => {
+        const next = density === 'tight' ? 'comfortable' : 'tight'
+        try { localStorage.setItem(DENSITY_KEY, next) } catch { /* quota */ }
+        applyDensity(next)
+      }
+    })
+
+    for (const p of projects.slice(0, 8)) {
+      out.push({
+        id: `project:${p.id}`, section: 'project', icon: FolderOpen,
+        label: p.name, hint: formatTime(p.lastOpened),
+        run: () => { void switchProject({ id: p.id, name: p.name }, t, onProjectClosed) }
+      })
+    }
+
+    for (const op of operators) {
+      if (op.revokedAt) continue
+      out.push({
+        id: `operator:${op.id}`, section: 'operator', icon: UserRound,
+        label: op.name,
+        hint: op.isPrimary ? t('palette.operatorPrimary') : undefined,
+        // Filtering the timeline by operator is the question worth asking of
+        // one: "what did this person do".
+        run: () => { onNavigate('timeline'); setTimeout(() => window.dispatchEvent(new CustomEvent('redlog:filter-operator', { detail: op.id })), 0) }
+      })
+    }
+
+    // §10: host search. Selecting one lands on the Timeline filtered to that
+    // host — the after-action question "what happened on this host". The
+    // busiest hosts sort first (the aggregation orders by count).
+    for (const h of hosts) {
+      out.push({
+        id: `host:${h.host}`, section: 'host', icon: Globe,
+        label: h.host,
+        hint: t('palette.hostHits', { count: h.count }),
+        run: () => { onNavigate('timeline'); setTimeout(() => window.dispatchEvent(new CustomEvent('redlog:filter-host', { detail: h.host })), 0) }
+      })
+    }
+
+    for (const e of events) {
+      const d = e.data as Record<string, unknown> | undefined
+      const label = String(d?.command ?? d?.title ?? d?.url ?? d?.description ?? e.agentType)
+      out.push({
+        id: `search:${e.id}`, section: 'search', icon: Search,
+        label, hint: formatTime(e.timestamp, { seconds: true }),
+        run: () => onOpenEvent(e.id, e.timestamp)
+      })
+    }
+
+    if (!q) {
+      // With no query, the search + host sections stay hidden and the rest is a
+      // menu. Hosts can number in the hundreds — they belong behind a query,
+      // like event search, not in the empty menu.
+      return out.filter((i) => i.section !== 'search' && i.section !== 'host')
+    }
+    return out
+      .map((i) => ({ i, s: i.section === 'search' ? 900 : score(i.label, q) }))
+      .filter((x) => x.s > 0)
+      .sort((a, b) => b.s - a.s)
+      .map((x) => x.i)
+  }, [query, events, projects, operators, hosts, recording, t, onNavigate, onOpenEvent, onProjectClosed])
+
+  useEffect(() => { setCursor(0) }, [query])
+  // Keep the keyboard selection on screen: ↓ past the fold used to move an
+  // invisible highlight.
+  useEffect(() => {
+    if (!open) return
+    document.getElementById(`palette-opt-${cursor}`)?.scrollIntoView?.({ block: 'nearest' })
+  }, [cursor, open])
+
+  const activate = useCallback((item: Item | undefined) => {
+    if (!item) return
+    onClose()
+    item.run()
+  }, [onClose])
+
+  if (!open) return null
+
+  const onKeyDown = (e: React.KeyboardEvent): void => {
+    if (e.key === 'Escape') { e.preventDefault(); onClose(); return }
+    if (e.key === 'ArrowDown') { e.preventDefault(); setCursor((c) => Math.min(items.length - 1, c + 1)); return }
+    if (e.key === 'ArrowUp') { e.preventDefault(); setCursor((c) => Math.max(0, c - 1)); return }
+    if (e.key === 'Enter') { e.preventDefault(); activate(items[cursor]) }
+  }
+
+  let lastSection: Section | null = null
+
+  return (
+    <div
+      className="fixed inset-0 z-[150] flex items-start justify-center pt-[12vh] bg-black/50 backdrop-blur-sm select-text"
+      onClick={onClose}
+    >
+      <div
+        ref={panel}
+        role="dialog"
+        aria-modal="true"
+        aria-label={t('palette.title')}
+        className="w-full max-w-xl mx-4 bg-redlog-surface border border-redlog-border rounded-xl shadow-2xl overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+        onKeyDown={onKeyDown}
+      >
+        <div className="flex items-center gap-2 px-3 border-b border-redlog-border">
+          <Search size={16} strokeWidth={1.5} aria-hidden className="text-redlog-text-faint shrink-0" />
+          <input
+            ref={field}
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder={t('palette.placeholder')}
+            aria-label={t('palette.placeholder')}
+            role="combobox"
+            aria-expanded="true"
+            aria-controls="palette-listbox"
+            aria-activedescendant={items.length > 0 ? `palette-opt-${cursor}` : undefined}
+            autoComplete="off"
+            spellCheck={false}
+            className="flex-1 bg-transparent py-3 text-sm text-redlog-text placeholder-redlog-muted outline-none"
+          />
+        </div>
+
+        <div id="palette-listbox" role="listbox" aria-label={t('palette.title')} className="max-h-[52vh] overflow-y-auto py-1">
+          {searchState === 'failed' && (
+            <p data-testid="palette-search-failed" role="status" className="px-4 py-3 text-xs text-red-300 text-center">
+              {t('palette.searchFailed')}
+            </p>
+          )}
+          {searchState === 'unparsable' && (
+            <p data-testid="palette-search-unparsable" role="status" className="px-4 py-3 text-xs text-amber-300 text-center">
+              {t('palette.searchUnparsable')}
+            </p>
+          )}
+          {searchState === 'answered' && eventsHasMore && (
+            <p data-testid="palette-search-subset" role="status" className="px-4 py-2 text-xs text-redlog-text-faint">
+              {t('palette.searchSubset', { count: EVENT_LIMIT })}
+            </p>
+          )}
+          {items.length === 0 && searchState !== 'failed' && searchState !== 'unparsable' && (
+            <p className="px-4 py-6 text-xs text-redlog-text-faint text-center">
+              {t('palette.noMatches', { query })}
+            </p>
+          )}
+          {items.map((item, i) => {
+            const header = item.section !== lastSection ? item.section : null
+            lastSection = item.section
+            return (
+              <div key={item.id}>
+                {header && (
+                  <SectionLabel className="px-3 pt-2 pb-1">
+                    {t(SECTION_KEY[header])}
+                  </SectionLabel>
+                )}
+                <button
+                  id={`palette-opt-${i}`}
+                  data-command-id={item.id}
+                  role="option"
+                  aria-selected={i === cursor}
+                  onMouseMove={() => setCursor(i)}
+                  onClick={() => activate(item)}
+                  className={`w-full flex items-center gap-2.5 px-3 py-1.5 text-left ${
+                    i === cursor ? 'bg-redlog-elevated' : ''
+                  }`}
+                >
+                  <item.icon size={16} strokeWidth={1.5} aria-hidden className="shrink-0 text-redlog-text-faint" />
+                  <span title={item.label} className="flex-1 min-w-0 truncate text-xs text-redlog-text">{item.label}</span>
+                  {item.hint && (
+                    <span className="shrink-0 text-xs font-mono text-redlog-text-faint tabular-nums">{item.hint}</span>
+                  )}
+                </button>
+              </div>
+            )
+          })}
+        </div>
+      </div>
+    </div>
+  )
+}

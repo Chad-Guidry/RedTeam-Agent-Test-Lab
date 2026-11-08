@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""RedLog pcap capture agent — an out-of-process 🟢 capture producer.
+
+Fills the gap the app-layer proxy and the established-only connection monitor
+cannot see: TCP connection *attempts* (SYN scans like `nmap -sS` complete no
+handshake, so they never reach the connection monitor), refused connections,
+and non-proxied UDP flow metadata. Like hooks/mitmproxy-addon.py it only POSTs
+events to RedLog's authenticated local API — it never touches the DB, keys, or
+chain, so a bug here can add noise but cannot forge or corrupt evidence.
+
+It summarises, it does not dump packets: a port scan is emitted as ONE
+`pcap.port_scan` event, not 65,535 rows; ordinary traffic is one
+`pcap.connection_attempt` per (host, port). Payloads are never captured — HTTP
+bodies belong to the mitmproxy addon, and raw payloads would bloat the store and
+duplicate it.
+
+Usage (needs root/sudo for raw capture; needs scapy):
+    sudo -E "$(command -v uv)" run --with scapy hooks/pcap-agent.py -i en0
+    sudo -E "$(command -v uv)" run --with scapy hooks/pcap-agent.py -i eth0 --filter "tcp or udp"
+
+`uv run --with` supplies scapy without installing it; uv is spelled out by
+absolute path because sudoers' secure_path drops it from PATH.
+
+Verify without root or a live NIC:
+    uv run --with scapy hooks/pcap-agent.py --dry-run
+
+Env: REDLOG_VERBOSE=1 logs each emitted event.
+"""
+
+import argparse
+import json
+import os
+import sys
+import threading
+import time
+from pathlib import Path
+
+try:
+    import urllib.request
+except ImportError:  # pragma: no cover
+    urllib = None
+
+REDLOG_PORT_FILE = Path.home() / ".redlog" / "api-port"
+REDLOG_TOKEN_FILE = Path.home() / ".redlog" / "api-token"
+SPOOL_DIR = Path.home() / ".redlog" / "pending"
+
+VERBOSE = os.environ.get("REDLOG_VERBOSE", "false").lower() in ("true", "1", "yes")
+
+# A dst_ip that draws SYNs to at least this many distinct ports within one
+# flush window is reported as a single port_scan, not one row per port.
+SCAN_PORT_THRESHOLD = int(os.environ.get("REDLOG_PCAP_SCAN_PORTS", "15"))
+# How often the aggregator flushes its per-host SYN buffers, in seconds.
+FLUSH_INTERVAL = float(os.environ.get("REDLOG_PCAP_FLUSH_SEC", "3"))
+
+
+# ─── RedLog API (mirrors hooks/mitmproxy-addon.py) ──────────────────────────
+
+def _get_redlog_connection():
+    if not REDLOG_PORT_FILE.exists() or not REDLOG_TOKEN_FILE.exists():
+        return None, None
+    return REDLOG_PORT_FILE.read_text().strip(), REDLOG_TOKEN_FILE.read_text().strip()
+
+
+_IDENTITY_PATH = Path.home() / ".redlog" / "active-identity.json"
+
+
+def _embed_identity(payload: dict) -> None:
+    try:
+        ident = json.loads(_IDENTITY_PATH.read_text(encoding="utf-8"))
+        if "engagementId" in ident:
+            payload["_identity"] = ident
+    except Exception:
+        pass
+
+
+_SPOOL_LOCK = threading.Lock()
+_last_spool_ns = 0
+
+
+def _spool_payload(payload: dict) -> None:
+    """Write one payload to the spool for the app to replay.
+
+    Sends run on their own threads, so two payloads can be spooled at once. The
+    name is one no earlier payload of this process has had: a millisecond clock
+    and `id(payload)` are not that (the clock repeats within a tick, and an id
+    is reused once the last payload is freed), and the old open truncated the
+    file it found, so the first payload was lost. Stamps only rise, so names
+    sort in write order, which the drain's sorted listing relies on. The record
+    is written under a `.tmp` name and renamed, so the drain, which reads only
+    `.json`, never sees half of one. Same rule as `_write_spool_record` in
+    mitmproxy-addon.py."""
+    global _last_spool_ns
+    _embed_identity(payload)
+    try:
+        encoded = json.dumps(payload)
+        with _SPOOL_LOCK:
+            SPOOL_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+            stamp = max(time.time_ns(), _last_spool_ns + 1)
+            _last_spool_ns = stamp
+            filename = f"{stamp}-{os.getpid()}.json"
+            temporary = SPOOL_DIR / (filename + ".tmp")
+            try:
+                with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as output:
+                    output.write(encoded)
+                temporary.replace(SPOOL_DIR / filename)
+            finally:
+                temporary.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _send_to_redlog(payload: dict) -> None:
+    port, token = _get_redlog_connection()
+    if not port:
+        if VERBOSE:
+            print("[redlog-pcap] no api-port/token — is RedLog running with a project open?", file=sys.stderr)
+        return
+
+    def _do_send():
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/events",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=5)
+        except Exception:
+            _spool_payload(payload)
+
+    threading.Thread(target=_do_send, daemon=True).start()
+
+
+def _emit(subtype: str, dst_ip: str, data: dict) -> None:
+    """POST one pcap event. target_id = dst_ip so scope classification and the
+    Targets aggregate treat a sniffed host like any other target."""
+    payload = {"agent_type": "pcap", "target_id": dst_ip, "data": {"subtype": subtype, **data}}
+    _send_to_redlog(payload)
+    if VERBOSE:
+        print(f"[redlog-pcap] {subtype} {dst_ip} {json.dumps(data)}", file=sys.stderr)
+
+
+# ─── SYN aggregation ────────────────────────────────────────────────────────
+
+class SynAggregator:
+    """Buffers TCP SYN probes per destination host and, on flush, emits either
+    individual connection_attempt events (a handful of ports) or one port_scan
+    (many ports) — so a full-range scan is a summary, not a flood."""
+
+    def __init__(self, emit=_emit):
+        self._emit = emit
+        self._lock = threading.Lock()
+        # dst_ip -> { port -> first_ts_ms }
+        self._buf: dict[str, dict[int, int]] = {}
+        self._stop = threading.Event()
+
+    def add_syn(self, dst_ip: str, dst_port: int, ts_ms: int) -> None:
+        with self._lock:
+            self._buf.setdefault(dst_ip, {}).setdefault(dst_port, ts_ms)
+
+    def flush(self) -> None:
+        with self._lock:
+            buf, self._buf = self._buf, {}
+        for dst_ip, ports in buf.items():
+            if len(ports) >= SCAN_PORT_THRESHOLD:
+                sorted_ports = sorted(ports)
+                self._emit("port_scan", dst_ip, {
+                    "port_count": len(ports),
+                    "port_min": sorted_ports[0],
+                    "port_max": sorted_ports[-1],
+                    "ports_sample": sorted_ports[:50],
+                    "first_at": min(ports.values()),
+                    "last_at": max(ports.values()),
+                    "proto": "tcp",
+                })
+            else:
+                for port, ts in sorted(ports.items()):
+                    self._emit("connection_attempt", dst_ip, {
+                        "dst_port": port, "proto": "tcp", "at": ts,
+                    })
+
+    def run_flusher(self) -> None:
+        while not self._stop.wait(FLUSH_INTERVAL):
+            try:
+                self.flush()
+            except Exception:
+                pass
+
+    def stop(self) -> None:
+        self._stop.set()
+        self.flush()
+
+
+# ─── Live capture (scapy) ───────────────────────────────────────────────────
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def run_capture(iface: str | None, bpf: str) -> int:
+    try:
+        from scapy.all import sniff, IP, IPv6, TCP, UDP  # type: ignore
+    except ImportError:
+        print(
+            "[redlog-pcap] scapy not installed. Rerun as: "
+            'sudo -E "$(command -v uv)" run --with scapy hooks/pcap-agent.py ...',
+            file=sys.stderr,
+        )
+        return 2
+
+    # Don't capture our own POSTs to the RedLog API.
+    api_port, _ = _get_redlog_connection()
+    udp_seen: set[tuple[str, int]] = set()
+    agg = SynAggregator()
+    threading.Thread(target=agg.run_flusher, daemon=True).start()
+
+    def handle(pkt) -> None:
+        ip = pkt.getlayer(IP) or pkt.getlayer(IPv6)
+        if ip is None:
+            return
+        dst_ip = ip.dst
+        ts = _now_ms()
+        if pkt.haslayer(TCP):
+            tcp = pkt.getlayer(TCP)
+            if api_port and int(tcp.dport) == int(api_port) and dst_ip in ("127.0.0.1", "::1"):
+                return
+            flags = int(tcp.flags)
+            syn, ack, rst = bool(flags & 0x02), bool(flags & 0x10), bool(flags & 0x04)
+            if syn and not ack:
+                agg.add_syn(dst_ip, int(tcp.dport), ts)
+            elif syn and ack:
+                _emit("connection_established", ip.src, {"dst_port": int(tcp.sport), "proto": "tcp", "at": ts})
+            elif rst and not syn:
+                _emit("connection_refused", ip.src, {"dst_port": int(tcp.sport), "proto": "tcp", "at": ts})
+        elif pkt.haslayer(UDP):
+            udp = pkt.getlayer(UDP)
+            key = (dst_ip, int(udp.dport))
+            if key in udp_seen:
+                return
+            udp_seen.add(key)
+            _emit("udp_flow", dst_ip, {"dst_port": int(udp.dport), "proto": "udp", "at": ts})
+
+    print(f"[redlog-pcap] capturing on {iface or 'default'} (filter: {bpf}) — Ctrl-C to stop", file=sys.stderr)
+    try:
+        sniff(iface=iface, filter=bpf, prn=handle, store=False)
+    except KeyboardInterrupt:
+        pass
+    except PermissionError:
+        print("[redlog-pcap] permission denied — raw capture needs root (sudo).", file=sys.stderr)
+        return 2
+    finally:
+        agg.stop()
+    return 0
+
+
+# ─── Dry run (no root, no NIC — proves the event shapes) ────────────────────
+
+def run_dry() -> int:
+    emitted: list[tuple[str, str, dict]] = []
+    agg = SynAggregator(emit=lambda st, ip, d: emitted.append((st, ip, d)))
+    # 3 ports to one host → individual attempts; 20 ports to another → port_scan.
+    for p in (22, 80, 443):
+        agg.add_syn("10.10.11.24", p, _now_ms())
+    for p in range(1, 21):
+        agg.add_syn("10.10.11.7", p, _now_ms())
+    agg.flush()
+    agg._emit("connection_established", "10.10.11.24", {"dst_port": 22, "proto": "tcp", "at": _now_ms()})
+    agg._emit("udp_flow", "10.10.11.53", {"dst_port": 53, "proto": "udp", "at": _now_ms()})
+    subtypes = sorted({st for st, _, _ in emitted})
+    print(json.dumps({"emitted": len(emitted), "subtypes": subtypes,
+                      "events": [{"subtype": st, "target": ip, **d} for st, ip, d in emitted]}, indent=2))
+    assert "port_scan" in subtypes and "connection_attempt" in subtypes, "aggregation broken"
+    # 3 attempts + 1 port_scan + 1 established + 1 udp_flow = 6
+    assert len(emitted) == 6, f"expected 6 events, got {len(emitted)}"
+    print("[redlog-pcap] dry-run OK", file=sys.stderr)
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="RedLog pcap capture agent")
+    ap.add_argument("-i", "--iface", default=None, help="interface (default: scapy's default)")
+    ap.add_argument("--filter", default="tcp or udp", help="BPF filter (default: 'tcp or udp')")
+    ap.add_argument("--dry-run", action="store_true", help="emit synthetic events and exit (no capture)")
+    args = ap.parse_args()
+    return run_dry() if args.dry_run else run_capture(args.iface, args.filter)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

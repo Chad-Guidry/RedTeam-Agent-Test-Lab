@@ -1,0 +1,141 @@
+import { resolveContentAnchor } from '../../core/evidence-content'
+import type { ContentAnchor } from '../../core/content-contract'
+import fs from 'fs'
+import path from 'path'
+import { createHash } from 'crypto'
+import type { IpcMain } from 'electron'
+import type { IpcContext } from './types'
+import { insertEvent, queryMarkerAmendments, type RedLogEvent } from '../../core/db/events'
+import { ingestEvent } from '../../core/ingest'
+import { getProjectDir } from '../../core/project-manager'
+import { loadConfig } from '../../core/config'
+import { redactFields } from '../../core/redaction'
+import { amendMarker } from '../../core/marker-amend'
+import { isInsideDir } from '../../core/paths'
+import { getProjectDir as getOpenProjectDir } from '../../core/db/index'
+import { eventBus } from '../../core/event-bus'
+import type { ScreenshotAgent } from '../services/screenshot-agent'
+
+export const MARKER_TEXT_FIELDS = ['title', 'notes', 'url'] as const
+
+const DAY_MS = 24 * 3_600_000
+
+/** A HUD marker draft is bound to the project open when it was started. No
+ *  binding (older caller) is accepted; a different project is refused. */
+export function hudDraftBelongsHere(bind: string | undefined, currentEngagementId: string): boolean {
+  return bind === undefined || bind === currentEngagementId
+}
+
+/** The fields of a marker added from the HUD form. `at` is when the operator
+ *  clicked "Add marker"; it is believed only if it is a real moment in the last
+ *  day, otherwise the marker is timed at `now` rather than at a value nobody
+ *  can vouch for. An empty title is allowed and named after the time, which is
+ *  what a bare mark has always been called. */
+export function hudMarkerFields(
+  input: { title?: unknown; notes?: unknown; at?: unknown },
+  now: number
+): { title: string; notes: string; source_timestamp: number; source: 'hud' | 'hud-instant' } {
+  const at = typeof input.at === 'number' && Number.isFinite(input.at) && input.at <= now && input.at > now - DAY_MS
+    ? input.at : now
+  const title = (typeof input.title === 'string' ? input.title : '').trim().slice(0, 200)
+  const notes = (typeof input.notes === 'string' ? input.notes : '').slice(0, 10_000)
+  return {
+    title: title || `HUD mark ${new Date(at).toLocaleTimeString()}`,
+    notes,
+    source_timestamp: at,
+    // A bare mark is marked as such, so a reviewer knows a time-only title is
+    // intentional.
+    source: notes || title ? 'hud' : 'hud-instant'
+  }
+}
+
+/** Event ids a marker may cite: strings of a sane length, at most 20. */
+export function markerCauses(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return [...new Set(value.filter((v): v is string => typeof v === 'string' && v.length > 0 && v.length <= 128))].slice(0, 20)
+}
+
+export function registerMarkersIpc(
+  ipcMain: IpcMain,
+  ctx: IpcContext,
+  screenshotAgent: ScreenshotAgent
+): void {
+  ipcMain.handle('marker:create', (_e, data: Record<string, unknown>) => {
+    const proj = ctx.getActiveProject()
+    if (!proj) return null
+    const config = loadConfig(getProjectDir(proj))
+    const anchor=data.contentAnchor as ContentAnchor | undefined
+    if(anchor){
+      if(anchor.ref?.projectId!==config.engagement.id)throw new Error('Evidence fragment project changed')
+      const verified=resolveContentAnchor(anchor)
+      if(!verified.ok)throw new Error(verified.message)
+    }
+    const causes=markerCauses([...(Array.isArray(data.causes)?data.causes:[]),...(anchor?[anchor.ref.eventId]:[])])
+    const at = data.atTimestamp
+    const event = ingestEvent('marker', redactFields({
+      ...(anchor ? { contentAnchor: {v:anchor.v,coordinate:anchor.coordinate,ref:{projectId:anchor.ref.projectId,eventId:anchor.ref.eventId,field:anchor.ref.field,version:anchor.ref.version},start:anchor.start,end:anchor.end,sha256:anchor.sha256} } : {}),
+      title: data.title,
+      notes: data.notes,
+      severity: data.severity ?? 'info',
+      category: data.category ?? 'custom',
+      ...(typeof at === 'number' && Number.isFinite(at) && at > 0 ? { atTimestamp: at } : {}),
+      ...(typeof data.url === 'string' && data.url.trim()
+        ? { url: data.url.trim().slice(0, 2048) }
+        : {}),
+      // #225: a step picked in the transcript cites the events it is about.
+      // The marker is a new chained row; the cited events are not touched.
+      ...(causes.length > 0 ? { _causes: causes } : {})
+    }, MARKER_TEXT_FIELDS), {
+      engagementId: config.engagement.id, operatorId: config.operator.id, bypassPause: true,
+      ...(typeof data.targetId === 'string' && data.targetId.trim() ? { targetId: data.targetId.trim().slice(0, 253) } : {})
+    })
+    return event
+  })
+
+  ipcMain.handle('marker:amend', (_e, markerId: string, changes: Record<string, unknown>) => {
+    const proj = ctx.getActiveProject()
+    if (!proj) return { ok: false, error: 'no-active-project' }
+    const config = loadConfig(getProjectDir(proj))
+    const result = amendMarker(String(markerId), changes ?? {}, {
+      engagementId: config.engagement.id,
+      operatorId: config.operator.id
+    })
+    if (result.ok) eventBus.publish(result.event, { bypassPause: true })
+    return result
+  })
+
+  ipcMain.handle('marker:amendments', (_e, ids: string[]) =>
+    ctx.getActiveProject() && Array.isArray(ids) ? queryMarkerAmendments(ids.map(String)) : [])
+
+  ipcMain.handle('screenshot:capture', (_e, causeEventId?: string, opts?: { heldFrame?: unknown; hideOwnWindows?: unknown }) =>
+    screenshotAgent.captureNow('manual', typeof causeEventId === 'string' ? causeEventId : undefined, {
+      heldFrame: typeof opts?.heldFrame === 'string' ? opts.heldFrame : undefined,
+      hideOwnWindows: opts?.hideOwnWindows === true
+    }))
+
+  ipcMain.handle('screenshot:deleteFile', (_e, eventId: string, filePath: string) => {
+    try {
+      const screenshotDir = path.join(getOpenProjectDir(), 'screenshots')
+      const resolved = path.resolve(filePath)
+      if (!isInsideDir(screenshotDir, resolved)) return { ok: false, error: 'path outside project' }
+      let sha256: string | null = null
+      try { sha256 = createHash('sha256').update(fs.readFileSync(resolved)).digest('hex') } catch { /* file may already be gone */ }
+      fs.unlinkSync(resolved)
+      const engId = ctx.getCurrentEngagementId()
+      const opId = ctx.getCurrentOperatorId()
+      if (engId && opId) {
+        const ev = insertEvent('system', {
+          subtype: 'screenshot_deleted',
+          source_event: eventId,
+          _causes: [eventId],
+          path: path.basename(resolved),
+          sha256_pre_delete: sha256
+        }, { engagementId: engId, operatorId: opId })
+        if (ev) eventBus.publish(ev)
+      }
+      return { ok: true }
+    } catch (e) {
+      return { ok: false, error: (e as Error).message }
+    }
+  })
+}

@@ -1,0 +1,71 @@
+import { describe, it, expect } from 'vitest'
+import fs from 'fs'
+import path from 'path'
+
+// §10 and phase-3 item 13: one export control.
+//
+// Exporting was reachable from six places, each worded its own way — the
+// dashboard, three separate groups in Settings, the timeline's slice button,
+// and the transcript's. An operator writing an engagement up had to already
+// know which one produced the thing they wanted, and the answer was not
+// guessable from the labels.
+//
+// The fix was not to pick a winner but to notice that the scope of an export
+// is a property of the export, not of where the button sits. Once scope is an
+// option, six locations collapse to one control with three options — and the
+// only thing a view still contributes is the part it alone knows.
+
+const ROOT = path.join(__dirname, '..')
+const R = (p: string): string => fs.readFileSync(path.join(ROOT, p), 'utf-8')
+
+/** Every renderer file, so a seventh entry point cannot appear unnoticed. */
+function rendererFiles(): string[] {
+  const out: string[] = []
+  const walk = (dir: string): void => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, e.name)
+      if (e.isDirectory()) walk(full)
+      else if (/\.tsx?$/.test(e.name)) out.push(full)
+    }
+  }
+  walk(path.join(ROOT, 'src/renderer/src'))
+  return out
+}
+
+describe('one export control', () => {
+  it('calls the file-writing export APIs from exactly one component', () => {
+    const callers = rendererFiles().filter((f) =>
+      /window\.redlog\.data\.executeExportPlan\b/.test(fs.readFileSync(f, 'utf-8'))
+    )
+    expect(callers.map((f) => path.basename(f))).toEqual(['ExportMenu.tsx'])
+  })
+
+  it('lets a view contribute its own scope instead of its own button', () => {
+    // The timeline knows what "the visible range" means and nothing else
+    // does. It contributes that; it does not render a second export button.
+    const timeline = R('src/renderer/src/components/Timeline.tsx')
+    expect(timeline).toMatch(/useContributeExport/)
+    expect(timeline).not.toMatch(/timeline\.exportSlice['"]\)\}<\/button>/)
+  })
+
+  it('labels each format option clearly', () => {
+    // Each export option uses a translated label so the operator knows what
+    // they are getting — the label IS the preview (format name + audience).
+    const menu = R('src/renderer/src/components/ExportMenu.tsx')
+    expect(menu).toMatch(/export\.all/)
+    expect(menu).toMatch(/export\.currentFormat/)
+    expect(menu).toMatch(/export\.bundle/)
+  })
+
+  it('keeps copy-to-clipboard out of the file-export menu', () => {
+    // The transcript's Markdown button writes the clipboard, not a file. It
+    // was counted as one of the six and is not one of them; folding it in
+    // would have made the count tidier and the action worse.
+    const transcript = R('src/renderer/src/components/TranscriptView.tsx')
+    expect(transcript).toMatch(/copyAsMarkdown/)
+    // Clipboard writes go through lib/clipboard's main-process bridge; the
+    // renderer's Async Clipboard API is denied by the permission handler.
+    expect(transcript).toMatch(/writeClipboard/)
+    expect(transcript).not.toMatch(/window\.redlog\.data\.export/)
+  })
+})

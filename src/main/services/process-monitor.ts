@@ -1,0 +1,476 @@
+import { execFile } from 'child_process'
+import { ingestEvent } from '../../core/ingest'
+import { eventBus } from '../../core/event-bus'
+import { noteDbError } from '../../core/capture-health'
+import type { ProjectIdentity } from '../../core/project-runtime'
+import { noteProcessParent } from '../../core/socket-attribution'
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Process monitor (v0.6.92)
+//
+// Polls `ps -eo pid,ppid,etime,command` every N ms (default 500ms) on macOS /
+// Linux and emits `process` events for spawned/exited processes. Best-effort:
+// a process that both spawns AND exits inside the poll interval will be
+// missed — that's a known trade-off for polling vs. dtrace/audit (which
+// requires elevated perms + platform-specific glue).
+//
+// Correlation to shell commands: builtin-terminal session_start events set
+// REDLOG_TERMINAL_ID on the pty; we surface it here via the `_causes` field
+// when a spawned process's ppid maps back to a shell session we know about.
+// The mapping is best-effort (there's no reliable way to get REDLOG_TERMINAL_ID
+// out of ps' env on macOS without SIP-elevated ptrace), so we fall back to
+// matching by ppid alone: if a shell.session_start event's terminalId
+// process is our pid's grandparent, we point `_causes` at that session_start.
+//
+// Emit budget: cap 1000 events/minute; over that, we drop the excess and
+// emit a single `system.process_monitor_saturated` event with the count.
+// This prevents a fork bomb or a build script from wedging the log.
+//
+// Ignore list: default ignores match Electron's own subprocess names and
+// whatever ignoreCommands the operator adds via config. Prevents the app
+// from watching itself.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface ProcessMonitorConfig {
+  enabled: boolean
+  pollMs?: number
+  ignoreCommands?: string[]
+  /** Held by reference and read when an event is written, so an operator
+   *  change made while the project stays open reaches the next event. */
+  identity?: Readonly<ProjectIdentity>
+}
+
+interface PsRow {
+  pid: number
+  ppid: number
+  etime: string
+  command: string
+}
+
+interface TrackedProc {
+  pid: number
+  ppid: number
+  command: string
+  startedAt: number
+}
+
+const DEFAULT_POLL_MS = 500
+const EMIT_BUDGET_PER_MINUTE = 1000
+// What is never engagement evidence.
+//
+// This list used to hold only RedLog's own processes, so on a real desktop
+// the monitor recorded everything else the operator's machine happened to be
+// doing: one two-minute session produced 500 process events, the great
+// majority of them conhost.exe, service hosts and browser renderers, with
+// their full command lines - which also carried paths from outside the
+// engagement into the record. The operator's actual work in that session was
+// 24 shell commands, buried underneath.
+//
+// Only OS and desktop plumbing is listed. Anything an operator might
+// plausibly have run themselves stays recorded, and `ignoreCommands` is
+// theirs to extend.
+const DEFAULT_IGNORES = [
+  'Electron',
+  'RedLog',
+  'redlog',
+  'redlog Helper',
+  'ps',           // our own poll
+  'ps -eo',
+  // Windows console and service plumbing. conhost.exe alone is one process
+  // per console that any command opens.
+  'conhost.exe',
+  'svchost.exe',
+  'RuntimeBroker.exe',
+  'backgroundTaskHost.exe',
+  'dllhost.exe',
+  'taskhostw.exe',
+  'sihost.exe',
+  'ctfmon.exe',
+  'SearchProtocolHost.exe',
+  'SearchFilterHost.exe',
+  'SearchIndexer.exe',
+  'WmiPrvSE.exe',
+  'audiodg.exe',
+  'fontdrvhost.exe',
+  'ShellExperienceHost.exe',
+  'StartMenuExperienceHost.exe',
+  'TextInputHost.exe',
+  'SystemSettings.exe',
+  // macOS / Linux desktop equivalents.
+  'mdworker',
+  'mdworker_shared',
+  'mds_stores',
+  'distnoted',
+  'cfprefsd',
+  'gvfsd',
+  'tracker-miner-fs',
+  'systemd-journald',
+]
+
+/** The executable of a command line: the quoted leading token where there is
+ *  one, else everything up to the first whitespace. */
+/** Is this command line one the monitor should not record? Exported so the
+ *  rule can be tested directly rather than through a diff. */
+export function isIgnoredCommand(cmd: string, ignoreCommands: readonly string[] = []): boolean {
+  for (const ig of [...DEFAULT_IGNORES, ...ignoreCommands]) {
+    if (!ig) continue
+    if (cmd === ig) return true
+    if (cmd.startsWith(ig + ' ')) return true
+    // Match on the leading token, which is the executable's path.
+    //
+    // Splitting on whitespace is wrong on Windows, where that token is
+    // routinely quoted BECAUSE it holds spaces: a Chrome command line split
+    // to `"C:\Program`, which matches no basename, so an operator who added
+    // chrome.exe to ignoreCommands saw it ignored - silently - for every
+    // program installed under a path with a space in it.
+    const first = leadingToken(cmd)
+    if (first === ig) return true
+    if (first.endsWith('/' + ig) || first.endsWith('\\' + ig)) return true
+  }
+  return false
+}
+
+export function leadingToken(cmd: string): string {
+  const trimmed = cmd.trimStart()
+  if (trimmed.startsWith('"')) {
+    const close = trimmed.indexOf('"', 1)
+    if (close > 0) return trimmed.slice(1, close)
+  }
+  return trimmed.split(/\s+/)[0] ?? ''
+}
+
+let cfg: ProcessMonitorConfig = { enabled: false }
+/** The identity to write under, read at the moment of the write. */
+function ids(): { engagementId: string; operatorId: string } {
+  return { engagementId: cfg.identity?.engagementId ?? '', operatorId: cfg.identity?.operatorId ?? '' }
+}
+let pollTimer: ReturnType<typeof setInterval> | null = null
+let knownProcs = new Map<number, TrackedProc>()
+let ownPid = process.pid
+let emitBucket = { count: 0, windowStart: 0 }
+// v0.6.96 Clean-2: removed sessionCache — was only fed to findCauseSession
+// which always returned undefined (see comment above emitSpawn).
+// Bumped whenever polling stops, so on every restart and stop. The seed and
+// each poll run ps asynchronously, and config:save and project open configure
+// the monitor twice in one synchronous run, so a run can finish after a newer
+// restart or a stop. It must not act then: repeating the advisory below,
+// replacing the newer seed, or diffing against the table the restart just
+// emptied and recording every running process as a spawn.
+let generation = 0
+// Whether this capture start has said ps is unusable. Once per capture start
+// (the first, after a stop, or when the pack is turned back on), not once per
+// restart: every Settings save restarts the monitor.
+let psAdvised = false
+
+export function configureProcessMonitor(next: Partial<ProcessMonitorConfig>): void {
+  cfg = { ...cfg, ...next }
+  restart()
+}
+
+export function stopProcessMonitor(): void {
+  stopPolling()
+  // A stop ends the capture (project close or switch), so the next start may
+  // say again that ps is unusable.
+  psAdvised = false
+}
+
+/** Stop the poll and forget the table without ending the capture: restart()
+ *  does this on every configure. */
+function stopPolling(): void {
+  generation++
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
+  knownProcs.clear()
+  emitBucket = { count: 0, windowStart: 0 }
+}
+
+function restart(): void {
+  stopPolling()
+  const run = generation
+  const capturing = cfg.enabled && !!cfg.identity?.engagementId && !!cfg.identity.operatorId &&
+    (process.platform === 'darwin' || process.platform === 'linux' || process.platform === 'win32')
+  // Not capturing, so the next start is a capture start and may say again
+  // that ps is unusable. A restart while capture stays on does not.
+  if (!capturing) { psAdvised = false; return }
+  // v0.6.98 D: Windows polls the Win32_Process CIM class via PowerShell.
+  // Cold PowerShell spawn is 800ms-1.5s, hot spawn ~200-400ms, so the
+  // 500ms default poll cadence would stack calls. Floor the interval at
+  // 2000ms on win32; operator can drop it below via pollMs if they know
+  // what they're doing.
+  const defaultPoll = process.platform === 'win32' ? 2000 : DEFAULT_POLL_MS
+  const floorMin = process.platform === 'win32' ? 2000 : 200
+  const interval = Math.max(floorMin, cfg.pollMs ?? defaultPoll)
+  // Seed known pids so the first poll doesn't emit "spawn" for every existing
+  // process on the box — a fresh RedLog startup would insert thousands of
+  // events. From here on, only real deltas fire.
+  runPs().then((rows) => {
+    if (run !== generation || !cfg.enabled) return
+    knownProcs = new Map(rows.map((r) => [r.pid, { pid: r.pid, ppid: r.ppid, command: r.command, startedAt: Date.now() }]))
+  }).catch((err) => {
+    // Alpine / BusyBox `ps` doesn't accept the procps
+    // `-eo pid=,ppid=,etime=,command=` syntax and errors immediately —
+    // syntax. Emit a one-shot advisory mirroring the Windows path so
+    // the operator sees why nothing shows up: once per capture start, and
+    // only from the newest restart.
+    if (run !== generation || !cfg.enabled || psAdvised) return
+    psAdvised = true
+    try {
+      const ev = ingestEvent('system', {
+        subtype: 'process_monitor_ps_unavailable',
+        platform: process.platform,
+        error: (err as Error)?.message?.slice(0, 200) || 'unknown',
+        description: 'Process monitor: system `ps` not usable (BusyBox / minimal container?). Install procps-ng.'
+      }, ids())
+    } catch { /* additive */ }
+    console.warn('[process-monitor] ps unavailable:', (err as Error)?.message)
+  })
+  pollTimer = setInterval(poll, interval)
+}
+
+let polling = false
+
+async function poll(): Promise<void> {
+  if (polling) return
+  if (eventBus.paused) return
+  polling = true
+  try { await pollInner() } finally { polling = false }
+}
+
+async function pollInner(): Promise<void> {
+  const run = generation
+  let rows: PsRow[]
+  try { rows = await runPs() } catch { return }
+  // A restart or a stop ran while ps ran: its seed is what this would be
+  // diffed against, and it may have turned capture off.
+  if (run !== generation || !cfg.enabled) return
+  const nowMap = new Map<number, PsRow>()
+  for (const r of rows) nowMap.set(r.pid, r)
+  // Ancestry for socket attribution. The pid on a socket is the tool; the pid
+  // a shell hook reports is the shell that forked it, because a `preexec` hook
+  // fires before the fork and cannot know the child. Only the process table
+  // bridges them, and this is the one place that reads it.
+  //
+  // Every row, not just the spawns: a tool that was already running when the
+  // monitor started still opens sockets, and a diff would never mention it.
+  for (const r of rows) noteProcessParent(r.pid, r.ppid)
+  const { spawns, exits } = diffProcs(knownProcs, nowMap, cfg.ignoreCommands ?? [])
+  // Ignore RedLog's own pid + its descendants; capping the traversal at 32
+  // ancestors so a cycle (should never happen) can't hang the poll.
+  const ownDescendants = collectDescendants(ownPid, nowMap)
+  const filteredSpawns = spawns.filter((r) => !ownDescendants.has(r.pid) && r.pid !== ownPid)
+  const filteredExits = exits.filter((p) => !ownDescendants.has(p.pid) && p.pid !== ownPid)
+
+  const total = filteredSpawns.length + filteredExits.length
+  if (!withinBudget(total)) {
+    // Over cap — emit a saturation notice ONCE for the window and drop the rest.
+    try {
+      const ev = ingestEvent('system', {
+        subtype: 'process_monitor_saturated',
+        count: total,
+        window_ms: 60_000,
+        description: `Process monitor over budget: ${total} events in the last minute; dropping`
+      }, ids())
+    } catch { /* additive */ }
+    // Still update knownProcs so we don't re-detect these next tick.
+    // v0.6.100 F3: exclude our own descendants from knownProcs. Pre-v0.6.100
+    // a dead descendant (e.g. the powershell.exe we spawn every 2s on
+    // Windows to poll Win32_Process) landed in `prev` and then, on the next
+    // tick when it was naturally gone, appeared in `filteredExits` because
+    // `collectDescendants(ownPid, nowMap)` only sees currently-live pids —
+    // a dead pid can't be traced through nowMap. Filtering the snapshot
+    // itself means no dead descendant ever reaches `prev`, so no spurious
+    // process_exit event fires. Same fix at both knownProcs write sites
+    // (poll body + saturated-branch).
+    knownProcs = new Map(rows.filter((r) => !ownDescendants.has(r.pid) && r.pid !== ownPid).map((r) => [r.pid, {
+      pid: r.pid, ppid: r.ppid, command: r.command,
+      startedAt: knownProcs.get(r.pid)?.startedAt ?? Date.now()
+    }]))
+    return
+  }
+
+  for (const r of filteredSpawns) {
+    emitSpawn(r)
+  }
+  for (const p of filteredExits) {
+    emitExit(p)
+  }
+  // Update knownProcs snapshot for next diff — filter own descendants
+  // so dead short-lived subprocesses (e.g. the powershell.exe spawned
+  // every poll for WMI) don't produce spurious process_exit events.
+  knownProcs = new Map(rows.filter((r) => !ownDescendants.has(r.pid) && r.pid !== ownPid).map((r) => [r.pid, {
+    pid: r.pid, ppid: r.ppid, command: r.command,
+    startedAt: knownProcs.get(r.pid)?.startedAt ?? Date.now()
+  }]))
+}
+
+// Exported for unit tests — the diff algorithm is pure and testable in
+// isolation without shelling out to ps.
+export function diffProcs(
+  prev: Map<number, TrackedProc>,
+  next: Map<number, PsRow>,
+  ignoreCommands: string[]
+): { spawns: PsRow[]; exits: TrackedProc[] } {
+  const isIgnored = (cmd: string): boolean => isIgnoredCommand(cmd, ignoreCommands)
+  const spawns: PsRow[] = []
+  for (const [pid, row] of next) {
+    if (prev.has(pid)) continue
+    if (isIgnored(row.command)) continue
+    spawns.push(row)
+  }
+  const exits: TrackedProc[] = []
+  for (const [pid, tp] of prev) {
+    if (next.has(pid)) continue
+    if (isIgnored(tp.command)) continue
+    exits.push(tp)
+  }
+  return { spawns, exits }
+}
+
+function collectDescendants(rootPid: number, nowMap: Map<number, PsRow>): Set<number> {
+  const desc = new Set<number>([rootPid])
+  // BFS by ppid — capped at 32 iterations against a runaway loop.
+  for (let i = 0; i < 32; i++) {
+    let grew = false
+    for (const [pid, row] of nowMap) {
+      if (desc.has(row.ppid) && !desc.has(pid)) {
+        desc.add(pid)
+        grew = true
+      }
+    }
+    if (!grew) break
+  }
+  return desc
+}
+
+function withinBudget(add: number): boolean {
+  const now = Date.now()
+  if (now - emitBucket.windowStart > 60_000) {
+    emitBucket = { count: 0, windowStart: now }
+  }
+  if (emitBucket.count + add > EMIT_BUDGET_PER_MINUTE) return false
+  emitBucket.count += add
+  return true
+}
+
+// v0.6.96 Clean-2: removed findCauseSession() — always returned undefined
+// (ppid → terminalId correlation needs env-var access ps doesn't give).
+// Kept the wall-clock proximity fallback in Timeline; when a proper mapping
+// path (macOS EndpointSecurity / Linux eBPF / Windows Sysmon) lands, wire
+// _causes directly here. sessionCache warm-up dropped along with it — it
+// was only feeding the stub.
+
+function emitSpawn(r: PsRow): void {
+  try {
+    const argv = r.command.split(/\s+/)
+    const ev = ingestEvent('process', {
+      subtype: 'process_spawn',
+      pid: r.pid,
+      ppid: r.ppid,
+      command: r.command.slice(0, 500),
+      argv: argv.slice(0, 20),
+      started_at: Date.now()
+    }, ids())
+  } catch (e) {
+    noteDbError('process-monitor', e)
+  }
+}
+
+function emitExit(p: TrackedProc): void {
+  try {
+    const duration_sec = Math.max(0, Math.round((Date.now() - p.startedAt) / 1000))
+    const ev = ingestEvent('process', {
+      subtype: 'process_exit',
+      pid: p.pid,
+      ppid: p.ppid,
+      command: p.command.slice(0, 500),
+      exit_code: null,   // ps -eo doesn't expose exit; caller can join to shell events
+      duration_sec
+    }, ids())
+  } catch (e) {
+    noteDbError('process-monitor', e)
+  }
+}
+
+// Runs `ps -eo pid,ppid,etime,command` and parses the fixed-width-ish output.
+// The command column is the tail of the line, so we split off the first three
+// whitespace-separated columns and keep the rest as `command`.
+// v0.6.98 D: Windows dispatches to Win32_Process via PowerShell instead.
+export function runPs(): Promise<PsRow[]> {
+  if (process.platform === 'win32') return runWindowsPs()
+  return new Promise((resolve, reject) => {
+    // v0.6.97 E: on Linux procps truncates the command column at the terminal
+    // width (default 80 cols in an inherited-env spawn — argv gets sliced),
+    // which loses the args we need for scope matching. Double `-w` disables
+    // truncation entirely (`-w` once bumps to unlimited, twice is a belt-
+    // and-suspenders for procps < 3.3). macOS BSD ps ignores unknown flags,
+    // so `-w -w` still parses correctly there. Alpine BusyBox errors on
+    // both — that path is already covered by the CP-2 advisory event.
+    const args = process.platform === 'linux'
+      ? ['-w', '-w', '-eo', 'pid=,ppid=,etime=,command=']
+      : ['-eo', 'pid=,ppid=,etime=,command=']
+    execFile('ps', args, { maxBuffer: 8 * 1024 * 1024 }, (err, stdout) => {
+      if (err) { reject(err); return }
+      const rows: PsRow[] = []
+      for (const line of stdout.split('\n')) {
+        const parsed = parsePsLine(line)
+        if (parsed) rows.push(parsed)
+      }
+      resolve(rows)
+    })
+  })
+}
+
+// v0.6.98 D: Windows polls Get-CimInstance Win32_Process. CommandLine is
+// pipe-delimited from PID and PPID so the command tail can freely contain
+// spaces, tabs, and quotes without ambiguity. CommandLine can itself contain
+// `|` (rare — literal in an argv), so we split on the FIRST TWO delimiters
+// only and treat the rest as command. Falls back to Name when CommandLine
+// is null (elevated processes not readable without admin token; SYSTEM PIDs).
+function runWindowsPs(): Promise<PsRow[]> {
+  return new Promise((resolve, reject) => {
+    const script =
+      "Get-CimInstance -ClassName Win32_Process | ForEach-Object { " +
+      "$c = if ($_.CommandLine) { $_.CommandLine } else { $_.Name }; " +
+      "\"$($_.ProcessId)|$($_.ParentProcessId)|$c\" }"
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script],
+      { maxBuffer: 16 * 1024 * 1024 }, (err, stdout) => {
+        if (err) { reject(err); return }
+        resolve(parseWindowsPsOutput(stdout))
+      })
+  })
+}
+
+// v0.6.99 C: extracted from runWindowsPs so unit tests can exercise the
+// parser without spawning PowerShell (which isn't on the darwin/linux
+// CI runners). Line grammar: `<pid>|<ppid>|<command…>` with LF or CRLF
+// line endings. CommandLine may itself contain `|` (rare — literal in
+// argv), so we split on the first two delimiters only and treat the
+// rest as command. Empty lines, malformed rows, and rows with a blank
+// command are dropped.
+export function parseWindowsPsOutput(stdout: string): PsRow[] {
+  const rows: PsRow[] = []
+  for (const line of stdout.split(/\r?\n/)) {
+    const parts = line.split('|')
+    if (parts.length < 3) continue
+    const pid = parseInt(parts[0], 10)
+    const ppid = parseInt(parts[1], 10)
+    if (!Number.isFinite(pid) || !Number.isFinite(ppid)) continue
+    const command = parts.slice(2).join('|').trim()
+    if (!command) continue
+    rows.push({ pid, ppid, etime: '0', command })
+  }
+  return rows
+}
+
+// Exported for unit tests — line parsing is a tiny grammar and easier to
+// exercise directly than by shelling out to ps in the test.
+export function parsePsLine(line: string): PsRow | null {
+  const trimmed = line.trim()
+  if (!trimmed) return null
+  // pid ppid etime command…
+  const m = trimmed.match(/^(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/)
+  if (!m) return null
+  const pid = parseInt(m[1], 10)
+  const ppid = parseInt(m[2], 10)
+  if (!Number.isFinite(pid) || !Number.isFinite(ppid)) return null
+  return { pid, ppid, etime: m[3], command: m[4] }
+}

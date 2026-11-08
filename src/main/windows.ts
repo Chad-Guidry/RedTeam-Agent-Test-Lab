@@ -1,0 +1,137 @@
+import { BrowserWindow, screen } from 'electron'
+import { join } from 'path'
+import { is } from '@electron-toolkit/utils'
+import { attachContextMenu } from './context-menu'
+import { showWhenReady } from './window-show'
+import { HUD_INITIAL_H, defaultOverlayBounds } from '../core/overlay-layout'
+
+const isMac = process.platform === 'darwin'
+const isWin = process.platform === 'win32'
+
+// The app is a local SPA: it never opens sub-windows and never navigates away
+// from its own content (external links go through the app:openExternal IPC,
+// which is http/https-allowlisted). So deny every window-open and every
+// navigation to a foreign origin. Without this, a captured link inside evidence
+// data (an HTTP body, an agent transcript) could load attacker content
+// in-window; with no CSP that would be unconstrained. Applied to both windows.
+function hardenNavigation(win: BrowserWindow): void {
+  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+  win.webContents.on('will-navigate', (e, url) => {
+    const devUrl = process.env['ELECTRON_RENDERER_URL']
+    const ok = url.startsWith('file://') || (!!devUrl && url.startsWith(devUrl))
+    if (!ok) e.preventDefault()
+  })
+}
+
+export function createMainWindow(savedBounds?: Electron.Rectangle): BrowserWindow {
+  const win = new BrowserWindow({
+    // Default sized to the dashboard's "寬屏 1400px 居中" layout (§22) so the
+    // one-screen-one-question view shows at full width on first launch, with
+    // more vertical room for the timeline and the HTTP/loot tables. A saved
+    // bound (the operator resized) always wins.
+    width: savedBounds?.width ?? 1400,
+    height: savedBounds?.height ?? 900,
+    x: savedBounds?.x,
+    y: savedBounds?.y,
+    minWidth: 800,
+    minHeight: 500,
+    show: false,
+    // Windows wants an .ico here: it picks the 16px representation for the title
+    // bar and the 32px one for the taskbar, and a single 256px PNG has to be
+    // downscaled into both — which is where a thin ring stops being a ring.
+    // macOS ignores this field entirely; Linux wants the PNG.
+    icon: join(__dirname, '../../resources', isWin ? 'icon.ico' : 'icon-256.png'),
+    backgroundColor: '#121214',
+    titleBarStyle: isMac ? 'hiddenInset' : 'hidden',
+    ...(isMac
+      ? {}
+      : {
+          titleBarOverlay: {
+            color: '#121214',
+            symbolColor: '#a1a1aa',
+            height: 40
+          }
+        }),
+    webPreferences: {
+      preload: join(__dirname, '../preload/index.js'),
+      sandbox: true,
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  })
+
+  // Right-click gets a native menu (copy/paste in fields, copy for a plain
+  // selection). Without this the app has no context menu at all, which is one
+  // of the loudest "this is a web page" tells on the desktop.
+  attachContextMenu(win.webContents, { dev: is.dev })
+  hardenNavigation(win)
+
+  // No zoom bump here. Windows at scaleFactor 1 used to get a silent 1.1,
+  // from when 1.0 rendered text too small to read — and the visible zoom
+  // ladder in Settings said the same thing, with 1.1 as its "normal". The
+  // type scale then gained its 13px floor (§2) and the ladder was corrected
+  // to 1.0; this was not. So the operator's own setting was being multiplied
+  // by an older default they never chose and could not see, and turning it
+  // down never reached the size they were asking for.
+  //
+  // One zoom now, and it is the one on the screen.
+  showWhenReady(win)
+
+  if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
+    win.loadURL(process.env['ELECTRON_RENDERER_URL'])
+  } else {
+    win.loadFile(join(__dirname, '../renderer/index.html'))
+  }
+
+  return win
+}
+
+export function createOverlayWindow(
+  saved?: { x: number; y: number } | null,
+  opts: { show?: boolean } = {}
+): BrowserWindow {
+  const workArea = screen.getPrimaryDisplay().workArea
+  const width = 440
+  const placed = saved ?? defaultOverlayBounds(workArea, width)
+
+  const win = new BrowserWindow({
+    width,
+    height: HUD_INITIAL_H,
+    // Created either way so the toggle, the tray and the IPC handlers always
+    // have a window; `autoShow: false` only keeps it from appearing.
+    show: opts.show !== false,
+    x: placed.x,
+    y: placed.y,
+    frame: false,
+    transparent: true,
+    alwaysOnTop: true,
+    resizable: false,
+    skipTaskbar: true,
+    hasShadow: false,
+    movable: true,
+    webPreferences: {
+      preload: join(__dirname, '../preload/overlay.js'),
+      sandbox: true,
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  })
+
+  // Start interactive. Explicit pass-through configuration is applied by
+  // startProject immediately after creation; normal mode must never depend on
+  // a forwarded hover event before its controls can be clicked.
+  win.setIgnoreMouseEvents(false)
+  // 'screen-saver' is the highest window level — the HUD stays above other
+  // always-on-top windows (and over fullscreen apps, via visibleOnFullScreen).
+  win.setAlwaysOnTop(true, 'screen-saver')
+  win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
+  hardenNavigation(win)
+
+  if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
+    win.loadURL(process.env['ELECTRON_RENDERER_URL'] + '/overlay.html')
+  } else {
+    win.loadFile(join(__dirname, '../renderer/overlay.html'))
+  }
+
+  return win
+}
