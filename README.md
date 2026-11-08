@@ -7,7 +7,7 @@ Red Team Operation Log — an Electron desktop app that records a penetration te
 ![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white)
 ![SQLite](https://img.shields.io/badge/SQLite-WAL-003B57?logo=sqlite&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green)
-[![Latest release](https://img.shields.io/)](https://github.com/guan4tou2/REDLOG/releases/latest)
+[![Latest release](https://img.shields.io/)]()
 
 ## Install
 
