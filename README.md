@@ -7,7 +7,7 @@ Red Team Operation Log — an Electron desktop app that records a penetration te
 ![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white)
 ![SQLite](https://img.shields.io/badge/SQLite-WAL-003B57?logo=sqlite&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green)
-[![Latest release](https://img.shields.io/github/v/release/guan4tou2/REDLOG?label=download&logo=github)](https://github.com/guan4tou2/REDLOG/releases/latest)
+[![Latest release](https://img.shields.io/github/v/release/guan4tou2/REDLOG?label=download&logo=github)]
 
 ## Install
 
@@ -15,7 +15,7 @@ Install RedLog on **your operator machine** (the Kali box or laptop you attack
 from), not on a target. It records what you do; it is not an implant.
 
 Grab the installer for your platform from the
-[**releases page**](https://github.com/guan4tou2/REDLOG/releases/latest) — current version **v0.18.6**.
+[**releases page**] — current version **v0.18.6**.
 Builds do not yet carry a trusted publisher identity (macOS is ad-hoc signed, not notarised). First launch may require an OS trust decision; managed machines may block it.
 
 | Platform | File | Install |
